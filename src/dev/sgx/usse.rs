@@ -944,7 +944,10 @@ static FORMS: &[Form] = &[
         inverted: 0,
         pred: PredEnc::Short(41),
         rpt: RptEnc::Field(44, 4),
-        end: Some(43),
+        // [G] The encoder puts END at b43 here, but the microkernel sets it
+        // on two back-to-back register writes with live code after them
+        // (f2013a40), so on STR it cannot end the program. It still prints.
+        end: None,
         flags: F_SKIP_END43,
         ops: O_STR,
         exec: Op::Str,
@@ -1244,6 +1247,19 @@ impl Insn {
     /// Whether the END flag is set (§2.2).
     pub fn is_end(&self) -> bool {
         self.form.end.is_some_and(|n| bit(self.word, n))
+    }
+
+    /// Whether the instruction carries the flag the reference disassembler
+    /// calls `syncs?` (useasm flags1.17), which ends the phase once it has
+    /// executed \[G\]. The evidence is the microkernel's own: of its nine
+    /// uses, every one is either a `PHAS`/opcode 358 or the instruction
+    /// straight after a `PHAS`, and the code after each is either another
+    /// entry point or unreachable.
+    pub fn ends_phase(&self) -> bool {
+        self.form
+            .flags
+            .iter()
+            .any(|f| f.0 == "syncs?" && self.word & f.1 == f.1)
     }
 
     /// The test form's ALU sub-op, `b19:14` (§5.3).
@@ -1783,11 +1799,14 @@ pub enum Stop {
         /// The next instruction.
         pc: u32,
     },
-    /// The phase ended (`PHAS` with `b51`, or opcode 358) \[G\]. `next` is the
-    /// entry the program declared for its next phase, if any. It is left as
-    /// encoded because its base is not settled: the slave microkernel's
-    /// `PHAS` targets count from the main image's base, while its branches
-    /// count from its own (§7).
+    /// The phase ended: opcode 358, or any instruction carrying `syncs?`
+    /// ([`Insn::ends_phase`]) \[G\]. `next` is the entry the program declared
+    /// for its next phase with `PHAS`, if any — `Some(0)` is what the
+    /// microkernel declares before ending a task for good, `None` (an opcode
+    /// 358 with nothing declared) leaves the choice to the hardware. It is
+    /// left as encoded because its base is not settled: the slave
+    /// microkernel's `PHAS` targets count from the main image's base, while
+    /// its branches count from its own (§7).
     Phase {
         /// The instruction that ended the phase.
         pc: u32,
@@ -1958,6 +1977,12 @@ impl Usse {
         if enabled && insn.is_end() {
             return Err(Stop::End { pc: self.pc });
         }
+        if enabled && insn.ends_phase() {
+            return Err(Stop::Phase {
+                pc,
+                next: self.next_phase.take(),
+            });
+        }
         Ok(())
     }
 
@@ -2106,18 +2131,9 @@ impl Usse {
             Op::Setl => self.link = self.read(&a[0], 0, pc, w)?,
             Op::Savl => self.write(&a[0], 0, self.link, pc, w)?,
             Op::Nop | Op::Idf | Op::Wdf => {}
-            Op::Phas => {
-                let next = field(w, 0, 20) as u32;
-                self.next_phase = Some(next);
-                // [G] b51 ends the phase here; without it PHAS only declares
-                // the next one.
-                if bit(w, 51) {
-                    return Err(Stop::Phase {
-                        pc,
-                        next: Some(next),
-                    });
-                }
-            }
+            // PHAS only declares the next phase; its own `syncs?` bit (b51),
+            // like that bit on any instruction, ends the current one (`step`).
+            Op::Phas => self.next_phase = Some(field(w, 0, 20) as u32),
             Op::PhaseEnd => {
                 return Err(Stop::Phase {
                     pc,

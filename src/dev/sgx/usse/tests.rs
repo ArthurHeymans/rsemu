@@ -721,6 +721,32 @@ fn emit_reaches_the_bus() {
 }
 
 #[test]
+fn syncs_ends_the_phase_and_str_end_does_not_end_the_program() {
+    // `phas #0` then a `nop` carrying `syncs?`: the microkernel's task end.
+    let phas = class(4) | 2 << 56 | 7 << 40;
+    let (u, _, stop) = run(&[phas, nop() | b(50), nop()], |_| {});
+    assert_eq!(
+        stop,
+        Stop::Phase {
+            pc: 1,
+            next: Some(0)
+        }
+    );
+    assert_eq!(u.pc, 2);
+    assert_eq!(u.next_phase, None, "the declaration is consumed");
+    // On an ALU word too, and with nothing declared.
+    let (_, _, stop) = run(&[alu(10, true, d_r(1), s1_r(1), s2_imm(0)) | b(50)], |_| {});
+    assert_eq!(stop, Stop::Phase { pc: 0, next: None });
+    // `str.end` writes and runs on.
+    let (u, bus, stop) = run(&[str_(0x134b, s1_r(16)) | b(43), nop() | b(43)], |u| {
+        u.temp[16] = 0x22
+    });
+    assert_eq!(bus.regs.get(&0x134b), Some(&0x22));
+    assert_eq!(stop, Stop::End { pc: 2 });
+    assert_eq!(u.pc, 2);
+}
+
+#[test]
 fn stops_are_reported() {
     // Phase end with a declared next phase.
     let (_, _, stop) = run(&[class(4) | 2 << 56 | b(51) | 0x42], |_| {});
