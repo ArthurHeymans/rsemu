@@ -90,6 +90,7 @@
 //! hardware-level model that runs the real microkernel. It is not wired into
 //! this device yet: the stand-in above still answers the host itself.
 
+pub mod pds;
 pub mod usse;
 
 use alloc::boxed::Box;
