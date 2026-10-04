@@ -205,7 +205,10 @@ machine "alphard-navi" {
 
   # The PowerVR SGX: a stand-in for its firmware's handshake with the host
   # driver -- start, build check, kernel commands -- and no rendering.
-  object sgx "pvr.sgx" { clock = pclk / 1024, space = mem, log = "sgx" }
+  # `-p sgx-mode=hw` runs the GPU's real firmware on the modelled engine
+  # instead; that is bring-up work, so the stand-in stays the default.
+  param sgx-mode = "standin"
+  object sgx "pvr.sgx" { clock = pclk / 1024, space = mem, log = "sgx", mode = sgx-mode }
 
   # CAN channel 1 (the SD system's rcan driver reads its channel from its
   # configuration: 1). Nothing else is on the bus; what matters is that the

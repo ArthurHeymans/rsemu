@@ -83,13 +83,19 @@
 //! register offsets and values they write and poll, the command ring they
 //! fill, the structure sizes and build constants they pass and compare.
 //!
-//! # The shader engine
+//! # The shader engine, and the hardware mode
 //!
 //! [`usse`] holds the instruction set of the SGX's programmable core, the
-//! USSE2 — decoder, disassembler and interpreter — as the first piece of a
-//! hardware-level model that runs the real microkernel. It is not wired into
-//! this device yet: the stand-in above still answers the host itself.
+//! USSE2, and [`pds`] that of the data sequencer that starts its tasks —
+//! decoder, disassembler and interpreter each. With `mode = "hw"` the device
+//! stops answering the host itself and runs the GPU's real firmware on them
+//! instead (`hw.rs`): kicks raise events, events run the firmware's PDS
+//! programs, and those start the microkernel, which then does through
+//! memory and registers everything described above. The fixed-function
+//! pipeline is not modelled; work the firmware starts on it completes at
+//! once. That mode is bring-up work, so the stand-in stays the default.
 
+mod hw;
 pub mod pds;
 pub mod usse;
 
@@ -114,7 +120,7 @@ use crate::machine::realize::{BindCtx, Instance};
 pub const CLASS_NAME: &str = "pvr.sgx";
 
 /// The snapshot chunk version. Bump with the encoding, never on its own.
-const STATE_VERSION: u32 = 1;
+const STATE_VERSION: u32 = 2;
 
 /// How much address space the register block answers.
 pub const REGISTER_WINDOW_LEN: u64 = 0x1_0000;
@@ -205,6 +211,11 @@ struct State {
     kick_pending: bool,
     /// The TA/3D control block's GPU address, once found.
     ta3d: Option<u32>,
+    /// Hardware mode: a start raised in each bank (master, core 0, core 1)
+    /// and not yet taken.
+    hw_starts: [bool; 3],
+    /// Hardware mode: command kicks per bank not yet taken.
+    hw_kicks: [u32; 3],
 }
 
 impl Default for State {
@@ -214,6 +225,8 @@ impl Default for State {
             start_pending: false,
             kick_pending: false,
             ta3d: None,
+            hw_starts: [false; 3],
+            hw_kicks: [0; 3],
         }
     }
 }
@@ -231,6 +244,32 @@ impl State {
         self.reg(EVENT_STATUS) & self.reg(EVENT_ENABLE) & EVENT_UKERNEL != 0
             || self.reg(EVENT_STATUS2) & self.reg(EVENT_ENABLE2) & EVENT2_MASK != 0
     }
+
+    /// Hardware mode: a write that raises an event (a start or command kick
+    /// in one of the banks); true if it was one.
+    fn hw_event(&mut self, offset: u64, v: u32) -> bool {
+        let slot = match offset & !0x3fff {
+            0x0000 => 0,
+            0x8000 => 1,
+            0xc000 => 2,
+            _ => return false,
+        };
+        match (offset & 0x3fff) as u32 {
+            hw::START => {
+                if v & 1 != 0 {
+                    self.hw_starts[slot] = true;
+                }
+                true
+            }
+            hw::KICK => {
+                if v & 1 != 0 {
+                    self.hw_kicks[slot] = self.hw_kicks[slot].saturating_add(1);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -243,6 +282,11 @@ struct Shared {
     /// Where every command the firmware side consumes is reported, if
     /// anywhere (`log = "port"`).
     log: Option<Arc<dyn crate::host::chardev::CharDevice>>,
+    /// The hardware mode's knobs; `None` in the stand-in mode.
+    hw: Option<hw::Tuning>,
+    /// The hardware mode's engine. Taken out for the length of a slice, so
+    /// that no lock is held while the firmware reaches memory.
+    engine: Mutex<Option<Box<hw::Engine>>>,
 }
 
 impl Shared {
@@ -274,6 +318,9 @@ impl Shared {
 
     fn write_reg(&self, offset: u64, v: u32) {
         let mut s = self.state.lock();
+        if self.hw.is_some() && s.hw_event(offset, v) {
+            return;
+        }
         match offset {
             EVENT_CLEAR => *s.reg_mut(EVENT_STATUS) &= !v,
             EVENT_CLEAR2 => *s.reg_mut(EVENT_STATUS2) &= !v,
@@ -283,8 +330,42 @@ impl Shared {
         }
     }
 
+    /// A register write by the firmware (`STR`). Returns whether the
+    /// interrupt may have changed.
+    ///
+    /// The firmware raises the host's event by writing its bit to the status
+    /// register, so a firmware write there sets bits rather than replacing
+    /// the word (it writes `0x4000` alone) \[G\]; clears are as the host's.
+    fn usse_write_reg(&self, offset: u32, v: u32) -> bool {
+        let offset = u64::from(offset);
+        let mut s = self.state.lock();
+        if s.hw_event(offset, v) {
+            return false;
+        }
+        match offset {
+            EVENT_STATUS => *s.reg_mut(EVENT_STATUS) |= v,
+            EVENT_CLEAR => *s.reg_mut(EVENT_STATUS) &= !v,
+            EVENT_STATUS2 => *s.reg_mut(EVENT_STATUS2) |= v,
+            EVENT_CLEAR2 => *s.reg_mut(EVENT_STATUS2) &= !v,
+            _ => {
+                *s.reg_mut(offset) = v;
+                return false;
+            }
+        }
+        true
+    }
+
     fn space(&self) -> Option<Arc<AddressSpace>> {
         self.bus.lock().as_ref().and_then(Weak::upgrade)
+    }
+
+    /// Hardware mode: run the firmware for `ticks` device ticks.
+    fn run_hw(&self, ticks: u64, tuning: hw::Tuning) {
+        let Some(mut engine) = self.engine.lock().take() else {
+            return;
+        };
+        engine.run(self, ticks, tuning);
+        *self.engine.lock() = Some(engine);
     }
 
     /// Do whatever a kick left pending.
@@ -660,26 +741,47 @@ impl Sgx {
         let mut r = props.reader();
         let revision = r.or_range("revision", 0x0001_0205u64, 0..=0xff_ffff)? as u32;
         let log = r.optional_str("log")?.map(ToString::to_string);
+        let mode = r.or_str("mode", "standin")?.to_string();
+        let ipt = r.or_range("ipt", 256u64, 1..=1 << 20)?;
+        let timer_ticks = r.or_range("timer-ticks", 59u64, 0..=1 << 32)?;
         r.finish()?;
+        let hw = match mode.as_str() {
+            "standin" => None,
+            "hw" => Some(hw::Tuning { ipt, timer_ticks }),
+            other => {
+                return Err(Error::Property(alloc::format!(
+                    "mode: `{other}` is neither `standin` nor `hw`"
+                )));
+            }
+        };
         let log = match log {
             Some(name) => Some(crate::host::chardev::ports::attach(props, &name)?
                 as Arc<dyn crate::host::chardev::CharDevice>),
             None => None,
         };
-        Ok(Sgx::build(revision, log))
+        Ok(Sgx::build(revision, log, hw))
     }
 
     /// Build one reporting `revision` (major.minor.maintenance in bits
     /// 23:16, 15:8, 7:0).
     #[must_use]
     pub fn with_revision(revision: u32) -> Sgx {
-        Sgx::build(revision, None)
+        Sgx::build(revision, None, None)
     }
 
-    fn build(revision: u32, log: Option<Arc<dyn crate::host::chardev::CharDevice>>) -> Sgx {
+    fn build(
+        revision: u32,
+        log: Option<Arc<dyn crate::host::chardev::CharDevice>>,
+        hw: Option<hw::Tuning>,
+    ) -> Sgx {
         let shared = Arc::new(Shared {
             log,
             revision,
+            hw,
+            engine: Mutex::with_rank(
+                LockRank::DEVICE,
+                hw.map(|_| Box::new(hw::Engine::default())),
+            ),
             state: Mutex::with_rank(LockRank::DEVICE, State::default()),
             irq: Mutex::with_rank(LockRank::LEAF, None),
             bus: Mutex::with_rank(LockRank::LEAF, None),
@@ -717,6 +819,24 @@ pub static CLASS: DeviceClass = DeviceClass {
             required: false,
             summary: "a character port every consumed command is reported on, one line each",
         },
+        PropertySpec {
+            name: "mode",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "`standin` (default): answer the host here; `hw`: run the real firmware on the modelled engine",
+        },
+        PropertySpec {
+            name: "ipt",
+            kind: ValueKind::Uint,
+            required: false,
+            summary: "hw mode: shader-engine instructions per device tick (default 256)",
+        },
+        PropertySpec {
+            name: "timer-ticks",
+            kind: ValueKind::Uint,
+            required: false,
+            summary: "hw mode: device ticks between firmware timer events, 0 for none (default 59)",
+        },
     ],
     construct: |props| Ok(Box::new(Sgx::new(props)?)),
 };
@@ -732,6 +852,9 @@ impl Device for Sgx {
 
     fn reset(&self, _kind: ResetKind) {
         *self.shared.state.lock() = State::default();
+        if self.shared.hw.is_some() {
+            *self.shared.engine.lock() = Some(Box::default());
+        }
         self.shared.drive();
     }
 
@@ -759,7 +882,10 @@ impl Device for Sgx {
     }
 
     fn run(&self, budget: crate::core::sched::Budget) -> crate::core::sched::Consumed {
-        self.shared.run();
+        match self.shared.hw {
+            Some(tuning) => self.shared.run_hw(budget.ticks, tuning),
+            None => self.shared.run(),
+        }
         crate::core::sched::Consumed::new(budget.ticks)
     }
 
@@ -771,7 +897,19 @@ impl Device for Sgx {
         w.write_bool(s.start_pending)?;
         w.write_bool(s.kick_pending)?;
         w.write_bool(s.ta3d.is_some())?;
-        w.write_u32(s.ta3d.unwrap_or(0))
+        w.write_u32(s.ta3d.unwrap_or(0))?;
+        for b in s.hw_starts {
+            w.write_bool(b)?;
+        }
+        for k in s.hw_kicks {
+            w.write_u32(k)?;
+        }
+        let engine = self.shared.engine.lock();
+        w.write_bool(engine.is_some())?;
+        match engine.as_ref() {
+            Some(e) => e.save(w),
+            None => Ok(()),
+        }
     }
 
     fn load(&self, r: &mut ChunkReader<'_>) -> Result<()> {
@@ -783,12 +921,33 @@ impl Device for Sgx {
         let kick_pending = r.read_bool()?;
         let has = r.read_bool()?;
         let ta3d = r.read_u32()?;
+        let mut hw_starts = [false; 3];
+        for b in &mut hw_starts {
+            *b = r.read_bool()?;
+        }
+        let mut hw_kicks = [0; 3];
+        for k in &mut hw_kicks {
+            *k = r.read_u32()?;
+        }
+        let engine = if r.read_bool()? {
+            Some(Box::new(hw::Engine::load(r)?))
+        } else {
+            None
+        };
+        if engine.is_some() != self.shared.hw.is_some() {
+            return Err(Error::State(String::from(
+                "snapshot taken in the other SGX mode",
+            )));
+        }
         *self.shared.state.lock() = State {
             regs,
             start_pending,
             kick_pending,
             ta3d: has.then_some(ta3d),
+            hw_starts,
+            hw_kicks,
         };
+        *self.shared.engine.lock() = engine;
         self.shared.drive();
         Ok(())
     }
@@ -833,6 +992,9 @@ pub fn schema() -> crate::machine::validate::ClassSchema {
     ClassSchema::new(CLASS_NAME)
         .prop(PropSchema::new("revision", ValueKind::Uint).range(0, 0xff_ffff))
         .prop(PropSchema::new("log", ValueKind::Str))
+        .prop(PropSchema::new("mode", ValueKind::Str))
+        .prop(PropSchema::new("ipt", ValueKind::Uint).range(1, 1 << 20))
+        .prop(PropSchema::new("timer-ticks", ValueKind::Uint).range(0, 1 << 32))
         .region("")
         .region("regs")
         .port(IRQ_PIN, PortDir::Out)
@@ -1095,5 +1257,320 @@ mod tests {
         let want = sgx.shared.state.lock().clone();
         assert_eq!(*back.shared.state.lock(), want);
         assert_eq!(save(&back), bytes);
+    }
+
+    // -- the hardware mode --------------------------------------------------
+
+    mod hw_mode {
+        use super::*;
+
+        // A few USSE and PDS words, assembled from the field positions in
+        // `usse.rs` and `pds.rs`; nothing here comes from a firmware image.
+
+        const fn b(n: u32) -> u64 {
+            1 << n
+        }
+        const fn class(c: u64) -> u64 {
+            31 << 59 | c << 52
+        }
+        fn limm(r: u64, v: u32) -> u64 {
+            let v = u64::from(v);
+            class(2)
+                | 4 << 56
+                | r << 21
+                | (v & 0x1f_ffff)
+                | (v >> 21 & 0x1f) << 36
+                | (v >> 26 & 0x3f) << 44
+        }
+        fn reg_field(reg: u64) -> u64 {
+            (reg & 0x7f) | (reg >> 7 & 0x7f) << 14 | (reg >> 14 & 0xf) << 34 | b(48) | 2 << 28
+        }
+        /// `str #reg, <bank> n`, bank 0 temp, 2 primary, 3 secondary.
+        fn str_(reg: u64, bank: u64, n: u64) -> u64 {
+            class(2) | 6 << 56 | b(51) | reg_field(reg) | bank << 30 | n << 7
+        }
+        fn ldr(r: u64, reg: u64) -> u64 {
+            class(2) | 6 << 56 | r << 21 | reg_field(reg)
+        }
+        /// `and.test.t[z] _, p0, r<n>, r<n>`.
+        fn test_zero(n: u64) -> u64 {
+            // t = 0x14: zero test (t2 → b40) combined with AND (t4 → b39).
+            9 << 59 | 0x30 << 14 | b(40) | b(39) | b(51) | b(32) | n << 7 | n
+        }
+        fn ba_if_p0(target: u64) -> u64 {
+            class(0) | 1 << 56 | target
+        }
+        fn ba(target: u64) -> u64 {
+            class(0) | target
+        }
+        const PHAS0: u64 = (31 << 59) | (4 << 52) | (2 << 56) | (7 << 40);
+        const NOP_SYNCS: u64 = (31 << 59) | (5 << 38) | (1 << 50);
+        /// `emit162 #0, r0, r2, #arg, #imm` (operands name register pairs).
+        fn emit(arg: u64, imm: u64) -> u64 {
+            class(2)
+                | 3 << 56
+                | b(47)
+                | 1 << 7
+                | b(48)
+                | 2 << 28
+                | arg
+                | (imm & 0x3f) << 22
+                | (imm >> 6 & 0x3f) << 35
+        }
+
+        fn dout(row_a: u32, irsrc: bool, row_b: u32, sel: [u32; 4], t: u32) -> u32 {
+            7 << 24
+                | row_a << 18
+                | u32::from(irsrc) << 17
+                | (row_b >> 4) << 16
+                | (row_b & 0xf) << 12
+                | sel[0] << 10
+                | sel[1] << 8
+                | sel[2] << 6
+                | sel[3] << 4
+                | t
+        }
+        const HALT: u32 = 0xaf00_0000;
+        /// DOUTU W0 for code-base 15, instruction `pc`, 32 temps.
+        fn doutu_w0(pc: u32) -> u32 {
+            8 << 24 | pc << 4 | 15
+        }
+
+        const CODE: u32 = 0x1_0000;
+        const PDS: u32 = 0x2_0000;
+
+        fn hw_board() -> (Sgx, Arc<AddressSpace>) {
+            let (_, space) = board();
+            let sgx = Sgx::build(
+                0x01_0205,
+                None,
+                Some(hw::Tuning {
+                    ipt: 64,
+                    timer_ticks: 0,
+                }),
+            );
+            sgx.attach_space(&space);
+            reg_w(&sgx, KERNEL_DIRECTORY, 0x1000);
+            reg_w(&sgx, 0xa48, CODE >> 6 | 0x0c00_0000);
+            (sgx, space)
+        }
+
+        fn put64(space: &AddressSpace, at: u32, words: &[u64]) {
+            for (i, w) in words.iter().enumerate() {
+                mw(space, at + 8 * i as u32, *w as u32);
+                mw(space, at + 8 * i as u32 + 4, (*w >> 32) as u32);
+            }
+        }
+
+        /// A PDS program at `at`: data rows, then code.
+        fn put_pds(space: &AddressSpace, at: u32, rows: &[[u32; 4]], code: &[u32]) {
+            for (i, v) in rows.iter().flatten().chain(code).enumerate() {
+                mw(space, at + 4 * i as u32, *v);
+            }
+        }
+
+        fn run(sgx: &Sgx, ticks: u64) {
+            sgx.run(crate::core::sched::Budget::of(ticks));
+        }
+
+        fn idle(sgx: &Sgx) -> bool {
+            sgx.shared.engine.lock().as_ref().unwrap().idle()
+        }
+
+        #[test]
+        fn a_start_runs_the_event_program_and_the_firmware_raises_the_host_event() {
+            let (sgx, space) = hw_board();
+            put_pds(
+                &space,
+                PDS,
+                &[[doutu_w0(0), 1, 0, 0]],
+                &[dout(0, false, 0, [0, 1, 2, 0], 5), HALT],
+            );
+            put64(
+                &space,
+                CODE,
+                &[limm(0, EVENT_UKERNEL), str_(0x4b, 0, 0), PHAS0, NOP_SYNCS],
+            );
+            reg_w(&sgx, 0x8a68, PDS);
+            reg_w(&sgx, 0x8a6c, 1);
+            reg_w(&sgx, EVENT_ENABLE, EVENT_UKERNEL);
+            reg_w(&sgx, START_KICK, 1);
+            assert_eq!(
+                reg_r(&sgx, EVENT_STATUS),
+                0,
+                "nothing inside the register write"
+            );
+            run(&sgx, 4);
+            assert_eq!(reg_r(&sgx, EVENT_STATUS), EVENT_UKERNEL);
+            assert!(sgx.shared.state.lock().irq());
+            assert!(idle(&sgx), "the task ended at its phase end");
+            reg_w(&sgx, EVENT_CLEAR, 0x8000_0000 | EVENT_UKERNEL);
+            assert!(!sgx.shared.state.lock().irq());
+        }
+
+        #[test]
+        fn each_command_kick_is_one_event_with_its_bit_in_pa1() {
+            let (sgx, space) = hw_board();
+            put_pds(
+                &space,
+                PDS,
+                &[[0, 0x100, 0, 0], [doutu_w0(0), 1, 0, 0]],
+                &[
+                    dout(0, true, 0, [2, 0, 0, 0], 6), // douta ir0 -> pa0
+                    dout(0, true, 1, [2, 1, 0, 0], 6), // douta ir1 -> pa1
+                    dout(1, false, 0, [0, 1, 2, 0], 5),
+                    HALT,
+                ],
+            );
+            put64(
+                &space,
+                CODE,
+                &[str_(0x800, 2, 1), str_(0x801, 2, 0), PHAS0, NOP_SYNCS],
+            );
+            reg_w(&sgx, 0x8a68, PDS);
+            reg_w(&sgx, 0x8a6c, 2);
+            reg_w(&sgx, COMMAND_KICK, 1);
+            reg_w(&sgx, COMMAND_KICK, 1);
+            assert_eq!(
+                sgx.shared.state.lock().hw_kicks[1],
+                2,
+                "counted, not latched"
+            );
+            run(&sgx, 8);
+            assert_eq!(sgx.shared.state.lock().hw_kicks[1], 0);
+            assert_eq!(reg_r(&sgx, 0x2000), 0x40);
+            assert_eq!(reg_r(&sgx, 0x2004), 0);
+            assert!(idle(&sgx));
+        }
+
+        #[test]
+        fn emit_starts_a_secondary_program_whose_dma_fills_the_core_attributes() {
+            let (sgx, space) = hw_board();
+            // Task 1: emit the secondary program, end. Task 2: report sa6.
+            put64(
+                &space,
+                CODE,
+                &[
+                    limm(0, 2 << 23),
+                    limm(2, (PDS + 0x100) >> 4),
+                    emit(0, 0xc43),
+                    PHAS0,
+                    NOP_SYNCS,
+                    str_(0x803, 3, 6),
+                    PHAS0,
+                    NOP_SYNCS,
+                ],
+            );
+            put_pds(
+                &space,
+                PDS,
+                &[[doutu_w0(0), 1, 0, 0]],
+                &[dout(0, false, 0, [0, 1, 2, 0], 5), HALT],
+            );
+            put_pds(
+                &space,
+                PDS + 0x100,
+                &[[0x3_0000, 3 | 5 << 8, 0, 0], [doutu_w0(5), 1, 0, 0]],
+                &[
+                    dout(0, false, 0, [0, 1, 0, 0], 3),
+                    dout(1, false, 0, [0, 1, 2, 0], 5),
+                    HALT,
+                ],
+            );
+            for (i, v) in [11, 22, 33, 44].into_iter().enumerate() {
+                mw(&space, 0x3_0000 + 4 * i as u32, v);
+            }
+            reg_w(&sgx, 0x8a68, PDS);
+            reg_w(&sgx, 0x8a6c, 1);
+            reg_w(&sgx, START_KICK, 1);
+            run(&sgx, 8);
+            assert_eq!(reg_r(&sgx, 0x200c), 22);
+            let sa = sgx.shared.engine.lock().as_ref().unwrap().sa(0)[5..9].to_vec();
+            assert_eq!(sa, [11, 22, 33, 44]);
+        }
+
+        #[test]
+        fn polls_see_their_completion_and_an_unknown_one_is_forced() {
+            let (sgx, space) = hw_board();
+            put64(
+                &space,
+                CODE,
+                &[
+                    ldr(0, 0x4b),
+                    str_(0x804, 0, 0),
+                    ldr(1, 0x3000), // a register nothing sets
+                    test_zero(1),
+                    ba_if_p0(2),
+                    str_(0x805, 0, 1),
+                    PHAS0,
+                    NOP_SYNCS,
+                ],
+            );
+            put_pds(
+                &space,
+                PDS,
+                &[[doutu_w0(0), 1, 0, 0]],
+                &[dout(0, false, 0, [0, 1, 2, 0], 5), HALT],
+            );
+            reg_w(&sgx, 0x8a68, PDS);
+            reg_w(&sgx, 0x8a6c, 1);
+            reg_w(&sgx, START_KICK, 1);
+            run(&sgx, 16);
+            assert_eq!(reg_r(&sgx, 0x2010) & 0x40, 0x40, "a completion bit");
+            assert_eq!(reg_r(&sgx, 0x2010) & EVENT_UKERNEL, 0, "never the host's");
+            assert_eq!(
+                reg_r(&sgx, EVENT_STATUS),
+                0,
+                "and the host still reads what is stored"
+            );
+            assert_eq!(reg_r(&sgx, 0x2014), !0, "the stuck poll was let go");
+            assert!(idle(&sgx));
+        }
+
+        #[test]
+        fn a_snapshot_round_trips_with_a_task_in_flight() {
+            let (sgx, space) = hw_board();
+            put_pds(
+                &space,
+                PDS,
+                &[[doutu_w0(0), 1, 0, 0]],
+                &[dout(0, false, 0, [0, 1, 2, 0], 5), HALT],
+            );
+            put64(&space, CODE, &[limm(3, 0x1234), ba(1)]);
+            reg_w(&sgx, 0x8a68, PDS);
+            reg_w(&sgx, 0x8a6c, 1);
+            reg_w(&sgx, START_KICK, 1);
+            reg_w(&sgx, COMMAND_KICK, 1);
+            run(&sgx, 2);
+            assert!(!idle(&sgx), "the task loops");
+            let save = |s: &Sgx| {
+                let mut shape = MachineShape::new();
+                shape.add_device("sgx", CLASS.name).unwrap();
+                let mut wr = StateWriter::new(shape);
+                {
+                    let mut chunk = wr.chunk("sgx", CLASS.name, CLASS.version).unwrap();
+                    s.save(&mut chunk).unwrap();
+                }
+                wr.to_vec().unwrap()
+            };
+            let bytes = save(&sgx);
+            let (back, _) = hw_board();
+            let reader = StateReader::new(&bytes).unwrap();
+            let chunk = reader
+                .load("sgx", CLASS.name, CLASS.version, &Migrations::new())
+                .unwrap();
+            back.load(&mut chunk.reader()).unwrap();
+            let want = sgx.shared.state.lock().clone();
+            assert_eq!(*back.shared.state.lock(), want);
+            let fp = |s: &Sgx| hw::fingerprint(s.shared.engine.lock().as_ref().unwrap());
+            assert_eq!(fp(&back), fp(&sgx));
+            assert_eq!(save(&back), bytes);
+            // The other mode's snapshot is refused.
+            let standin = Sgx::with_revision(0x01_0205);
+            let chunk = reader
+                .load("sgx", CLASS.name, CLASS.version, &Migrations::new())
+                .unwrap();
+            assert!(standin.load(&mut chunk.reader()).is_err());
+        }
     }
 }
