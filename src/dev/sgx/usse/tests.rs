@@ -708,6 +708,31 @@ fn ld_st_go_to_memory() {
 }
 
 #[test]
+fn b41_post_increments_the_base() {
+    let mut bus = MockBus::program(
+        BASE,
+        &[
+            ld(0, 1, 0, s1_imm(1)) | b(41),          // r1 = [r0]; r0 += 4
+            ld(0, 2, 0, s1_imm(0)) | b(41) | rpt(2), // r2, r3 = [r0], [r0+4]
+            st(0, 4, s1_imm(1), s2_r(1)) | b(41),    // [r4] = r1; r4 += 4
+            st(0, 4, s1_imm(1), s2_r(2)) | b(41),    // [r4] = r2; r4 += 4
+            nop() | b(43),
+        ],
+    );
+    for (i, v) in [10, 11, 12].into_iter().enumerate() {
+        bus.mem.insert(0x2000 + 4 * i as u32, v);
+    }
+    let mut u = Usse::new(BASE, 0);
+    u.temp[0] = 0x2000;
+    u.temp[4] = 0x3000;
+    assert_eq!(u.run(&mut bus, 100), Stop::End { pc: 5 });
+    assert_eq!(&u.temp[1..4], &[10, 11, 12]);
+    assert_eq!(u.temp[0], 0x2004);
+    assert_eq!(u.temp[4], 0x3008);
+    assert_eq!((bus.mem[&0x3000], bus.mem[&0x3004]), (10, 11));
+}
+
+#[test]
 fn emit_reaches_the_bus() {
     let imm = 0x843u64;
     let emit = class(2)

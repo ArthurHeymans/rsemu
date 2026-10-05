@@ -2237,15 +2237,23 @@ impl Usse {
             _ => return Err(unimpl(pc, w, "qword load/store")),
         };
         let load = insn.op() == Op::Load;
-        let (base, offset) = if load { (&a[1], &a[2]) } else { (&a[0], &a[1]) };
-        let base = self.read(base, 0, pc, w)?;
+        let (base_arg, offset) = if load { (&a[1], &a[2]) } else { (&a[0], &a[1]) };
+        let base = self.read(base_arg, 0, pc, w)?;
         let offset = self.read(offset, 0, pc, w)?;
+        // [G] b41 (`f1.28`) is post-increment: the access is at the base
+        // itself and the base register then advances by the offset. The
+        // microkernel copies register blocks to memory with
+        // `stad.f1.28 rB, #1, rV` in a loop that never advances rB
+        // otherwise, walks lists with `ldad.f1.28 rN, rP, #1`, and reads a
+        // command slot's handler with `ldad.f1.28 r4, r0, #1` before its
+        // remaining words from the advanced `r0`.
+        let post = bit(w, 41);
         for rep in 0..insn.repeat {
-            // [G] The offset counts elements of the access size, and steps by
-            // one per repeat; the addressing-mode bits (b40, b41, b53) are
-            // not applied.
+            // [G] The offset counts elements of the access size, and every
+            // repeat steps one element; b40 and b53 are not applied.
+            let index = if post { 0 } else { offset };
             let addr = base.wrapping_add(
-                offset
+                index
                     .wrapping_add(u32::from(rep))
                     .wrapping_mul(size.bytes()),
             );
@@ -2259,6 +2267,10 @@ impl Usse {
                 bus.store(addr, size, v)
                     .map_err(|error| Stop::Fault { pc, addr, error })?;
             }
+        }
+        if post {
+            let next = base.wrapping_add(offset.wrapping_mul(size.bytes()));
+            self.write(base_arg, 0, next, pc, w)?;
         }
         Ok(())
     }
