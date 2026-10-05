@@ -360,12 +360,17 @@ fn mad_families_decode() {
     let dec = d_r(1) | 1 << 14 | s1_imm(1) | s2_imm(1);
     assert_eq!(dis(op(20) | b(43) | b(53) | dec), "imadd20 r1, r1, #1, -#1");
     assert_eq!(dis(op(20) | dec), "imadd20b r1, r1, #1, #1");
-    // Opcode 26 has b39 set for a positive src2, and a signed immediate with
-    // b41 set.
-    assert_eq!(dis(op(26) | b(39) | b(41) | dec), "imadd26n r1, r1, #1, #1");
-    assert_eq!(dis(op(26) | dec), "imadd26 r1, r1, #1, -#1");
+    // Opcode 26 negates src2 with b39 (ENCODING.md §2.3's argument flag; the
+    // microkernel's `d0030280` builds the DMA control 0xff from 0x100 with
+    // it, and its plain `d0030000` steps register numbers upwards), and has
+    // a signed immediate with b41 set.
     assert_eq!(
-        dis(op(26) | b(39) | b(41) | d_r(1) | 1 << 14 | s1_imm(1) | s2_imm(0x7f)),
+        dis(op(26) | b(39) | b(41) | dec),
+        "imadd26n r1, r1, #1, -#1"
+    );
+    assert_eq!(dis(op(26) | dec), "imadd26 r1, r1, #1, #1");
+    assert_eq!(
+        dis(op(26) | b(41) | d_r(1) | 1 << 14 | s1_imm(1) | s2_imm(0x7f)),
         "imadd26n r1, r1, #1, #-1"
     );
     // b52 on opcode 26 is unknown and stays undecoded.
@@ -586,7 +591,7 @@ fn mad_executes() {
         &[
             op(21) | d_r(4) | 2 << 14 | s1_imm(8) | s2_r(3), // r4 = r2*8 + r3
             op(20) | b(43) | b(53) | d_r(1) | 1 << 14 | s1_imm(1) | s2_imm(1), // r1 -= 1
-            op(26) | b(41) | d_r(6) | 6 << 14 | s1_imm(1) | s2_r(7), // r6 = r6 - r7
+            op(26) | b(39) | d_r(6) | 6 << 14 | s1_imm(1) | s2_r(7), // r6 = r6 - r7
             op(21) | b(56) | d_r(9) | 9 << 14 | s1_imm(1) | s2_imm(0) | END, // r9 = r9 >> 16
         ],
         |u| {
@@ -878,7 +883,9 @@ mod firmware {
             && bit(w, 48)
             && field(w, 28, 2) == 2
             && field(w, 38, 5) != 0;
-        indexed || rotated
+        // The reference read opcode 26's b39 the wrong way round.
+        let mad26 = insn.op() == Op::Mad(MadUnit::Hw26);
+        indexed || rotated || mad26
     }
 
     /// Disassembles both microkernel images and compares, line by line, with

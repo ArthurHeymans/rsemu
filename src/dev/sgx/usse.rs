@@ -685,7 +685,7 @@ const O_MAD26S: &[Opd] = &[
     Opd::Src {
         slot: Slot::S2,
         imm: Imm::S7,
-        neg: Some(Neg(39, false)),
+        neg: Some(Neg(39, true)),
         inv: false,
     },
 ];
@@ -696,7 +696,7 @@ const O_MAD26U: &[Opd] = &[
     Opd::Src {
         slot: Slot::S2,
         imm: Imm::U7,
-        neg: Some(Neg(39, false)),
+        neg: Some(Neg(39, true)),
         inv: false,
     },
 ];

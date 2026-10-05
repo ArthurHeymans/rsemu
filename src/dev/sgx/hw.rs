@@ -603,6 +603,15 @@ impl Engine {
             }
         }
         let used = task.usse.retired.wrapping_sub(before).max(1);
+        // A task that runs on and on is usually spinning on something not
+        // modelled: say where, now and then.
+        if before >> 22 != task.usse.retired >> 22 && Diag::thin(&mut ctx.diag.stops) {
+            shared.note(&format!(
+                "sgx: core{core} task still running at {:#010x} after {} instructions\n",
+                task.usse.address_of(task.usse.pc),
+                task.usse.retired
+            ));
+        }
         let emits = core::mem::take(&mut ctx.emits);
         *irq |= ctx.irq;
         c.sa.copy_from_slice(&task.usse.secondary);
