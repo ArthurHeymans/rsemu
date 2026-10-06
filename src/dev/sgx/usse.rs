@@ -2240,18 +2240,22 @@ impl Usse {
         let (base_arg, offset) = if load { (&a[1], &a[2]) } else { (&a[0], &a[1]) };
         let base = self.read(base_arg, 0, pc, w)?;
         let offset = self.read(offset, 0, pc, w)?;
-        // [G] b41 (`f1.28`) is post-increment: the access is at the base
-        // itself and the base register then advances by the offset. The
-        // microkernel copies register blocks to memory with
-        // `stad.f1.28 rB, #1, rV` in a loop that never advances rB
-        // otherwise, walks lists with `ldad.f1.28 rN, rP, #1`, and reads a
-        // command slot's handler with `ldad.f1.28 r4, r0, #1` before its
-        // remaining words from the advanced `r0`.
-        let post = bit(w, 41);
+        // [G] b41 (`f1.28`) writes the base register back. With b53 set
+        // (the encoder's default, so `f1.31` does not print) the access is
+        // at the base itself and the base then advances by the offset: the
+        // microkernel reads a command slot's handler PC with
+        // `ldad.f1.28 r4, r0, #1` before the slot's remaining words from
+        // the advanced `r0`, and walks lists with `ldad.f1.28 rN, rP, #1`.
+        // With b53 clear (`f1.31`) the access is at base + offset as usual
+        // and the base advances by the repeat count: its pair-copy loops
+        // (`ldad.f1.28.f1.31.rpt2 r5, r3, #0` against an end pointer of
+        // `r3 + 8n`, and `stad.f1.28.f1.31.rpt2 r1, #0x52, r5` filling
+        // consecutive pairs) never advance the base any other way.
+        let (writeback, pre) = (bit(w, 41), !bit(w, 53));
+        let index = if writeback && !pre { 0 } else { offset };
         for rep in 0..insn.repeat {
             // [G] The offset counts elements of the access size, and every
-            // repeat steps one element; b40 and b53 are not applied.
-            let index = if post { 0 } else { offset };
+            // repeat steps one element; b40 is not applied.
             let addr = base.wrapping_add(
                 index
                     .wrapping_add(u32::from(rep))
@@ -2268,8 +2272,9 @@ impl Usse {
                     .map_err(|error| Stop::Fault { pc, addr, error })?;
             }
         }
-        if post {
-            let next = base.wrapping_add(offset.wrapping_mul(size.bytes()));
+        if writeback {
+            let step = if pre { u32::from(insn.repeat) } else { offset };
+            let next = base.wrapping_add(step.wrapping_mul(size.bytes()));
             self.write(base_arg, 0, next, pc, w)?;
         }
         Ok(())

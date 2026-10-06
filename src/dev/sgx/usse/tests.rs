@@ -708,14 +708,18 @@ fn ld_st_go_to_memory() {
 }
 
 #[test]
-fn b41_post_increments_the_base() {
+fn b41_writes_the_base_back() {
+    // With b53 (the helpers' default): access at the base, then base +=
+    // offset. Without: access at base + offset, then base += repeat.
+    let post = |w: u64| w | b(41);
+    let pre = |w: u64| (w | b(41)) & !b(53);
     let mut bus = MockBus::program(
         BASE,
         &[
-            ld(0, 1, 0, s1_imm(1)) | b(41),          // r1 = [r0]; r0 += 4
-            ld(0, 2, 0, s1_imm(0)) | b(41) | rpt(2), // r2, r3 = [r0], [r0+4]
-            st(0, 4, s1_imm(1), s2_r(1)) | b(41),    // [r4] = r1; r4 += 4
-            st(0, 4, s1_imm(1), s2_r(2)) | b(41),    // [r4] = r2; r4 += 4
+            post(ld(0, 1, 0, s1_imm(1))),               // r1 = [r0]; r0 += 4
+            pre(ld(0, 2, 0, s1_imm(0)) | rpt(2)),       // r2, r3 = [r0], [r0+4]; r0 += 8
+            post(st(0, 4, s1_imm(1), s2_r(1))),         // [r4] = r1; r4 += 4
+            pre(st(0, 4, s1_imm(2), s2_r(2)) | rpt(2)), // [r4+8], [r4+12] = r2, r3; r4 += 8
             nop() | b(43),
         ],
     );
@@ -727,9 +731,10 @@ fn b41_post_increments_the_base() {
     u.temp[4] = 0x3000;
     assert_eq!(u.run(&mut bus, 100), Stop::End { pc: 5 });
     assert_eq!(&u.temp[1..4], &[10, 11, 12]);
-    assert_eq!(u.temp[0], 0x2004);
-    assert_eq!(u.temp[4], 0x3008);
-    assert_eq!((bus.mem[&0x3000], bus.mem[&0x3004]), (10, 11));
+    assert_eq!(u.temp[0], 0x200c);
+    assert_eq!(u.temp[4], 0x300c);
+    assert_eq!(bus.mem[&0x3000], 10);
+    assert_eq!((bus.mem[&0x300c], bus.mem[&0x3010]), (11, 12));
 }
 
 #[test]
