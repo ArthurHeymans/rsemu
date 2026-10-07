@@ -1351,6 +1351,8 @@ mod tests {
             );
             sgx.attach_space(&space);
             reg_w(&sgx, KERNEL_DIRECTORY, 0x1000);
+            // The firmware's requester uses directory 7, the kernel's.
+            reg_w(&sgx, 0xc78, 7);
             reg_w(&sgx, 0xa48, CODE >> 6 | 0x0c00_0000);
             (sgx, space)
         }

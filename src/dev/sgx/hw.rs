@@ -100,9 +100,20 @@ const RESUME_PC: u32 = 0xba0;
 
 /// USE code-base registers: `0xa0c + 4·idx`, value `VA >> 6 | flags`.
 const CODE_BASE: u32 = 0xa0c;
-const MMU_DIRECTORY: u32 = 0xc50;
+/// The MMU's eight page directories: index 0 at `0xc84`, 1–7 at
+/// `0xc38 + 4·(i-1)` (the host programs 7, its own, at `0xc50`; the firmware
+/// programs 0, an application's, at `0xc84`, and the driver's lock-up dump
+/// names "EDM context index 7" and "TA context index 0" with those values).
+const DIRECTORY0: u32 = 0xc84;
+const DIRECTORY1: u32 = 0xc38;
+/// Which directory each requester uses, a nibble each; the firmware's own
+/// accesses take nibble 0 (its routine at f2013bd8 sets nibble 0 to 7 for
+/// the kernel's context, or copies the TA's or 3D's nibble into it).
+const BANK_SELECT: u32 = 0xc78;
 const TIMER_CTL: u32 = 0x4144;
-const TIMER_ENABLE: u32 = 1 << 16;
+/// The timer period field \[G\]: the host writes 1000 here, the firmware
+/// saves it, writes 0x10001 while it sets up, and puts it back.
+const TIMER_PERIOD: u32 = 0xffff;
 
 /// The command-kick event's input bit (`IR1`) and the timer's (`IR0`).
 const IR1_KICK: u32 = 0x40;
@@ -142,6 +153,19 @@ fn completion(offset: u32) -> u32 {
         (true, 0x4d10) => 0x3,
         _ => 0,
     }
+}
+
+/// The page directory the firmware's own accesses go through.
+fn edm_directory(s: &State) -> u32 {
+    match s.reg(u64::from(BANK_SELECT)) & 0xf {
+        0 => s.reg(u64::from(DIRECTORY0)),
+        i => s.reg(u64::from(DIRECTORY1 + 4 * (i - 1))),
+    }
+}
+
+/// Whether a register write can change [`edm_directory`].
+fn moves_directory(offset: u32) -> bool {
+    offset == BANK_SELECT || offset == DIRECTORY0 || (DIRECTORY1..DIRECTORY1 + 28).contains(&offset)
 }
 
 /// A PDS program waiting to run.
@@ -224,6 +248,8 @@ impl Diag {
 #[derive(Debug, Default)]
 pub(super) struct Engine {
     cores: [Core; CORES],
+    /// The firmware has been started (a start event was taken).
+    started: bool,
     /// Device ticks since the last timer event.
     timer: u64,
     poll: Poll,
@@ -378,6 +404,10 @@ impl UsseBus for UsseCtx<'_, '_> {
             return;
         }
         self.irq |= self.shared.usse_write_reg(offset, value);
+        if moves_directory(offset) {
+            self.mmu.directory = edm_directory(&self.shared.state.lock());
+            self.mmu.tlb = [(0, 0); 16];
+        }
     }
 
     fn emit(&mut self, emit: &Emit) -> MemResult {
@@ -489,6 +519,7 @@ impl Engine {
         for &(slot, bank) in banks {
             let launch = if s.hw_starts[slot] {
                 s.hw_starts[slot] = false;
+                self.started = true;
                 Some(Engine::event(&s, bank, [0; 3]))
             } else if s.hw_kicks[slot] > 0 {
                 s.hw_kicks[slot] -= 1;
@@ -517,11 +548,13 @@ impl Engine {
                 *c = (s.reg(u64::from(CODE_BASE) + 4 * i as u64) & 0x03ff_ffff) << 6;
             }
             (
-                s.reg(u64::from(MMU_DIRECTORY)),
+                edm_directory(&s),
                 cb,
-                s.reg(u64::from(TIMER_CTL)) & TIMER_ENABLE != 0,
+                s.reg(u64::from(TIMER_CTL)) & TIMER_PERIOD != 0 && self.started,
             )
         };
+        // [G] The timer only runs once the firmware has been started: an
+        // event before that would run the boot program again.
         if timer_on && tuning.timer_ticks != 0 {
             self.timer += ticks;
             if self.timer >= tuning.timer_ticks {
@@ -769,6 +802,7 @@ impl Engine {
     // -- snapshots ----------------------------------------------------------
 
     pub(super) fn save(&self, w: &mut ChunkWriter<'_>) -> Result<()> {
+        w.write_bool(self.started)?;
         w.write_u64(self.timer)?;
         let p = self.poll;
         for v in [p.pc, p.offset, p.value, p.count] {
@@ -797,7 +831,9 @@ impl Engine {
     }
 
     pub(super) fn load(r: &mut ChunkReader<'_>) -> Result<Engine> {
+        let started = r.read_bool()?;
         let mut e = Engine {
+            started,
             timer: r.read_u64()?,
             ..Engine::default()
         };
