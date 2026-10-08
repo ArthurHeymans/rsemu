@@ -216,6 +216,9 @@ struct State {
     hw_starts: [bool; 3],
     /// Hardware mode: command kicks per bank not yet taken.
     hw_kicks: [u32; 3],
+    /// Hardware mode: the host soft-reset the core; the engine drops what it
+    /// was running at its next slice.
+    hw_reset: bool,
 }
 
 impl Default for State {
@@ -227,6 +230,7 @@ impl Default for State {
             ta3d: None,
             hw_starts: [false; 3],
             hw_kicks: [0; 3],
+            hw_reset: false,
         }
     }
 }
@@ -320,6 +324,15 @@ impl Shared {
         let mut s = self.state.lock();
         if self.hw.is_some() && s.hw_event(offset, v) {
             return;
+        }
+        // [G] The host's soft reset (it writes 0x7ff to 0x4080 before every
+        // start, and resets the core this way on recovery) stops whatever
+        // the firmware was running. The firmware's own writes there reset
+        // single units and do not count.
+        if self.hw.is_some() && matches!(offset, 0x0080 | 0x4080) && v != 0 {
+            s.hw_reset = true;
+            s.hw_kicks = [0; 3];
+            s.hw_starts = [false; 3];
         }
         match offset {
             EVENT_CLEAR => *s.reg_mut(EVENT_STATUS) &= !v,
@@ -904,6 +917,7 @@ impl Device for Sgx {
         for k in s.hw_kicks {
             w.write_u32(k)?;
         }
+        w.write_bool(s.hw_reset)?;
         let engine = self.shared.engine.lock();
         w.write_bool(engine.is_some())?;
         match engine.as_ref() {
@@ -929,6 +943,7 @@ impl Device for Sgx {
         for k in &mut hw_kicks {
             *k = r.read_u32()?;
         }
+        let hw_reset = r.read_bool()?;
         let engine = if r.read_bool()? {
             Some(Box::new(hw::Engine::load(r)?))
         } else {
@@ -946,6 +961,7 @@ impl Device for Sgx {
             ta3d: has.then_some(ta3d),
             hw_starts,
             hw_kicks,
+            hw_reset,
         };
         *self.shared.engine.lock() = engine;
         self.shared.drive();
@@ -1527,6 +1543,29 @@ mod tests {
             );
             assert_eq!(reg_r(&sgx, 0x2014), !0, "the stuck poll was let go");
             assert!(idle(&sgx));
+        }
+
+        #[test]
+        fn the_hosts_soft_reset_drops_a_running_task() {
+            let (sgx, space) = hw_board();
+            put_pds(
+                &space,
+                PDS,
+                &[[doutu_w0(0), 1, 0, 0]],
+                &[dout(0, false, 0, [0, 1, 2, 0], 5), HALT],
+            );
+            put64(&space, CODE, &[ba(0)]);
+            reg_w(&sgx, 0x8a68, PDS);
+            reg_w(&sgx, 0x8a6c, 1);
+            reg_w(&sgx, START_KICK, 1);
+            run(&sgx, 2);
+            assert!(!idle(&sgx));
+            reg_w(&sgx, COMMAND_KICK, 1);
+            reg_w(&sgx, 0x4080, 0x7ff);
+            reg_w(&sgx, 0x4080, 0);
+            run(&sgx, 1);
+            assert!(idle(&sgx));
+            assert_eq!(sgx.shared.state.lock().hw_kicks, [0; 3]);
         }
 
         #[test]

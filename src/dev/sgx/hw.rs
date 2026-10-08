@@ -541,6 +541,16 @@ impl Engine {
 
     /// Run a slice of `ticks` device ticks.
     pub(super) fn run(&mut self, shared: &Shared, ticks: u64, tuning: Tuning) {
+        if core::mem::take(&mut shared.state.lock().hw_reset) {
+            if shared.log.is_some() {
+                let busy = self.cores.iter().filter(|c| !c.idle()).count();
+                shared.note(&format!("sgx: soft reset ({busy} busy cores dropped)\n"));
+            }
+            *self = Engine {
+                diag: core::mem::take(&mut self.diag),
+                ..Engine::default()
+            };
+        }
         let (directory, codebases, timer_on) = {
             let s = shared.state.lock();
             let mut cb = [0u32; 16];
