@@ -297,6 +297,7 @@
 //! forbidden.
 
 pub mod disasm;
+pub mod embedding;
 mod exec;
 
 #[cfg(feature = "cpu-x86-lift")]

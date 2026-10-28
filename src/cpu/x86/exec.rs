@@ -506,6 +506,12 @@ pub(super) struct Exec<'a> {
     /// instruction** under the interpreter, so every field it carries is copied
     /// on every one of them, and a niche-optimised reference is one word.
     pub(super) position: Option<&'a Position>,
+    /// Host embedding policy, absent for ordinary machine execution.
+    pub(super) embedded: Option<super::embedding::StepOptions>,
+    /// Event returned to an embedder instead of entering a guest handler.
+    pub(super) exit: Option<super::embedding::Exit>,
+    /// Embedded steps suppress all subsequent transactions after a refusal.
+    pub(super) bus_failed: bool,
 }
 
 /// Where this core publishes its position (`core::sched::TickCursor`), and
@@ -620,6 +626,9 @@ impl<'a> Exec<'a> {
             wrote_n: 0,
             wrote_over: false,
             position: None,
+            embedded: None,
+            exit: None,
+            bus_failed: false,
         }
     }
 
@@ -921,7 +930,14 @@ impl<'a> Exec<'a> {
                 self.entry = self.state.regs;
             }
             self.state.queue.flush();
-            self.deliver(fault);
+            if self.embedded.is_some() {
+                self.exit = Some(super::embedding::exception_exit(fault));
+            } else {
+                self.deliver(fault);
+            }
+            return self.used;
+        }
+        if self.exit.is_some() {
             return self.used;
         }
         if trap && !self.state.int_shadow {
@@ -944,6 +960,10 @@ impl<'a> Exec<'a> {
     /// processor down — real silicon drives a `SHUTDOWN` bus cycle and waits
     /// for `RESET`, which the chipset is expected to notice.
     pub(super) fn deliver(&mut self, first: Fault) {
+        if self.embedded.is_some() {
+            self.exit = Some(super::embedding::exception_exit(first));
+            return;
+        }
         let mut current = first;
         // Three attempts is the whole ladder: the event, the double fault, and
         // the shutdown that follows a fault during the double fault.
@@ -1033,6 +1053,9 @@ impl<'a> Exec<'a> {
     /// The transfer both kinds of read share, already charged for.
     #[inline]
     fn bus_read(&mut self, addr: u64, size: u8) -> u64 {
+        if self.bus_failed {
+            return 0;
+        }
         let width = Self::width_of(size);
         let addr = self.masked(addr);
         match self.mem.read(addr, width, self.attrs) {
@@ -1046,6 +1069,7 @@ impl<'a> Exec<'a> {
                 // finds out.
                 self.state.faults = self.state.faults.wrapping_add(1);
                 self.state.last_fault = addr;
+                self.bus_failed = self.embedded.is_some();
                 let byte = u64::from(self.state.open_bus);
                 // The same byte on every lane, for as many lanes as the
                 // transfer had.
@@ -1056,6 +1080,9 @@ impl<'a> Exec<'a> {
 
     /// One physical bus write of one, two, four or eight bytes.
     pub(super) fn phys_write(&mut self, addr: u64, size: u8, value: u64) {
+        if self.bus_failed {
+            return;
+        }
         self.charge(self.variant().bus_clocks());
         self.publish_position();
         self.state.open_bus = (value >> ((size as u32 - 1) * 8)) as u8;
@@ -1065,6 +1092,7 @@ impl<'a> Exec<'a> {
         if self.mem.write(addr, width, value, self.attrs).is_err() {
             self.state.faults = self.state.faults.wrapping_add(1);
             self.state.last_fault = addr;
+            self.bus_failed = self.embedded.is_some();
         }
     }
 
@@ -1297,6 +1325,9 @@ impl<'a> Exec<'a> {
     /// One I/O read. A core with no I/O space sees an unterminated bus, which
     /// reads as ones — the same answer the corpus expects from a bare 8088.
     pub(super) fn io_read(&mut self, port: u16, size: u8) -> u32 {
+        if self.bus_failed {
+            return 0;
+        }
         self.charge(self.variant().bus_clocks());
         self.publish_position();
         let Some(io) = self.io else {
@@ -1316,6 +1347,7 @@ impl<'a> Exec<'a> {
             Err(_) => {
                 self.state.faults = self.state.faults.wrapping_add(1);
                 self.state.last_fault = u64::from(port);
+                self.bus_failed = self.embedded.is_some();
                 match size {
                     1 => 0xff,
                     2 => 0xffff,
@@ -1326,6 +1358,9 @@ impl<'a> Exec<'a> {
     }
 
     pub(super) fn io_write(&mut self, port: u16, size: u8, value: u32) {
+        if self.bus_failed {
+            return;
+        }
         self.charge(self.variant().bus_clocks());
         self.publish_position();
         let Some(io) = self.io else {
@@ -1342,6 +1377,7 @@ impl<'a> Exec<'a> {
         {
             self.state.faults = self.state.faults.wrapping_add(1);
             self.state.last_fault = u64::from(port);
+            self.bus_failed = self.embedded.is_some();
         }
     }
 
@@ -1832,6 +1868,9 @@ impl<'a> Exec<'a> {
         }
         self.prepare_ea(&fields);
         self.charge(fields.insn.op.clocks());
+        if self.embedded_intercept(&fields)? {
+            return Ok(());
+        }
         // `LOCK#` asserted: hold the space's bus lock across the whole
         // instruction, so that its read and its write are one indivisible
         // transaction to every other master on the space. Here rather than
@@ -3612,8 +3651,12 @@ impl<'a> Exec<'a> {
         };
         // `REP` with a zero count does nothing at all — not even one
         // iteration.
+        let mut remaining = self.embedded.map(|o| o.repeat_limit.max(1));
         while self.counter(f) != 0 {
             self.string_step(f, size, delta)?;
+            if self.bus_failed {
+                return Ok(());
+            }
             let count = self.counter(f).wrapping_sub(1);
             self.set_counter(f, count);
             if op.repeat_tests_zf() {
@@ -3630,6 +3673,15 @@ impl<'a> Exec<'a> {
                 break;
             }
             self.charge(op.clocks());
+            if let Some(left) = remaining.as_mut() {
+                *left -= 1;
+                if *left == 0 {
+                    self.state.regs.rip = self.start_ip;
+                    self.state.queue.flush();
+                    self.exit = Some(super::embedding::Exit::RepeatYield);
+                    return Ok(());
+                }
+            }
             // A repeat is interruptible between iterations: the processor
             // backs the instruction pointer up to the prefix and re-enters.
             // Modelled as a clean restart; the 8086 erratum where it forgets
@@ -3797,7 +3849,7 @@ impl<'a> Exec<'a> {
 
     /// `INT n`, which is not the same as an exception: in protected mode the
     /// gate's privilege level is checked against the caller's.
-    fn software_interrupt(&mut self, vector: u8) -> Ex<()> {
+    pub(super) fn software_interrupt(&mut self, vector: u8) -> Ex<()> {
         if self.protected() {
             self.check_software_gate(vector)?;
         }
