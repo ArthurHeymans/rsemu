@@ -467,6 +467,26 @@ fn the_wide_encodings_decode_to_what_they_say() {
             half: false
         }
     );
+    // `BPL.W +0x134`: imm6 is hw1[5:0], and the condition in hw1[9:6] must
+    // not leak into the offset. Decoding it as +0x5134 sent STM32 HAL
+    // clock-config code into a literal pool.
+    let [a, b] = wide(0xf140_809a);
+    assert_eq!(
+        decode(a, b),
+        Insn::Branch {
+            cond: Some(Cond(0b0101)),
+            offset: 0x134
+        }
+    );
+    // `BNE.W -0x3c` with a non-zero imm6: hw1 = S=1, cond=0001, imm6=0x3f.
+    let [a, b] = wide(0xf47f_afe2);
+    assert_eq!(
+        decode(a, b),
+        Insn::Branch {
+            cond: Some(Cond(0b0001)),
+            offset: -0x3c
+        }
+    );
     // A coprocessor encoding is distinct from an undefined one: the fault
     // differs, and firmware reads exactly that bit to find out there is no
     // coprocessor. Fourteen is the debug one, which nothing here implements

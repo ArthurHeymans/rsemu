@@ -2023,9 +2023,11 @@ fn decode_32_branch_misc(a: u32, b: u32) -> Insn {
                 return decode_32_system(a, b, op);
             }
             // B<cond>.W (T3): ±1 MiB.
-            let imm = (s << 20) | (j2 << 19) | (j1 << 18) | (field(a, 9, 6) << 12) | (imm11 << 1);
-            // The condition field is `hw1[9:6]`, and `111x` is not a
-            // condition — those encodings are the system space handled above.
+            // imm32 = SignExtend(S:J2:J1:imm6:imm11:'0') with imm6 = `hw1[5:0]`
+            // (DDI 0403 A7.7.12). The condition field is `hw1[9:6]`, and
+            // `111x` is not a condition — those encodings are the system
+            // space handled above.
+            let imm = (s << 20) | (j2 << 19) | (j1 << 18) | (field(a, 5, 0) << 12) | (imm11 << 1);
             Insn::Branch {
                 cond: Some(Cond(field(a, 9, 6) as u8)),
                 offset: sign_extend(imm, 21),
