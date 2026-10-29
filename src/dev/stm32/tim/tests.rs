@@ -19,6 +19,7 @@ fn general() -> Tim {
         mask: 0xffff,
         channels: 4,
         arr_reset: 0,
+        layout: Layout::F4,
     })
 }
 
@@ -29,6 +30,7 @@ fn general32() -> Tim {
         mask: 0xffff_ffff,
         channels: 4,
         arr_reset: 0,
+        layout: Layout::F4,
     })
 }
 
@@ -39,6 +41,7 @@ fn advanced() -> Tim {
         mask: 0xffff,
         channels: 4,
         arr_reset: 0,
+        layout: Layout::F4,
     })
 }
 
@@ -49,6 +52,7 @@ fn basic() -> Tim {
         mask: 0xffff,
         channels: 0,
         arr_reset: 0,
+        layout: Layout::F4,
     })
 }
 
@@ -2104,4 +2108,96 @@ fn the_gate_pins_are_in_the_schema() {
             "and the validator knows `{pin}`"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The u5 layout
+// ---------------------------------------------------------------------------
+
+/// A `TIM1` in the U5's register map.
+fn advanced_u5() -> Tim {
+    Tim::with_config(Config {
+        variant: Variant::Advanced,
+        mask: 0xffff,
+        channels: 4,
+        arr_reset: 0,
+        layout: Layout::U5,
+    })
+}
+
+#[test]
+fn the_u5_layout_stores_ccr5_to_or1_and_moves_dcr_and_dmar() {
+    let tim = advanced_u5();
+    assert_eq!(tim.region.len(), REGISTER_BYTES_U5);
+    // CCR5 … OR1: stored and read back, and none of them is DCR or DMAR.
+    for i in 0..U5_EXT_COUNT as u64 {
+        poke(&tim, 0x48 + 4 * i, 0x100 + i as u32);
+    }
+    for i in 0..U5_EXT_COUNT as u64 {
+        assert_eq!(peek(&tim, 0x48 + 4 * i), 0x100 + i as u32);
+    }
+    assert_eq!(peek(&tim, U5_DCR), 0, "a CCR5 write is not a DCR write");
+    // DCR and DMAR at the top: a burst of two from ARR (DBA = 11).
+    poke(&tim, U5_DCR, 11 | (1 << 8));
+    assert_eq!(peek(&tim, U5_DCR), 11 | (1 << 8));
+    poke(&tim, U5_DMAR, 1234);
+    poke(&tim, U5_DMAR, 5678);
+    assert_eq!(peek(&tim, OFF_ARR), 1234);
+    assert_eq!(peek(&tim, 0x30), 5678 & 0xff, "RCR is the next word");
+    // A burst from DBA = 18 reaches CCR5, in this map.
+    poke(&tim, U5_DCR, 18);
+    poke(&tim, U5_DMAR, 0xbeef);
+    assert_eq!(peek(&tim, 0x48), 0xbeef);
+    // The words past OR1 and short of DCR are reserved.
+    poke(&tim, 0x6c, 0xffff_ffff);
+    assert_eq!(peek(&tim, 0x6c), 0);
+    // The F4 map is untouched: 0x48 is still its DCR.
+    let f4 = advanced();
+    poke(&f4, 0x48, 11);
+    assert_eq!(peek(&f4, OFF_DCR), 11);
+}
+
+#[test]
+fn a_u5_basic_timer_reads_the_extended_words_as_zero() {
+    let tim = Tim::new(
+        &Props::new()
+            .with("variant", Value::from("basic"))
+            .with("layout", Value::from("u5")),
+    )
+    .unwrap();
+    assert_eq!(tim.layout(), Layout::U5);
+    poke(&tim, 0x48, 7);
+    assert_eq!(peek(&tim, 0x48), 0);
+    assert!(Tim::new(&Props::new().with("layout", Value::from("h7"))).is_err());
+}
+
+#[test]
+fn a_u5_snapshot_round_trips_to_identical_state() {
+    let saved = advanced_u5();
+    for i in 0..U5_EXT_COUNT as u64 {
+        poke(&saved, 0x48 + 4 * i, 0xa0 + i as u32);
+    }
+    poke(&saved, U5_DCR, 11 | (2 << 8));
+    poke(&saved, U5_DMAR, 99);
+    poke(&saved, OFF_PSC, 3);
+    start(&saved);
+    saved.advance_by(17);
+
+    let mut shape = MachineShape::new();
+    shape.add_device("tim1", CLASS_NAME).unwrap();
+    let mut w = StateWriter::new(shape);
+    {
+        let mut chunk = w.chunk("tim1", CLASS_NAME, STATE_VERSION).unwrap();
+        Device::save(&saved, &mut chunk).unwrap();
+    }
+    let bytes = w.to_vec().unwrap();
+    let restored = advanced_u5();
+    let reader = StateReader::new(&bytes).unwrap();
+    let chunk = reader
+        .load("tim1", CLASS_NAME, STATE_VERSION, &Migrations::new())
+        .unwrap();
+    Device::load(&restored, &mut chunk.reader()).unwrap();
+    let before = *saved.shared.regs.lock();
+    let after = *restored.shared.regs.lock();
+    assert_eq!(after, before);
 }

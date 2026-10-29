@@ -68,6 +68,37 @@
 //! * **`SMCR.MSM`**, which on the part delays `TRGO` by a clock so a master and
 //!   its slave start on the same edge. Propagation here is instantaneous.
 //!
+//! # The U5 register map: `layout = "u5"`
+//!
+//! The STM32U5 (and the G4/L5/H5 generation it shares the block with) put
+//! six channels' worth of registers where the F4/L4 had `DCR`, `DMAR` and
+//! `OR`, and moved `DCR`/`DMAR` to the top of the kilobyte (`TIM_TypeDef` in
+//! ST CMSIS `stm32u585xx.h`, Apache-2.0; RM0456's timer chapters):
+//!
+//! | Offset | `layout = "f4"` (default) | `layout = "u5"` |
+//! | --- | --- | --- |
+//! | `0x48` | `DCR` | `CCR5` |
+//! | `0x4C` | `DMAR` | `CCR6` |
+//! | `0x50` | `OR1` | `CCMR3` |
+//! | `0x54`–`0x5C` | — | `DTR2`, `ECR`, `TISEL` |
+//! | `0x60`–`0x68` | `OR2` at `0x60` | `AF1`, `AF2`, `OR1` |
+//! | `0x3DC`, `0x3E0` | — | `DCR`, `DMAR` |
+//!
+//! So this is not a variant of the subset (`variant` stays `basic`/`general`/
+//! `advanced`) but a second property: the same block at other addresses. On
+//! the `u5` layout a write of `CCR6` is a `CCR6` write rather than a `DMAR`
+//! write that walks a burst into some other register, `DCR`/`DMAR` are where
+//! `HAL_TIM_DMABurst_*` writes them, and `DBA` counts from `CR1` in that
+//! map, so a burst over `CCR5` reaches it. The nine registers at `0x48`–`0x68`
+//! are **stored and read back** on a general or advanced timer and do
+//! nothing else: there is no fifth or sixth channel, no asymmetric dead time,
+//! no index input, and `TISEL`/`AF1`/`AF2`/`OR1` select which pin or signal an
+//! input comes from, which is the board's wiring here as `OR1`/`OR2` always
+//! were. A basic timer reads them as zero. The four-bit `SMS`/`OCxM`
+//! extensions and the five-bit `TS` that RM0456 adds sit in bits this model
+//! does not decode; firmware that leaves them zero, which is the HAL's
+//! default for everything but the U5-only modes, sees no difference.
+//!
 //! # The digital input filters
 //!
 //! `ICxF` and `ETF` are *N* consecutive samples at a division of `f_DTS`
@@ -188,6 +219,32 @@ const STATE_VERSION: u32 = 2;
 /// zero, which is what an unimplemented register in the peripheral's own
 /// kilobyte does.
 pub const REGISTER_BYTES: u64 = 0x64;
+
+/// How many bytes the `u5` layout occupies: through `DMAR` at `0x3E0`.
+pub const REGISTER_BYTES_U5: u64 = 0x3e4;
+
+/// The `u5` layout's first stored-only register, `CCR5`.
+const U5_EXT_FIRST: u64 = 0x48;
+/// How many stored-only registers the `u5` layout has: `CCR5` through `OR1`.
+const U5_EXT_COUNT: usize = 9;
+/// Where the `u5` layout puts `DCR` (ST CMSIS `stm32u585xx.h`, `TIM_TypeDef`).
+const U5_DCR: u64 = 0x3dc;
+/// Where the `u5` layout puts `DMAR`.
+const U5_DMAR: u64 = 0x3e0;
+/// Where the stored-only registers live in this file's internal offset
+/// space: past anything either map decodes, so no `match` arm can collide.
+const INTERNAL_EXT: u64 = 0x1_0000;
+
+/// Which register map the block has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Layout {
+    /// The F4/F7/L4 map: `DCR`/`DMAR` at `0x48`/`0x4C`, `OR1`/`OR2`.
+    #[default]
+    F4,
+    /// The U5/G4/L5 map: `CCR5`…`OR1` at `0x48`–`0x68`, `DCR`/`DMAR` at
+    /// `0x3DC`/`0x3E0`.
+    U5,
+}
 
 /// The most capture/compare channels any variant has.
 pub const MAX_CHANNELS: usize = 4;
@@ -534,9 +591,38 @@ struct Config {
     channels: usize,
     /// What `ARR` reads out of reset.
     arr_reset: u32,
+    /// Which register map.
+    layout: Layout,
 }
 
 impl Config {
+    /// The offset `offset` of this layout means in the F4-shaped space the
+    /// register code is written against.
+    fn internal(&self, offset: u64) -> u64 {
+        match (self.layout, offset) {
+            (Layout::F4, _) => offset,
+            (Layout::U5, U5_DCR) => OFF_DCR,
+            (Layout::U5, U5_DMAR) => OFF_DMAR,
+            (Layout::U5, o)
+                if (U5_EXT_FIRST..U5_EXT_FIRST + 4 * U5_EXT_COUNT as u64).contains(&o) =>
+            {
+                INTERNAL_EXT + (o - U5_EXT_FIRST)
+            }
+            // `DCR`, `DMAR` and `OR1` are not at their F4 offsets on a U5, and
+            // every one of those is inside the range above; anything else
+            // past it is a reserved word.
+            (Layout::U5, o) if o >= U5_EXT_FIRST => u64::MAX,
+            (Layout::U5, o) => o,
+        }
+    }
+
+    fn register_bytes(&self) -> u64 {
+        match self.layout {
+            Layout::F4 => REGISTER_BYTES,
+            Layout::U5 => REGISTER_BYTES_U5,
+        }
+    }
+
     /// Whether this instance has complementary outputs at all.
     fn advanced(&self) -> bool {
         matches!(self.variant, Variant::Advanced)
@@ -651,6 +737,10 @@ struct Regs {
     /// is nothing for them to switch.
     or: [u32; 2],
 
+    /// The `u5` layout's `CCR5`, `CCR6`, `CCMR3`, `DTR2`, `ECR`, `TISEL`,
+    /// `AF1`, `AF2` and `OR1`: stored and read back, nothing more.
+    ext: [u32; U5_EXT_COUNT],
+
     /// The raw level each `TIx` pin's net last delivered.
     ti_raw: [bool; MAX_CHANNELS],
     /// The same after `CR2.TI1S` and the `ICxF` filter: `TIxF`.
@@ -724,6 +814,7 @@ impl Regs {
             down: false,
             ocref: [false; MAX_CHANNELS],
             or: [0; 2],
+            ext: [0; U5_EXT_COUNT],
             ti_raw: [false; MAX_CHANNELS],
             ti_filt: [false; MAX_CHANNELS],
             ti_pend: [false; MAX_CHANNELS],
@@ -1890,6 +1981,9 @@ impl Shared {
             OFF_DMAR if !basic => 0,
             OFF_OR1 => regs.or[0],
             OFF_OR2 => regs.or[1],
+            o if !basic && (INTERNAL_EXT..INTERNAL_EXT + 4 * U5_EXT_COUNT as u64).contains(&o) => {
+                regs.ext[((o - INTERNAL_EXT) / 4) as usize]
+            }
             _ => {
                 // The compare registers, and everything this variant does not
                 // implement, which reads as zero rather than faulting: the
@@ -2020,6 +2114,9 @@ impl Shared {
             OFF_DMAR if !basic => {}
             OFF_OR1 => regs.or[0] = value,
             OFF_OR2 => regs.or[1] = value,
+            o if !basic && (INTERNAL_EXT..INTERNAL_EXT + 4 * U5_EXT_COUNT as u64).contains(&o) => {
+                regs.ext[((o - INTERNAL_EXT) / 4) as usize] = value;
+            }
             _ => {
                 if let Some(i) = channel_of(offset)
                     && i < cfg.channels
@@ -2043,7 +2140,10 @@ impl Shared {
     /// reaches is `0x3e * 4`, well past the registers that exist — and a
     /// register that does not exist reads as zero, as everywhere else here.
     fn dmar_offset(&self, regs: &Regs) -> u64 {
-        (u64::from(regs.dcr & 0x1f) + u64::from(regs.dma_index)) * 4
+        // `DBA` counts words in *this layout's* map, so a `u5` burst from
+        // `DBA = 18` lands on `CCR5`, not on the F4's `DCR`.
+        self.cfg
+            .internal((u64::from(regs.dcr & 0x1f) + u64::from(regs.dma_index)) * 4)
     }
 
     /// The same, and advance the burst index.
@@ -2216,6 +2316,10 @@ impl Tim {
         let width = r.or::<u64>("width", 16)?;
         let channels = r.or::<u64>("channels", variant.default_channels())?;
         let arr_reset = r.or::<u64>("arr-reset", 0)?;
+        let layout = match r.or_enum("layout", "f4", &["f4", "u5"])? {
+            "u5" => Layout::U5,
+            _ => Layout::F4,
+        };
         r.finish()?;
 
         let mask: u32 = match width {
@@ -2249,6 +2353,7 @@ impl Tim {
             mask,
             channels: channels as usize,
             arr_reset: arr_reset as u32,
+            layout,
         }))
     }
 
@@ -2272,7 +2377,7 @@ impl Tim {
         }
         let region = Arc::new(Region::io(
             "st.tim.regs",
-            REGISTER_BYTES,
+            cfg.register_bytes(),
             Arc::clone(&shared) as Arc<dyn MemOps>,
         ));
         Tim {
@@ -2286,6 +2391,12 @@ impl Tim {
     #[must_use]
     pub fn variant(&self) -> Variant {
         self.shared.cfg.variant
+    }
+
+    /// Which register map it has.
+    #[must_use]
+    pub fn layout(&self) -> Layout {
+        self.shared.cfg.layout
     }
 
     /// How many capture/compare channels it has.
@@ -2408,6 +2519,13 @@ impl Device for Tim {
         w.write_bool(regs.trgi)?;
         w.write_u32(regs.trgo_pulses)?;
         w.write_bool(regs.down)?;
+        // The `u5` layout's stored-only words, on that layout alone: it is a
+        // construction property, so an `f4` chunk is what it always was.
+        if self.shared.cfg.layout == Layout::U5 {
+            for value in regs.ext {
+                w.write_u32(value)?;
+            }
+        }
         // The domain position. The next-event tick is derived from the rest and
         // is recomputed by `load`, so it is not written (`CLAUDE.md`: derived
         // state is never serialized).
@@ -2460,6 +2578,11 @@ impl Device for Tim {
         regs.trgi = r.read_bool()?;
         regs.trgo_pulses = r.read_u32()?;
         regs.down = r.read_bool()?;
+        if self.shared.cfg.layout == Layout::U5 {
+            for slot in &mut regs.ext {
+                *slot = r.read_u32()?;
+            }
+        }
         let tick = r.read_u64()?;
         {
             let mut slot = self.shared.regs.lock();
@@ -2627,7 +2750,7 @@ impl MemOps for Shared {
             return Ok(());
         }
         self.sync(attrs);
-        let reg = offset & !3;
+        let reg = self.cfg.internal(offset & !3);
         let basic = matches!(self.cfg.variant, Variant::Basic);
         let (value, changed) = {
             let mut regs = self.regs.lock();
@@ -2687,7 +2810,7 @@ impl MemOps for Shared {
             return Ok(());
         }
         self.sync(attrs);
-        let reg = offset & !3;
+        let reg = self.cfg.internal(offset & !3);
         {
             let mut regs = self.regs.lock();
             let value = match src.len() {
@@ -2775,6 +2898,13 @@ pub static CLASS: DeviceClass = DeviceClass {
             required: false,
             summary: "what ARR reads out of reset (default 0, which is RM0090's value)",
         },
+        PropertySpec {
+            name: "layout",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "register map: \"f4\" (default; F4/F7/L4) or \"u5\" (CCR5..OR1 at \
+                      0x48-0x68, DCR/DMAR at 0x3DC/0x3E0)",
+        },
     ],
     construct: |props| Ok(Box::new(Tim::new(props)?)),
 };
@@ -2805,6 +2935,7 @@ pub fn schema() -> ClassSchema {
         .prop(PropSchema::new("width", ValueKind::Uint).range(16, 32))
         .prop(PropSchema::new("channels", ValueKind::Uint).range(0, MAX_CHANNELS as u64))
         .prop(PropSchema::new("arr-reset", ValueKind::Uint).range(0, u64::from(u32::MAX)))
+        .prop(PropSchema::new("layout", ValueKind::Str).values(&["f4", "u5"]))
         .region("")
         .region("regs")
         // An M-profile board wires these straight to the core, with the vector
