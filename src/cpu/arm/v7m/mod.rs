@@ -21,6 +21,22 @@
 //! option does. Double precision is not implemented at either revision; see
 //! "Unimplemented" below and [`fp`]'s own documentation.
 //!
+//! **Armv8-M Mainline** — the Cortex-M33 — is here as well, behind the
+//! `cpu-arm-v8m` feature and selected by [`Config::CORTEX_M33`] /
+//! `CORTEX_M33F` (`part = "cortex-m33"` / `"cortex-m33f"`): the
+//! `MSPLIM`/`PSPLIM` stack limits with the `STKOF` UsageFault, the v8-M
+//! `EXC_RETURN` format, `LDA`/`STL`/`LDAEX`/`STLEX`, `TT`, the PMSAv8 MPU and
+//! the v8-M `CCR`/`FPCCR` bits — modelled **without the Security Extension**,
+//! which is what an STM32U5 with `TZEN = 0` presents. `v8m`'s own
+//! documentation says exactly what that includes and leaves out. Everything
+//! v8-M changes keys off [`Config::arch`]; a v7-M part behaves identically
+//! whether or not the feature is compiled in.
+//!
+//! The reset sequence reads `SP` and `PC` from [`Config::reset_vtor`] — the
+//! `vtor` property — which every reset restores. Zero, as DDI 0403 has it,
+//! unless the SoC boots elsewhere; an STM32U5 boots from `0x08000000` with
+//! nothing mapped at zero.
+//!
 //! # Using it from another crate
 //!
 //! Built to be consumed directly, without a `.machine` file — a downstream SoC
@@ -68,6 +84,7 @@
 //! | [`sys`] | exception numbers, priorities, and the register map at `0xE000E000` |
 //! | `fp` | the floating-point register file, `FPSCR`, and the Arm rules over [`crate::float`] |
 //! | `fpisa` | the floating-point encodings, and their disassembly |
+//! | `v8m` | Armv8-M Mainline: PMSAv8, the v8-M register map, `EXC_RETURN`, `TT` |
 //! | `dsp` (private) | the SIMD and extending-move semantics |
 //! | `exec` (private) | the interpreter and its timing model |
 //!
@@ -95,8 +112,10 @@
 //!
 //! # Sources
 //!
-//! *ARMv7-M Architecture Reference Manual*, ARM DDI 0403; the *Cortex-M4* and
-//! *Cortex-M7 Technical Reference Manuals* for the implementation-defined
+//! *ARMv7-M Architecture Reference Manual*, ARM DDI 0403; the *Armv8-M
+//! Architecture Reference Manual*, Arm DDI 0553, for the Cortex-M33; the
+//! *Cortex-M4*, *Cortex-M7* and *Cortex-M33 Technical Reference Manuals* for
+//! the implementation-defined
 //! values (`CPUID`, the number of priority bits, MPU region count) and the
 //! instruction timings. No emulator source of any licence was consulted
 //! (`ROADMAP.md` §1).
@@ -124,6 +143,9 @@ mod fptests;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, feature = "cpu-arm-v8m"))]
+mod v8mtests;
 
 // The differential harness runs this core and the A-profile one over the same
 // instruction stream, so it only exists where both are compiled.
@@ -373,8 +395,8 @@ pub struct Config {
     pub priority_bits: u8,
     /// Whether this part has the bit-band alias windows.
     ///
-    /// Cortex-M3 and Cortex-M4 do; Cortex-M7 does not, and neither do the
-    /// M0/M0+/M23/M33 parts this core does not model. It is a property of
+    /// Cortex-M3 and Cortex-M4 do; Cortex-M7 and Cortex-M33 do not, and
+    /// neither do the M0/M0+/M23 parts this core does not model. It is a property of
     /// the *core's* bus matrix rather than of a board, which is why it is
     /// here and not a region a `.machine` file has to remember to map — see
     /// [`Config::with_bit_band`], which says why in full.

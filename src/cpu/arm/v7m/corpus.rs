@@ -1911,3 +1911,192 @@ fill_frame:
 
     b pass
 "#;
+
+/// Armv8-M Mainline on a Cortex-M33: load-acquire/store-release, `TT` against
+/// a PMSAv8 region, the v8-M `EXC_RETURN` values, a stack-limit violation
+/// caught and stepped over, and every condition of the wide conditional
+/// branch over a gap wide enough that `imm6` is non-zero in both directions.
+///
+/// Expected values are DDI 0553's (`TT_RESP`, `EXC_RETURN`, `UFSR.STKOF`)
+/// as `super::v8m` states them.
+#[cfg(feature = "cpu-arm-v8m")]
+pub(super) const V8M_MAINLINE: &str = r#"
+    .cpu cortex-m33
+    b v8_main
+
+    .thumb_func
+lr_handler:
+    mov r5, lr
+    bx lr
+
+    @ Record CFSR, clear it, and resume past the sixteen-bit instruction
+    @ that overflowed.
+    .thumb_func
+stkof_handler:
+    LOADC r4, 0xe000ed28
+    ldr r6, [r4]
+    str r6, [r4]
+    ldr r4, [sp, #24]
+    adds r4, r4, #2
+    str r4, [sp, #24]
+    bx lr
+
+    .thumb_func
+v8_main:
+    @ Load-acquire and store-release, every size.
+    LOADC r1, 0x20000100
+    LOADC r0, 0x8badf00d
+    stl r0, [r1]
+    lda r2, [r1]
+    CHECK 1, r2, 0x8badf00d
+    stlb r0, [r1]
+    ldab r2, [r1]
+    CHECK 2, r2, 0x0000000d
+    stlh r0, [r1]
+    ldah r2, [r1]
+    CHECK 3, r2, 0x0000f00d
+
+    @ The exclusive forms: one store through, the next refused.
+    ldaex r2, [r1]
+    stlex r3, r0, [r1]
+    CHECK 4, r3, 0
+    stlex r3, r0, [r1]
+    CHECK 5, r3, 1
+    ldaexb r2, [r1]
+    CHECK 6, r2, 0x0000000d
+    stlexb r3, r2, [r1]
+    CHECK 7, r3, 0
+
+    @ TT with the MPU off: no region, readable and writable.
+    tt r2, r1
+    CHECK 8, r2, 0x000c0000
+    sg
+    csdb
+    ssbb
+    pssbb
+
+    @ A PMSAv8 region 3 over 0x20000100-0x200001FF, read/write for anyone;
+    @ TT now names it.
+    LOADC r4, 0xe000ed98
+    movs r0, #3
+    str r0, [r4]
+    LOADC r0, 0x20000102
+    str r0, [r4, #4]
+    LOADC r0, 0x200001e1
+    str r0, [r4, #8]
+    LOADC r4, 0xe000ed94
+    movs r0, #5
+    str r0, [r4]
+    dsb
+    isb
+    tt r2, r1
+    CHECK 9, r2, 0x000d0003
+    movs r0, #0
+    str r0, [r4]
+    dsb
+    isb
+
+    @ EXC_RETURN in the Armv8-M format: Thread/PSP, then Thread/MSP.
+    LOADC r0, HANDLER_PTR
+    adr r1, lr_handler
+    orr r1, r1, #1
+    str r1, [r0]
+    LOADC r0, 0x20008000
+    msr psp, r0
+    movs r1, #2
+    msr control, r1
+    isb
+    movs r5, #0
+    svc #0
+    movs r1, #0
+    msr control, r1
+    isb
+    CHECK 10, r5, 0xffffffbc
+    movs r5, #0
+    svc #0
+    CHECK 11, r5, 0xffffffb8
+
+    @ MSPLIM: a MOV to SP below it is a STKOF UsageFault and SP stays put.
+    LOADC r0, 0x2000f000
+    msr msplim, r0
+    mrs r2, msplim
+    CHECK 12, r2, 0x2000f000
+    LOADC r0, 0xe000ed24
+    ldr r1, [r0]
+    orr r1, r1, #0x40000
+    str r1, [r0]
+    LOADC r0, HANDLER_PTR
+    adr r1, stkof_handler
+    orr r1, r1, #1
+    str r1, [r0]
+    movs r6, #0
+    LOADC r0, 0x2000e000
+    mov sp, r0
+    mov r2, sp
+    CHECK 13, r2, 0x20010000
+    CHECK 14, r6, 0x00100000
+    movs r0, #0
+    msr msplim, r0
+
+    @ B<cond>.W, every condition, forward over a 4 KiB gap and back again,
+    @ so imm6 is non-zero both ways. First N=1 Z=0 C=1 V=0.
+    LOADC r0, 0xa0000000
+    msr APSR_nzcvq, r0
+    bne.w f1
+b1: bcs.w f2
+b2: bmi.w f3
+b3: bvc.w f4
+b4: bhi.w f5
+b5: blt.w f6
+b6: ble.w f7
+b7: beq.w cond_fail
+    bcc.w cond_fail
+    bpl.w cond_fail
+    bvs.w cond_fail
+    bls.w cond_fail
+    bge.w cond_fail
+    bgt.w cond_fail
+    @ N=0 Z=1 C=0 V=1.
+    LOADC r0, 0x50000000
+    msr APSR_nzcvq, r0
+    beq.w f8
+b8: bcc.w f9
+b9: bpl.w f10
+b10: bvs.w f11
+b11: bls.w f12
+b12: bne.w cond_fail
+    bhi.w cond_fail
+    bge.w cond_fail
+    @ All clear: GE and GT.
+    LOADC r0, 0x00000000
+    msr APSR_nzcvq, r0
+    bge.w f13
+b13: bgt.w f14
+b14: blt.w cond_fail
+    ble.w cond_fail
+    b.w cond_done
+
+    .space 4200
+
+f1: bne.w b1
+f2: bcs.w b2
+f3: bmi.w b3
+f4: bvc.w b4
+f5: bhi.w b5
+f6: blt.w b6
+f7: ble.w b7
+f8: beq.w b8
+f9: bcc.w b9
+f10: bpl.w b10
+f11: bvs.w b11
+f12: bls.w b12
+f13: bge.w b13
+f14: bgt.w b14
+
+cond_fail:
+    movs r0, #20
+    b fail
+
+cond_done:
+    b pass
+"#;

@@ -218,6 +218,15 @@ impl Test {
         }
     }
 
+    /// The same test on a Cortex-M33, assembled for Armv8-M Mainline.
+    #[cfg(feature = "cpu-arm-v8m")]
+    const fn on_m33(self) -> Test {
+        Test {
+            part: Config::CORTEX_M33,
+            ..self
+        }
+    }
+
     /// Whether this test's part has a floating-point unit, which decides the
     /// `-mfpu` `clang` needs.
     const fn wants_fpu(&self) -> bool {
@@ -248,6 +257,8 @@ static CORPUS: &[Test] = &[
     Test::new("fp-memory", super::corpus::FP_MEMORY).on_m4f(),
     #[cfg(feature = "cpu-arm-v7m-fp")]
     Test::new("fp-exceptions", super::corpus::FP_EXCEPTIONS).on_m4f(),
+    #[cfg(feature = "cpu-arm-v8m")]
+    Test::new("v8m-mainline", super::corpus::V8M_MAINLINE).on_m33(),
 ];
 
 /// What running one test produced.
@@ -293,10 +304,17 @@ fn assemble(clang: &str, dir: &Path, test: &Test) -> Result<Object, String> {
     let src = dir.join(format!("{}.S", test.name));
     let obj = dir.join(format!("{}.o", test.name));
     std::fs::write(&src, source).map_err(|e| format!("writing {}: {e}", src.display()))?;
+    // An Armv8-M test is assembled for the architecture it runs on, so an
+    // encoding ARMv7-M does not have is accepted rather than refused.
+    let (target, cpu) = if test.part.is_v8m() {
+        ("--target=thumbv8m.main-none-eabi", "-mcpu=cortex-m33")
+    } else {
+        ("--target=thumbv7em-none-eabi", "-mcpu=cortex-m4")
+    };
     let output = Command::new(clang)
         .args([
-            "--target=thumbv7em-none-eabi",
-            "-mcpu=cortex-m4",
+            target,
+            cpu,
             "-mthumb",
             // A test that names `S0` needs the assembler told the unit is
             // there; one that does not is unaffected by the flag.

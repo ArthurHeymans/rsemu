@@ -1,0 +1,66 @@
+# Known gaps: cpu-arm-v8m, Armv8-M Mainline (Cortex-M33) in the ARMv7E-M core
+# (src/cpu/arm/v7m/v8m.rs, and the feature-gated arms in isa.rs and exec.rs).
+#
+# Like cpu-arm-v7m-fp.txt beside it, this ledger is not keyed by the name of a
+# test in a downloaded suite: there is no permissively licensed Armv8-M
+# conformance corpus to download. What measures the feature instead is
+#
+#   * src/cpu/arm/v7m/v8mtests.rs -- one test per mechanism: every new
+#     encoding against `arm-none-eabi-objdump`'s listing of it, each of them
+#     UNDEFINED on a Cortex-M4, STKOF on an instruction and on exception
+#     entry, the EXC_RETURN values, PMSAv8 permissions and overlap, TT, and
+#     the snapshot round trip;
+#   * `v8m-mainline` in the built ARMv7E-M corpus (conformance.rs), assembled
+#     by `clang --target=thumbv8m.main-none-eabi -mcpu=cortex-m33`: 14 checks
+#     plus every condition of B<cond>.W taken across a 4 KiB gap in both
+#     directions, so imm6 is never zero;
+#   * the whole ARMv7-M suite run with the feature on, which is what says a
+#     v7-M part is unchanged by it.
+#
+# Everything below is a deliberate and stated non-implementation. **This file
+# only ever shrinks**, a defect never goes in it, and every line says what it
+# is declining and what a guest sees instead.
+#
+# ---------------------------------------------------------------------------
+# 2026-10-29: the initial landing.
+#
+#   * v8mtests.rs: 31 of 31 pass.
+#   * the built corpus: 18 of 18 programs pass, one of them Armv8-M.
+# ---------------------------------------------------------------------------
+
+security-extension          # TrustZone for Armv8-M: Secure state, the SAU and
+                            # IDAU, the `_NS` register banks, secure
+                            # exception frames and FNC_RETURN. The core is a
+                            # v8-M Mainline part *without* the extension --
+                            # what an STM32U5 with TZEN=0 presents. The SAU
+                            # block and NVIC_ITNS read as zero; `_NS` MRS/MSR
+                            # aliases are RAZ/WI; TTA/TTAT, BXNS and BLXNS are
+                            # UNDEFINED; SG is a NOP; EXC_RETURN.S/ES set or
+                            # DCRS clear is INVPC. DDI 0553 B3, C2.4.
+
+id-registers                # ID_PFR0-1, ID_DFR0, ID_AFR0, ID_MMFR0-3 and
+                            # ID_ISAR0-5 read as zero, as they do on this
+                            # core's v7-M parts: the Cortex-M33 TRM's values
+                            # were not in hand to copy, and a guessed feature
+                            # word is worse than an honest zero. CPUID, MVFR*
+                            # and MPU_TYPE are real. DDI 0553 D1.
+
+shcsr.hardfault-nmi-active  # SHCSR.HARDFAULTACT, NMIACT and HARDFAULTPENDED
+                            # (Armv8-M additions) read as zero; the v7-M
+                            # active/pending bits are all there.
+
+stack-limit.ifp-lazy        # A lazily reserved floating-point area that
+                            # crosses the limit sets FPCCR.SPLIMVIOL and the
+                            # deferred push is skipped, but the registers are
+                            # not zeroed in its place.
+
+mpu.memory-attributes       # MAIR0/1 and RLAR.AttrIndx are stored and read
+                            # back but never interpreted, and RBAR.SH is
+                            # ignored: there are no caches or shareability
+                            # domains in this model for them to steer. Nor is
+                            # "fetch from Device memory is XN" applied to MPU
+                            # regions; RBAR.XN is.
+
+armv8.1-m                   # The Cortex-M55/M85 material -- MVE, RLAR.PXN,
+                            # low-overhead loops, the PACBTI extension -- is
+                            # Armv8.1-M and out of scope.

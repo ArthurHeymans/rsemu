@@ -1389,6 +1389,89 @@ fn the_schema_and_the_sinks_agree_about_every_pin() {
     assert!(schema.ports.iter().all(|p| p.dir == PortDir::In));
 }
 
+/// A core whose vector table is at `0x2000` and *nothing* at zero, booting
+/// through the `vtor` property — the STM32U5 shape.
+fn booting_from_vtor() -> (Arc<ArmV7m>, Arc<RamStore>) {
+    let ram = Arc::new(RamStore::new(0x1000));
+    ram.write_at(0, &0x2000_0800u32.to_le_bytes()).unwrap(); // SP
+    ram.write_at(4, &0x0000_2101u32.to_le_bytes()).unwrap(); // PC
+    ram.write_at(0x100, &0xe7feu16.to_le_bytes()).unwrap(); // B .
+    let space = AddressSpace::new("mem", 32).with_unassigned(UnassignedPolicy::FAULT);
+    space
+        .topology()
+        .map(Region::ram("boot", Arc::clone(&ram)), 0x2000)
+        .unwrap();
+    let props = Props::new()
+        .with("part", Value::from("cortex-m4"))
+        .with("vtor", Value::from(0x2000u64));
+    let cpu = Arc::new(ArmV7m::from_props(&props).unwrap());
+    cpu.attach_space(Arc::new(space));
+    (cpu, ram)
+}
+
+#[test]
+fn the_vtor_property_is_where_the_reset_sequence_reads_sp_and_pc() {
+    let (cpu, _ram) = booting_from_vtor();
+    assert_eq!(cpu.config().reset_vtor, 0x2000);
+    assert_eq!(cpu.vtor(), 0x2000, "visible before the first step");
+    cpu.step();
+    assert_eq!(cpu.msp(), 0x2000_0800);
+    assert_eq!(cpu.pc(), 0x2100);
+    assert!(!cpu.is_locked_up());
+
+    // Bits [6:0] of VTOR are zero; a misaligned one is refused, not rounded.
+    let props = Props::new().with("vtor", Value::from(0x2010u64));
+    assert!(ArmV7m::from_props(&props).is_err());
+    assert_eq!(
+        ArmV7m::from_props(&Props::new()).unwrap().config().reset_vtor,
+        0
+    );
+}
+
+#[test]
+fn every_reset_puts_vtor_back_to_its_reset_value() {
+    let (cpu, _ram) = booting_from_vtor();
+    cpu.step();
+    // The guest moves the table, then asks for a reset, which the machine
+    // carries out as a warm reset of the core.
+    cpu.with_sys(|s| {
+        assert!(s.write_word(0xe000_ed08, 0x0000_0400));
+        assert!(s.write_word(0xe000_ed0c, 0x05fa_0004));
+    });
+    assert_eq!(cpu.vtor(), 0x400);
+    assert!(cpu.reset_requested());
+    cpu.clear_reset_request();
+    Device::reset(cpu.as_ref(), crate::core::device::ResetKind::Warm);
+    cpu.step();
+    assert_eq!(cpu.vtor(), 0x2000);
+    assert_eq!(cpu.pc(), 0x2100);
+
+    // The reset pin, the same way.
+    cpu.with_sys(|s| s.vtor = 0x400);
+    cpu.lines().set_reset(true);
+    cpu.step();
+    assert_eq!(cpu.vtor(), 0x2000);
+    assert_eq!(cpu.pc(), 0x2100);
+
+    // And a cold one.
+    cpu.with_sys(|s| s.vtor = 0x400);
+    Device::reset(cpu.as_ref(), crate::core::device::ResetKind::Cold);
+    cpu.step();
+    assert_eq!(cpu.vtor(), 0x2000);
+    assert_eq!(cpu.pc(), 0x2100);
+}
+
+#[test]
+fn set_vtor_moves_the_reset_value_too() {
+    let (cpu, _ram) = booting_from_vtor();
+    cpu.set_vtor(0x2000);
+    cpu.with_sys(|s| s.vtor = 0);
+    cpu.request_reset();
+    cpu.step();
+    assert_eq!(cpu.vtor(), 0x2000);
+    assert_eq!(cpu.pc(), 0x2100);
+}
+
 #[test]
 fn from_props_names_a_part_and_rejects_a_typo() {
     let props = Props::new().with("part", Value::from("cortex-m7"));
