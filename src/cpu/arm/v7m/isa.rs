@@ -777,6 +777,13 @@ pub enum HintOp {
     /// A preload hint: `PLD`, `PLDW` or `PLI`. Architecturally a `NOP` in a
     /// core with no caches of its own.
     Preload,
+    /// `CSDB`, the consumption-of-speculative-data barrier Armv8-M Mainline
+    /// allocates in the hint space (DDI 0553 C2.4). A `NOP` in a core that
+    /// does not speculate — which is also what the unallocated hint it
+    /// replaces does on an ARMv7-M part, so only the listing differs.
+    #[cfg(feature = "cpu-arm-v8m")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-v8m")))]
+    Csdb,
 }
 
 impl HintOp {
@@ -791,6 +798,8 @@ impl HintOp {
             HintOp::Sev => "SEV",
             HintOp::Dbg(_) => "DBG",
             HintOp::Preload => "PLD",
+            #[cfg(feature = "cpu-arm-v8m")]
+            HintOp::Csdb => "CSDB",
         }
     }
 }
@@ -1239,6 +1248,59 @@ pub enum Insn {
         /// floating-point unit.
         cp: u8,
     },
+    /// `LDA`, `LDAB`, `LDAH`, `STL`, `STLB`, `STLH` and their exclusive forms
+    /// `LDAEX*` / `STLEX*` — the Armv8-M load-acquire and store-release
+    /// family (DDI 0553 C2.4).
+    ///
+    /// Decoded whatever the part; the interpreter makes it UNDEFINED on an
+    /// ARMv7-M one, where these encodings are unallocated.
+    #[cfg(feature = "cpu-arm-v8m")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-v8m")))]
+    AcqRel {
+        /// Whether it reads memory.
+        load: bool,
+        /// Whether it is the exclusive form, which tags or tests the local
+        /// monitor exactly as `LDREX`/`STREX` do.
+        exclusive: bool,
+        /// How wide.
+        size: Size,
+        /// Where an exclusive store reports success; unused otherwise.
+        rd: u8,
+        /// Data register.
+        rt: u8,
+        /// Base register. There is no offset.
+        rn: u8,
+    },
+    /// `TT`, `TTT`, `TTA` and `TTAT`: test the security and MPU attributes
+    /// of an address (DDI 0553 C2.4).
+    #[cfg(feature = "cpu-arm-v8m")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-v8m")))]
+    Tt {
+        /// Destination for the `TT_RESP` word.
+        rd: u8,
+        /// The address to test.
+        rn: u8,
+        /// `A`: query the other security state's view. Secure-only.
+        alt: bool,
+        /// `T`: query as unprivileged code would see it.
+        unpriv: bool,
+    },
+    /// `SG`, the secure gateway — `0xE97F_E97F`, a `NOP` on a part without
+    /// the Security Extension (DDI 0553 C2.4).
+    #[cfg(feature = "cpu-arm-v8m")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-v8m")))]
+    Sg,
+    /// `BXNS` and `BLXNS`: branch to non-secure state. UNDEFINED without the
+    /// Security Extension; on an ARMv7-M part the same encoding is a `BX`/
+    /// `BLX` whose should-be-zero bits were not zero, and runs as one.
+    #[cfg(feature = "cpu-arm-v8m")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-v8m")))]
+    Bxns {
+        /// `BLXNS` rather than `BXNS`.
+        link: bool,
+        /// Register holding the target.
+        rm: u8,
+    },
     /// A floating-point instruction, decoded by [`super::fpisa`].
     ///
     /// Only reachable where the FPv4-SP/FPv5 extension is compiled in; without
@@ -1402,6 +1464,14 @@ pub fn decode_16(raw: u16) -> Insn {
                         rm,
                         shift: Shift::NONE,
                     },
+                },
+                // `BXNS`/`BLXNS` are the same encodings with `hw[2:0] ==
+                // 100` (DDI 0553 C2.4); ARMv7-M calls those bits
+                // should-be-zero.
+                #[cfg(feature = "cpu-arm-v8m")]
+                _ if field(w, 2, 0) == 0b100 => Insn::Bxns {
+                    link: bit(w, 7),
+                    rm,
                 },
                 _ => {
                     if bit(w, 7) {
@@ -2076,6 +2146,8 @@ fn decode_32_system(a: u32, b: u32, op: u32) -> Insn {
                         0x02 => HintOp::Wfe,
                         0x03 => HintOp::Wfi,
                         0x04 => HintOp::Sev,
+                        #[cfg(feature = "cpu-arm-v8m")]
+                        0x14 => HintOp::Csdb,
                         v if v & 0xf0 == 0xf0 => HintOp::Dbg((v & 0xf) as u8),
                         _ => HintOp::Nop,
                     },
@@ -2148,7 +2220,25 @@ fn decode_32_dual_exclusive(a: u32, b: u32) -> Insn {
     let rn = field(a, 3, 0) as u8;
     let rt = field(b, 15, 12) as u8;
     let rt2 = field(b, 11, 8) as u8;
+    // `SG` sits on what ARMv7-M calls an `LDRD (literal)` with writeback,
+    // an encoding that architecture makes UNPREDICTABLE (DDI 0553 C2.4).
+    #[cfg(feature = "cpu-arm-v8m")]
+    if a == 0xe97f && b == 0xe97f {
+        return Insn::Sg;
+    }
     if !p && !w {
+        // `TT` and friends share `STREX`'s first halfword and are told apart
+        // by `Rt == 1111` and `hw2[5:0] == 0` — an `STREX` with `Rt == PC`
+        // being UNPREDICTABLE in both architectures (DDI 0553 C2.4).
+        #[cfg(feature = "cpu-arm-v8m")]
+        if !u && !l && rt == 15 && b & 0x3f == 0 {
+            return Insn::Tt {
+                rd: rt2,
+                rn,
+                alt: bit(b, 7),
+                unpriv: bit(b, 6),
+            };
+        }
         if !u {
             return Insn::LoadStoreExclusive {
                 load: l,
@@ -2202,6 +2292,27 @@ fn decode_32_dual_exclusive(a: u32, b: u32) -> Insn {
                 rn,
                 imm: 0,
             },
+            // The Armv8-M load-acquire / store-release block: `hw2[7:6]`
+            // is `10` for the plain forms and `11` for the exclusive ones,
+            // `hw2[5:4]` the size (DDI 0553 C2.4). The plain forms and the
+            // exclusive loads have `hw2[3:0]` fixed at `1111`.
+            #[cfg(feature = "cpu-arm-v8m")]
+            (_, op3 @ (0b1000..=0b1010 | 0b1100..=0b1110))
+                if op3 & 0b0100 != 0 && !l || field(b, 3, 0) == 0b1111 =>
+            {
+                Insn::AcqRel {
+                    load: l,
+                    exclusive: op3 & 0b0100 != 0,
+                    size: match op3 & 3 {
+                        0 => Size::Byte,
+                        1 => Size::Half,
+                        _ => Size::Word,
+                    },
+                    rd: field(b, 3, 0) as u8,
+                    rt,
+                    rn,
+                }
+            }
             _ => Insn::Undefined,
         };
     }
@@ -3267,6 +3378,18 @@ impl fmt::Display for Insn {
                 if i { "i" } else { "" },
                 if ff { "f" } else { "" }
             ),
+            // `SSBB` and `PSSBB` are `DSB` with the options ARMv7-M left
+            // reserved, and that is all they are here too (DDI 0553 C2.4).
+            #[cfg(feature = "cpu-arm-v8m")]
+            Insn::Barrier {
+                op: BarrierOp::Dsb,
+                option: 0,
+            } => f.write_str("SSBB"),
+            #[cfg(feature = "cpu-arm-v8m")]
+            Insn::Barrier {
+                op: BarrierOp::Dsb,
+                option: 4,
+            } => f.write_str("PSSBB"),
             Insn::Barrier { op, option } => write!(f, "{} #{option}", op.mnemonic()),
             Insn::Hint { op } => match op {
                 HintOp::Dbg(n) => write!(f, "DBG #{n}"),
@@ -3276,6 +3399,60 @@ impl fmt::Display for Insn {
             Insn::Svc { imm } => write!(f, "SVC #{imm}"),
             Insn::Udf { imm } => write!(f, "UDF #{imm}"),
             Insn::Coproc { cp } => write!(f, "<coproc p{cp}>"),
+            #[cfg(feature = "cpu-arm-v8m")]
+            Insn::AcqRel {
+                load,
+                exclusive,
+                size,
+                rd,
+                rt,
+                rn,
+            } => {
+                let mnemonic = match (load, exclusive) {
+                    (true, false) => "LDA",
+                    (true, true) => "LDAEX",
+                    (false, false) => "STL",
+                    (false, true) => "STLEX",
+                };
+                if exclusive && !load {
+                    write!(
+                        f,
+                        "{mnemonic}{} {}, {}, [{}]",
+                        size.suffix(),
+                        RegName(rd),
+                        RegName(rt),
+                        RegName(rn)
+                    )
+                } else {
+                    write!(
+                        f,
+                        "{mnemonic}{} {}, [{}]",
+                        size.suffix(),
+                        RegName(rt),
+                        RegName(rn)
+                    )
+                }
+            }
+            #[cfg(feature = "cpu-arm-v8m")]
+            Insn::Tt {
+                rd,
+                rn,
+                alt,
+                unpriv,
+            } => write!(
+                f,
+                "TT{}{} {}, {}",
+                if alt { "A" } else { "" },
+                if unpriv { "T" } else { "" },
+                RegName(rd),
+                RegName(rn)
+            ),
+            #[cfg(feature = "cpu-arm-v8m")]
+            Insn::Sg => f.write_str("SG"),
+            #[cfg(feature = "cpu-arm-v8m")]
+            Insn::Bxns { link, rm } => {
+                write!(f, "{} {}", if link { "BLXNS" } else { "BXNS" }, RegName(rm))
+            }
             #[cfg(feature = "cpu-arm-v7m-fp")]
             Insn::Fp(fp) => fp.fmt(f),
             Insn::Undefined => f.write_str("UNDEFINED"),
@@ -3316,6 +3493,31 @@ impl fmt::Display for SysReg {
             18 => "BASEPRI_MAX",
             19 => "FAULTMASK",
             20 => "CONTROL",
+            // The Armv8-M Mainline additions: the stack limits, and the
+            // `_NS` aliases a Secure-state program uses to reach the other
+            // bank (DDI 0553 C2.4, `MRS`).
+            #[cfg(feature = "cpu-arm-v8m")]
+            10 => "MSPLIM",
+            #[cfg(feature = "cpu-arm-v8m")]
+            11 => "PSPLIM",
+            #[cfg(feature = "cpu-arm-v8m")]
+            0x88 => "MSP_NS",
+            #[cfg(feature = "cpu-arm-v8m")]
+            0x89 => "PSP_NS",
+            #[cfg(feature = "cpu-arm-v8m")]
+            0x8a => "MSPLIM_NS",
+            #[cfg(feature = "cpu-arm-v8m")]
+            0x8b => "PSPLIM_NS",
+            #[cfg(feature = "cpu-arm-v8m")]
+            0x90 => "PRIMASK_NS",
+            #[cfg(feature = "cpu-arm-v8m")]
+            0x91 => "BASEPRI_NS",
+            #[cfg(feature = "cpu-arm-v8m")]
+            0x93 => "FAULTMASK_NS",
+            #[cfg(feature = "cpu-arm-v8m")]
+            0x94 => "CONTROL_NS",
+            #[cfg(feature = "cpu-arm-v8m")]
+            0x98 => "SP_NS",
             _ => return write!(f, "SYSm#{}", self.0),
         })
     }

@@ -224,6 +224,7 @@ full = [
     "machine-riscv-virt",
     "cpu-arm-v7m",
     "cpu-arm-v7m-fp",
+    "cpu-arm-v8m",
     "dev-stm32",
     "dev-stm32-dma",
     "dev-stm32-dmamux",
@@ -1930,6 +1931,21 @@ cpu-arm-v7m = []
 # `part = "cortex-m4f"` / `"cortex-m7f"`, so one build still runs an M3.
 # `no_std + alloc`, no `unsafe`, no dependencies.
 cpu-arm-v7m-fp = ["cpu-arm-v7m", "float"]
+
+# Armv8-M Mainline for `cpu-arm-v7m` -- the Cortex-M33 (src/cpu/arm/v7m/v8m.rs
+# plus feature-gated arms in the shared decoder and interpreter), selected per
+# instance by `part = "cortex-m33"` / `"cortex-m33f"` (the latter, FPv5-SP-D16,
+# also needs `cpu-arm-v7m-fp`). What it adds over ARMv7E-M: the MSPLIM/PSPLIM
+# stack-limit registers with the STKOF UsageFault, the v8-M EXC_RETURN format
+# (0xFFFFFFBC and friends), the load-acquire/store-release family (LDA*, STL*,
+# LDAEX*, STLEX*), TT/TTT, SG as a NOP, the PMSAv8 MPU (RBAR/RLAR base-limit
+# regions, the A1-A3 aliases, MAIR0/1, overlap faults) and the v8-M SCB bits.
+# Modelled *without* the Security Extension -- what an STM32U5 with TZEN=0
+# runs -- so there is no Secure state, no SAU and no _NS banking; TTA/TTAT,
+# BXNS and BLXNS are UNDEFINED. A v7-M-only build links none of it, and v7-M
+# parts behave identically with or without it. `no_std + alloc`, no `unsafe`,
+# no dependencies.
+cpu-arm-v8m = ["cpu-arm-v7m"]
 
 # STM32 peripherals (src/dev/stm32): a GPIO port and a USART, as separate
 # classes a `.machine` file places at the addresses its reference manual gives

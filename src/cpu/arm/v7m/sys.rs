@@ -185,6 +185,10 @@ pub mod fsr {
     pub const UF_INVPC: u32 = 1 << 18;
     /// `UFSR.NOCP` — a coprocessor instruction with no coprocessor.
     pub const UF_NOCP: u32 = 1 << 19;
+    /// `UFSR.STKOF` — Armv8-M only: a stack pointer update, or exception
+    /// entry's stacking, went below `MSPLIM`/`PSPLIM` (DDI 0553, "Stack limit checks"; the
+    /// stack limit checks; the bit is `CFSR[20]`).
+    pub const UF_STKOF: u32 = 1 << 20;
     /// `UFSR.UNALIGNED` — an unaligned access with `CCR.UNALIGN_TRP` set.
     pub const UF_UNALIGNED: u32 = 1 << 24;
     /// `UFSR.DIVBYZERO` — `SDIV`/`UDIV` by zero with `CCR.DIV_0_TRP` set.
@@ -212,6 +216,11 @@ pub mod ccr {
     pub const BFHFNMIGN: u32 = 1 << 8;
     /// Force eight-byte stack alignment on exception entry.
     pub const STKALIGN: u32 = 1 << 9;
+    /// Armv8-M only: ignore stack-limit violations while the execution
+    /// priority is negative — inside HardFault, NMI, or with `FAULTMASK`
+    /// set — so a fault handler running on an exhausted stack can still
+    /// report it.
+    pub const STKOFHFNMIGN: u32 = 1 << 10;
 }
 
 /// `SHCSR` bit names (DDI 0403 B3.2.13).
@@ -261,6 +270,11 @@ pub mod fpccr {
     pub const MMRDY: u32 = 1 << 5;
     /// HardFault was ready when the frame was reserved.
     pub const HFRDY: u32 = 1 << 4;
+    /// Armv8-M only: UsageFault was ready when the frame was reserved.
+    pub const UFRDY: u32 = 1 << 10;
+    /// Armv8-M only: the reserved frame violated the stack limit, so the
+    /// deferred push will not be made.
+    pub const SPLIMVIOL: u32 = 1 << 9;
     /// The reservation was made from Thread mode.
     pub const THREAD: u32 = 1 << 3;
     /// The reservation was made from unprivileged code, which is the
@@ -311,6 +325,17 @@ pub mod exc_return {
     pub const THREAD_MSP_FP: u32 = THREAD_MSP & !FP_FRAME;
     /// Return to Thread mode on the process stack, with an extended frame.
     pub const THREAD_PSP_FP: u32 = THREAD_PSP & !FP_FRAME;
+
+    /// Armv8-M: return to Handler mode on the main stack — prefix `0xFF`,
+    /// `S` clear (no Secure state), `DCRS` set (no callee-saved frame),
+    /// `FType` set, `Mode` clear, `SPSEL` clear, `ES` clear
+    /// (DDI 0553, "EXC_RETURN").
+    pub const V8_HANDLER_MSP: u32 = 0xffff_ffb0;
+    /// Armv8-M: return to Thread mode on the main stack.
+    pub const V8_THREAD_MSP: u32 = 0xffff_ffb8;
+    /// Armv8-M: return to Thread mode on the process stack. FreeRTOS's
+    /// `ARM_CM33_NTZ` port seeds every new task's frame with exactly this.
+    pub const V8_THREAD_PSP: u32 = 0xffff_ffbc;
 
     /// How many bytes the basic exception frame occupies.
     pub const BASIC_FRAME: u32 = 0x20;
@@ -478,6 +503,21 @@ pub struct Sys {
     /// is no MPU; with it zero the registers are read-as-zero, write-ignored
     /// and every access is permitted.
     pub mpu_regions: u8,
+
+    /// Whether this is an Armv8-M Mainline part's system block: PMSAv8 in
+    /// place of PMSAv7, the v8-M `CCR` and `FPCCR` bits, `UFSR.STKOF`.
+    ///
+    /// Configuration rather than state, like [`Sys::mvfr`]: set once by
+    /// [`Sys::with_v8m`] and never written by anything else.
+    #[cfg(feature = "cpu-arm-v8m")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-v8m")))]
+    pub v8m: bool,
+    /// `MPU_MAIR0` and `MPU_MAIR1`: PMSAv8's eight memory-attribute bytes a
+    /// region's `RLAR.AttrIndx` selects. Stored and returned, never
+    /// interpreted — there are no caches here for the attributes to steer.
+    #[cfg(feature = "cpu-arm-v8m")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-v8m")))]
+    pub mpu_mair: [u32; 2],
 }
 
 /// How many MPU regions this core has. Eight is the Cortex-M4 and M7 default.
@@ -533,6 +573,10 @@ impl Sys {
             mpu_rbar: [0; MPU_REGIONS],
             mpu_rasr: [0; MPU_REGIONS],
             mpu_regions: mpu_regions.min(MPU_REGIONS as u8),
+            #[cfg(feature = "cpu-arm-v8m")]
+            v8m: false,
+            #[cfg(feature = "cpu-arm-v8m")]
+            mpu_mair: [0; 2],
         };
         // The exceptions with no enable bit are permanently enabled, so the
         // arbiter never has to special-case them.
@@ -905,6 +949,12 @@ impl Sys {
     #[allow(clippy::too_many_lines)] // One arm per register; splitting hides the map.
     pub fn read_word(&mut self, addr: u32, debug: bool) -> Option<u32> {
         let word = addr & !3;
+        #[cfg(feature = "cpu-arm-v8m")]
+        if self.v8m
+            && let Some(value) = self.read_word_v8m(word)
+        {
+            return Some(value);
+        }
         Some(match word {
             // SysTick.
             0xe000_e010 => {
@@ -1014,6 +1064,10 @@ impl Sys {
     #[allow(clippy::too_many_lines)] // One arm per register; splitting hides the map.
     pub fn write_word(&mut self, addr: u32, value: u32) -> bool {
         let word = addr & !3;
+        #[cfg(feature = "cpu-arm-v8m")]
+        if self.v8m && self.write_word_v8m(word, value) {
+            return true;
+        }
         match word {
             0xe000_e010 => {
                 // COUNTFLAG is read-only.
@@ -1363,6 +1417,10 @@ impl Sys {
     /// when the MPU configuration is what broke.
     #[must_use]
     pub fn mpu_permits(&self, addr: u32, access: Access, privileged: bool, priority: i32) -> bool {
+        #[cfg(feature = "cpu-arm-v8m")]
+        if self.v8m {
+            return self.mpu_permits_v8(addr, access, privileged, priority);
+        }
         if self.mpu_regions == 0 || self.mpu_ctrl & 1 == 0 {
             return true;
         }

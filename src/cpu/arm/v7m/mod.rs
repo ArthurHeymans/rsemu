@@ -115,6 +115,10 @@ pub mod fpisa;
 mod dsp;
 mod exec;
 
+#[cfg(feature = "cpu-arm-v8m")]
+#[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-v8m")))]
+pub mod v8m;
+
 #[cfg(all(test, feature = "cpu-arm-v7m-fp"))]
 mod fptests;
 
@@ -160,6 +164,9 @@ use exec::{Exec, State};
 use sys::{Exception, Sys};
 
 pub use sys::{CPUID_CORTEX_M4, CPUID_CORTEX_M7};
+
+#[cfg(feature = "cpu-arm-v8m")]
+pub use v8m::CPUID_CORTEX_M33;
 
 /// `xPSR` bit positions (DDI 0403 B1.4.2).
 ///
@@ -245,6 +252,35 @@ impl Extensions {
         fp: FpUnit::V5Sp,
         ..Extensions::CORTEX_M4
     };
+    /// A Cortex-M33 with the DSP extension and an MPU, without the FPU.
+    /// The MPU here is PMSAv8 rather than PMSAv7; [`Config::arch`] is what
+    /// decides which.
+    #[cfg(feature = "cpu-arm-v8m")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-v8m")))]
+    pub const CORTEX_M33: Extensions = Extensions::CORTEX_M4;
+    /// A Cortex-M33 with FPv5-SP-D16 — the configuration an STM32U5 ships.
+    #[cfg(feature = "cpu-arm-v8m")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-v8m")))]
+    pub const CORTEX_M33F: Extensions = Extensions::CORTEX_M7F;
+}
+
+/// Which M-profile architecture the part implements.
+///
+/// One flag rather than a scatter of part checks: everything Armv8-M
+/// Mainline changes — the stack limits, the `EXC_RETURN` format, PMSAv8, the
+/// new instructions — keys off this, so a guest's view and the code that
+/// builds it cannot disagree about which part this is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum Arch {
+    /// ARMv7-M, or ARMv7E-M with [`Extensions::dsp`] (DDI 0403).
+    #[default]
+    V7m,
+    /// Armv8-M Mainline (DDI 0553), **without the Security Extension** —
+    /// see [`v8m`] for what that does and does not include.
+    #[cfg(feature = "cpu-arm-v8m")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-v8m")))]
+    V8mMainline,
 }
 
 /// Which revision of the floating-point extension a part has.
@@ -343,6 +379,19 @@ pub struct Config {
     /// here and not a region a `.machine` file has to remember to map — see
     /// [`Config::with_bit_band`], which says why in full.
     pub bit_band: bool,
+    /// Which architecture: ARMv7-M or Armv8-M Mainline.
+    pub arch: Arch,
+    /// `VTOR`'s reset value, and so where the reset sequence reads the
+    /// initial `SP` and `PC`.
+    ///
+    /// DDI 0403 resets `VTOR` to zero on an ARMv7-M part, and a Cortex-M4
+    /// boots from address zero; Armv8-M makes the reset value the SoC's
+    /// (`INITNSVTOR`), and an STM32U5 ties it to its boot option bytes —
+    /// `0x08000000` with nothing at all mapped at zero. Either way it is a
+    /// property of the silicon around the core, not something software
+    /// sets, which is why it is configuration and why every reset, warm or
+    /// cold, puts it back. Bits `[6:0]` are zero, as `VTOR`'s are.
+    pub reset_vtor: u32,
 }
 
 impl Config {
@@ -355,6 +404,8 @@ impl Config {
         cpuid: CPUID_CORTEX_M4,
         priority_bits: 3,
         bit_band: true,
+        arch: Arch::V7m,
+        reset_vtor: 0,
     };
 
     /// A Cortex-M7: the same architecture, a different `CPUID`, and four
@@ -386,6 +437,57 @@ impl Config {
         ext: Extensions::CORTEX_M7F,
         ..Config::CORTEX_M7
     };
+
+    /// A Cortex-M33: Armv8-M Mainline with the DSP extension and an
+    /// eight-region PMSAv8 MPU, no FPU, three priority bits, and **no
+    /// Security Extension** — the view an STM32U5 with `TZEN = 0` gives its
+    /// firmware.
+    ///
+    /// No bit-band alias: Armv8-M dropped it, so a Cortex-M33's
+    /// `0x22000000` is whatever the SoC maps there.
+    #[cfg(feature = "cpu-arm-v8m")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-v8m")))]
+    pub const CORTEX_M33: Config = Config {
+        ext: Extensions::CORTEX_M33,
+        cpuid: CPUID_CORTEX_M33,
+        bit_band: false,
+        arch: Arch::V8mMainline,
+        ..Config::CORTEX_M4
+    };
+
+    /// A Cortex-M33 with FPv5-SP-D16, built `-mfpu=fpv5-sp-d16`.
+    #[cfg(feature = "cpu-arm-v8m")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-v8m")))]
+    pub const CORTEX_M33F: Config = Config {
+        ext: Extensions::CORTEX_M33F,
+        ..Config::CORTEX_M33
+    };
+
+    /// Whether this is an Armv8-M Mainline part.
+    ///
+    /// Always `false` in a build without `cpu-arm-v8m`, which is what lets
+    /// the optimiser delete every v8-M branch from a v7-M-only core.
+    #[must_use]
+    #[inline]
+    pub const fn is_v8m(&self) -> bool {
+        #[cfg(feature = "cpu-arm-v8m")]
+        {
+            matches!(self.arch, Arch::V8mMainline)
+        }
+        #[cfg(not(feature = "cpu-arm-v8m"))]
+        {
+            false
+        }
+    }
+
+    /// Same configuration, booting from a different vector table — see
+    /// [`Config::reset_vtor`]. Bits `[6:0]` are dropped, as `VTOR` drops
+    /// them.
+    #[must_use]
+    pub const fn with_reset_vtor(mut self, vtor: u32) -> Config {
+        self.reset_vtor = vtor & 0xffff_ff80;
+        self
+    }
 
     /// A Cortex-M3: ARMv7-M without the DSP extension, so every `SADD8`,
     /// `QADD`, `SMLAD` and `PKHBT` traps as UNDEFINED.
@@ -465,7 +567,7 @@ impl Default for Config {
 /// `cpu-arm-v7m-fp` feature is rejected by the validator with the list of what
 /// it could have said — rather than quietly getting a part with no FPU and
 /// faulting on its first `VMOV`.
-#[cfg(feature = "cpu-arm-v7m-fp")]
+#[cfg(all(feature = "cpu-arm-v7m-fp", not(feature = "cpu-arm-v8m")))]
 const PARTS: &[&str] = &[
     "cortex-m3",
     "cortex-m4",
@@ -476,8 +578,26 @@ const PARTS: &[&str] = &[
 
 /// The part names a `.machine` file may give as `part`, without the
 /// floating-point unit compiled in.
-#[cfg(not(feature = "cpu-arm-v7m-fp"))]
+#[cfg(not(any(feature = "cpu-arm-v7m-fp", feature = "cpu-arm-v8m")))]
 const PARTS: &[&str] = &["cortex-m3", "cortex-m4", "cortex-m7"];
+
+/// The part names, with Armv8-M Mainline and the floating-point unit both
+/// compiled in.
+#[cfg(all(feature = "cpu-arm-v7m-fp", feature = "cpu-arm-v8m"))]
+const PARTS: &[&str] = &[
+    "cortex-m3",
+    "cortex-m4",
+    "cortex-m4f",
+    "cortex-m7",
+    "cortex-m7f",
+    "cortex-m33",
+    "cortex-m33f",
+];
+
+/// The part names, with Armv8-M Mainline but no floating-point unit — so
+/// `cortex-m33f` is refused by name rather than built without its FPU.
+#[cfg(all(not(feature = "cpu-arm-v7m-fp"), feature = "cpu-arm-v8m"))]
+const PARTS: &[&str] = &["cortex-m3", "cortex-m4", "cortex-m7", "cortex-m33"];
 
 // ---------------------------------------------------------------------------
 // The visible register file
@@ -698,6 +818,10 @@ struct Session {
     /// machine attached would be a diagnostic that quietly stops working after
     /// the first snapshot.
     spin: spin::Watch,
+    /// Where every reset reads the vector table from: [`Config::reset_vtor`]
+    /// until [`ArmV7m::set_vtor`] says otherwise. Configuration rather than
+    /// architectural state, so beside [`State`] and not in the snapshot.
+    reset_vtor: u32,
 }
 
 impl fmt::Debug for Session {
@@ -761,6 +885,7 @@ impl ArmV7m {
                     state: State::new(&cfg),
                     space: None,
                     spin: spin::Watch::new(cfg.requester),
+                    reset_vtor: cfg.reset_vtor,
                 },
             ),
         }
@@ -785,13 +910,26 @@ impl ArmV7m {
         let dsp_override = r.or("dsp", true)?;
         let mpu_override = r.or("mpu", true)?;
         let fp_override = r.or("fp", true)?;
+        let vtor = r.or_range("vtor", 0u64, 0..=0xffff_ff80)?;
         r.finish()?;
+        if vtor & 0x7f != 0 {
+            // Not silently rounded: a vector table the core would then read
+            // from somewhere other than where the board file said is a
+            // reset into the weeds with nothing pointing at the cause.
+            return Err(Error::Property(alloc::format!(
+                "property `vtor`: {vtor:#x} is not 128-byte aligned (VTOR bits [6:0] are zero)"
+            )));
+        }
         let base = match part {
             "cortex-m3" => Config::CORTEX_M3,
             "cortex-m4" => Config::CORTEX_M4,
             "cortex-m4f" => Config::CORTEX_M4F,
             "cortex-m7" => Config::CORTEX_M7,
             "cortex-m7f" => Config::CORTEX_M7F,
+            #[cfg(feature = "cpu-arm-v8m")]
+            "cortex-m33" => Config::CORTEX_M33,
+            #[cfg(all(feature = "cpu-arm-v8m", feature = "cpu-arm-v7m-fp"))]
+            "cortex-m33f" => Config::CORTEX_M33F,
             // `require_enum` has already rejected anything else.
             _ => Config::CORTEX_M4,
         };
@@ -814,6 +952,7 @@ impl ArmV7m {
                 },
                 mpu: base.ext.mpu && mpu_override,
             },
+            reset_vtor: vtor as u32,
             ..base
         };
         if priority_bits != 0 {
@@ -862,6 +1001,31 @@ impl ArmV7m {
     #[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-v7m-fp")))]
     pub fn set_fpscr(&self, value: u32) {
         self.session.lock().state.fp.fpscr = value & fp::fpscr::WRITABLE;
+    }
+
+    /// Read `MSPLIM` and `PSPLIM`, in that order (Armv8-M; both zero on an
+    /// ARMv7-M part, which has neither).
+    ///
+    /// Separate from [`Regs`] for the reason [`ArmV7m::s`] is: a register
+    /// most parts do not have is asked for, not carried.
+    #[cfg(feature = "cpu-arm-v8m")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-v8m")))]
+    #[must_use]
+    pub fn stack_limits(&self) -> (u32, u32) {
+        let s = &self.session.lock().state;
+        (s.msplim, s.psplim)
+    }
+
+    /// Write `MSPLIM` and `PSPLIM`. Bits `[2:0]` are RES0 and dropped;
+    /// ignored on an ARMv7-M part.
+    #[cfg(feature = "cpu-arm-v8m")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-v8m")))]
+    pub fn set_stack_limits(&self, msplim: u32, psplim: u32) {
+        if self.cfg.is_v8m() {
+            let s = &mut self.session.lock().state;
+            s.msplim = msplim & !7;
+            s.psplim = psplim & !7;
+        }
     }
 
     /// Give the core the address space it executes from.
@@ -1053,10 +1217,17 @@ impl ArmV7m {
         self.session.lock().state.sys.vtor
     }
 
-    /// Move the vector table. A machine whose boot ROM is not at zero sets
-    /// this before the first step.
+    /// Move the vector table, **and** make that where every later reset
+    /// boots from.
+    ///
+    /// A machine whose boot ROM is not at zero calls this before the first
+    /// step — the same thing [`Config::reset_vtor`] says at construction.
+    /// A guest's own write to `VTOR` moves only the live value, which the
+    /// next reset puts back.
     pub fn set_vtor(&self, value: u32) {
-        self.session.lock().state.sys.vtor = value & 0xffff_ff80;
+        let mut session = self.session.lock();
+        session.state.sys.vtor = value & 0xffff_ff80;
+        session.reset_vtor = value & 0xffff_ff80;
     }
 
     /// Drive external interrupt `irq`'s input. Level-sensitive: it re-pends
@@ -1137,9 +1308,20 @@ impl ArmV7m {
         let nmi = self.lines.nmi();
         let reset = self.lines.take_reset();
         let mut session = self.session.lock();
-        let Session { state, space, spin } = &mut *session;
+        let Session {
+            state,
+            space,
+            spin,
+            reset_vtor,
+        } = &mut *session;
         if reset {
             state.reset_pending = true;
+        }
+        if state.reset_pending {
+            // Every reset, warm or cold, boots from the SoC's vector table
+            // and not from wherever software last pointed `VTOR`
+            // (DDI 0403 B3.2.5; Armv8-M takes the value from the SoC).
+            state.sys.vtor = *reset_vtor;
         }
         let Some(space) = space.clone() else {
             return 0;
@@ -1309,13 +1491,19 @@ pub static CLASS: DeviceClass = DeviceClass {
     // 2: the snapshot gained `DEMCR` and the DWT's two live registers. 0.0.x,
     // so the old layout is simply gone rather than read behind a shim.
     version: 2,
-    summary: "ARMv7E-M (Cortex-M4/M7 class) CPU core with Thumb-2, DSP, NVIC and MPU",
+    summary: "ARMv7E-M / Armv8-M Mainline (Cortex-M4/M7/M33 class) CPU core with Thumb-2, DSP, NVIC and MPU",
     properties: &[
         PropertySpec {
             name: "part",
             kind: ValueKind::Str,
             required: false,
-            summary: "which part to model: cortex-m3, cortex-m4[f] or cortex-m7[f]",
+            summary: "which part to model: cortex-m3, cortex-m4[f], cortex-m7[f] or cortex-m33[f]",
+        },
+        PropertySpec {
+            name: "vtor",
+            kind: ValueKind::Uint,
+            required: false,
+            summary: "VTOR's reset value: where every reset reads SP and PC (default 0, 128-byte aligned)",
         },
         PropertySpec {
             name: "fp",
@@ -1345,7 +1533,7 @@ pub static CLASS: DeviceClass = DeviceClass {
             name: "mpu",
             kind: ValueKind::Bool,
             required: false,
-            summary: "whether a PMSAv7 memory protection unit is present",
+            summary: "whether the memory protection unit (PMSAv7, or PMSAv8 on an Armv8-M part) is present",
         },
     ],
     construct: |props| Ok(Box::new(ArmV7m::from_props(props)?)),
@@ -1467,6 +1655,13 @@ impl Device for ArmV7m {
         w.write_u8(state.last_svc)?;
         w.write_u8(state.last_bkpt)?;
         save_sys(&state.sys, w)?;
+        // The stack limits, only on an Armv8-M part — which keeps every
+        // ARMv7-M snapshot exactly the shape it was.
+        #[cfg(feature = "cpu-arm-v8m")]
+        if self.cfg.is_v8m() {
+            w.write_u32(state.msplim)?;
+            w.write_u32(state.psplim)?;
+        }
         // `S0`-`S31` and `FPSCR`, only on a part that has them.
         #[cfg(feature = "cpu-arm-v7m-fp")]
         if self.cfg.ext.fp.present() {
@@ -1510,6 +1705,11 @@ impl Device for ArmV7m {
         state.last_svc = r.read_u8()?;
         state.last_bkpt = r.read_u8()?;
         load_sys(&mut state.sys, r)?;
+        #[cfg(feature = "cpu-arm-v8m")]
+        if self.cfg.is_v8m() {
+            state.msplim = r.read_u32()? & !7;
+            state.psplim = r.read_u32()? & !7;
+        }
         #[cfg(feature = "cpu-arm-v7m-fp")]
         if self.cfg.ext.fp.present() {
             for value in &mut state.fp.s {
@@ -1598,6 +1798,12 @@ fn save_sys(sys: &Sys, w: &mut ChunkWriter<'_>) -> Result<()> {
     for value in sys.mpu_rasr {
         w.write_u32(value)?;
     }
+    // PMSAv8's attribute indirection, only on a part that has it.
+    #[cfg(feature = "cpu-arm-v8m")]
+    if sys.v8m {
+        w.write_u32(sys.mpu_mair[0])?;
+        w.write_u32(sys.mpu_mair[1])?;
+    }
     Ok(())
 }
 
@@ -1649,6 +1855,11 @@ fn load_sys(sys: &mut Sys, r: &mut ChunkReader<'_>) -> Result<()> {
     }
     for value in &mut sys.mpu_rasr {
         *value = r.read_u32()?;
+    }
+    #[cfg(feature = "cpu-arm-v8m")]
+    if sys.v8m {
+        sys.mpu_mair[0] = r.read_u32()?;
+        sys.mpu_mair[1] = r.read_u32()?;
     }
     Ok(())
 }
@@ -1714,6 +1925,7 @@ pub fn schema() -> crate::machine::validate::ClassSchema {
         .prop(PropSchema::new("dsp", ValueKind::Bool))
         .prop(PropSchema::new("mpu", ValueKind::Bool))
         .prop(PropSchema::new("fp", ValueKind::Bool))
+        .prop(PropSchema::new("vtor", ValueKind::Uint).range(0, 0xffff_ff80))
         // Inputs only. `irq0`…`irq239` are the NVIC's external lines.
         .port_bank("irq", PortDir::In, IRQ_LINES)
         .port("nmi", PortDir::In)

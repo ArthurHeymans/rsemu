@@ -128,7 +128,7 @@ fn classify(raw: u16) -> Verdict {
         return Verdict::Diverge(Why::Wide);
     }
     let v5 = thumb::decode(raw);
-    let v7 = isa::decode_16(raw);
+    let v7 = decode_v7m(raw);
     // Anything that raises an exception on the ARMv7-M side goes in the
     // exception class first, `UDF` included: both architectures leave it
     // permanently undefined, so it is not "new in v7-M" even though the
@@ -345,10 +345,25 @@ impl Harness {
     }
 }
 
+/// Decode a sixteen-bit encoding as the Cortex-M4 under test executes it.
+///
+/// With `cpu-arm-v8m` compiled in, a `BX`/`BLX` with `hw[2:0] == 100`
+/// decodes as `BXNS`/`BLXNS`, which an ARMv7-M part runs as the plain
+/// branch — so that is what it is classified as here.
+fn decode_v7m(raw: u16) -> Insn {
+    match isa::decode_16(raw) {
+        #[cfg(feature = "cpu-arm-v8m")]
+        Insn::Bxns { link: true, rm } => Insn::Blx { rm },
+        #[cfg(feature = "cpu-arm-v8m")]
+        Insn::Bxns { link: false, rm } => Insn::Bx { rm },
+        other => other,
+    }
+}
+
 /// Force the target of a `BX`/`BLX` odd on both cores, so the one case where
 /// ARMv5 would enter ARM state does not swamp the comparison.
 fn make_target_thumb(setup: &mut Setup, raw: u16) {
-    if let Insn::Bx { rm } | Insn::Blx { rm } = isa::decode_16(raw)
+    if let Insn::Bx { rm } | Insn::Blx { rm } = decode_v7m(raw)
         && rm < 13
     {
         setup.r[rm as usize] |= 1;

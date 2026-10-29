@@ -99,6 +99,13 @@ impl Trap {
         status: fsr::UF_NOCP,
         far: None,
     };
+    /// An Armv8-M stack-limit violation by an instruction.
+    #[cfg(feature = "cpu-arm-v8m")]
+    const STKOF: Trap = Trap {
+        exc: Exception::USAGE_FAULT,
+        status: fsr::UF_STKOF,
+        far: None,
+    };
 }
 
 /// `Ok`, or "this instruction faulted; abandon it".
@@ -163,6 +170,12 @@ pub(super) struct State {
     pub last_svc: u8,
     /// The comment field of the last `BKPT` executed.
     pub last_bkpt: u8,
+    /// `MSPLIM`, Armv8-M only. Bits `[2:0]` are RES0.
+    #[cfg(feature = "cpu-arm-v8m")]
+    pub msplim: u32,
+    /// `PSPLIM`, Armv8-M only.
+    #[cfg(feature = "cpu-arm-v8m")]
+    pub psplim: u32,
 }
 
 impl State {
@@ -179,6 +192,10 @@ impl State {
         } else {
             sys
         };
+        #[cfg(feature = "cpu-arm-v8m")]
+        let sys = if cfg.is_v8m() { sys.with_v8m() } else { sys };
+        let mut sys = sys;
+        sys.vtor = cfg.reset_vtor & 0xffff_ff80;
         State {
             r: [0; 16],
             sp_other: 0,
@@ -204,6 +221,10 @@ impl State {
             last_fault: 0,
             last_svc: 0,
             last_bkpt: 0,
+            #[cfg(feature = "cpu-arm-v8m")]
+            msplim: 0,
+            #[cfg(feature = "cpu-arm-v8m")]
+            psplim: 0,
         }
     }
 
@@ -353,6 +374,15 @@ pub(super) struct Exec<'a> {
     branched: bool,
     /// Cycles this step has charged.
     used: u64,
+    /// An instruction tried to move `SP` below its limit; the step turns
+    /// this into a `STKOF` UsageFault once the instruction returns.
+    #[cfg(feature = "cpu-arm-v8m")]
+    stkof: bool,
+    /// While exception entry is stacking: the lowest address it may write,
+    /// which is the stack limit when the frame crosses it and zero
+    /// otherwise.
+    #[cfg(feature = "cpu-arm-v8m")]
+    stack_floor: u32,
 }
 
 impl<'a> Exec<'a> {
@@ -373,6 +403,10 @@ impl<'a> Exec<'a> {
             insn_addr: 0,
             branched: false,
             used: 0,
+            #[cfg(feature = "cpu-arm-v8m")]
+            stkof: false,
+            #[cfg(feature = "cpu-arm-v8m")]
+            stack_floor: 0,
         }
     }
 
@@ -479,6 +513,12 @@ impl<'a> Exec<'a> {
         self.state.faultmask = false;
         self.state.basepri = 0;
         self.state.sp_is_psp = false;
+        // Both stack limits reset to zero — no limit — on every reset.
+        #[cfg(feature = "cpu-arm-v8m")]
+        {
+            self.state.msplim = 0;
+            self.state.psplim = 0;
+        }
         self.state.sys.active = [0; Exception::COUNT / 32];
         self.state.sys.pending = [0; Exception::COUNT / 32];
         let base = self.state.sys.vtor;
@@ -543,12 +583,35 @@ impl<'a> Exec<'a> {
     /// write of `R15` can only come from an encoding the architecture calls
     /// UNPREDICTABLE. Dropping it keeps such an encoding from silently
     /// becoming a wild branch.
+    ///
+    /// On an Armv8-M part a write of `SP` below the current stack's limit is
+    /// not made, and the instruction faults with `STKOF` when it finishes
+    /// (see `super::v8m`).
     #[inline]
     fn set_reg(&mut self, index: u8, value: u32) {
         let index = (index & 0xf) as usize;
+        #[cfg(feature = "cpu-arm-v8m")]
+        if index == 13 && self.sp_violates(self.state.sp_is_psp, value) {
+            self.stkof = true;
+            return;
+        }
         if index != 15 {
             self.state.r[index] = value;
         }
+    }
+
+    /// Fault now, before any memory access, if writing `new` back to `rn`
+    /// would put the stack pointer below its limit — so a `PUSH` that
+    /// overflows writes nothing (see `super::v8m`). A no-op on ARMv7-M.
+    #[inline]
+    fn check_sp_writeback(&self, rn: u8, new: u32) -> Ex {
+        #[cfg(feature = "cpu-arm-v8m")]
+        if rn == 13 && self.sp_violates(self.state.sp_is_psp, new) {
+            return Err(Trap::STKOF);
+        }
+        #[cfg(not(feature = "cpu-arm-v8m"))]
+        let _ = (rn, new);
+        Ok(())
     }
 
     /// `BranchWritePC`: stay in Thumb state and drop bit zero
@@ -1017,6 +1080,24 @@ impl<'a> Exec<'a> {
         // The `SPSEL`-selected stack is the one that gets the frame; the
         // handler then runs on the main stack.
         self.state.r[13] = sp;
+        // Armv8-M: a frame that crosses the stack limit is written only down
+        // to the limit, and the stack pointer stops there (`super::v8m`).
+        #[cfg(feature = "cpu-arm-v8m")]
+        let overflowed = {
+            let psp = self.state.sp_is_psp;
+            let over = self.sp_violates(psp, sp);
+            self.stack_floor = 0;
+            if over {
+                let limit = if psp {
+                    self.state.psplim
+                } else {
+                    self.state.msplim
+                };
+                self.stack_floor = limit;
+                self.state.r[13] = limit;
+            }
+            over
+        };
 
         let privileged = self.state.privileged();
         let xpsr_stacked =
@@ -1034,7 +1115,7 @@ impl<'a> Exec<'a> {
         let mut stack_failed = false;
         for (k, value) in frame.iter().enumerate() {
             let at = sp.wrapping_add((k as u32) * 4);
-            if self.write_mem(at, 4, *value, privileged).is_err() {
+            if !self.stack_write(at, *value, privileged) {
                 stack_failed = true;
             }
         }
@@ -1048,6 +1129,13 @@ impl<'a> Exec<'a> {
             stack_failed |= self.stack_fp_frame(sp, privileged);
         }
 
+        #[cfg(feature = "cpu-arm-v8m")]
+        {
+            self.stack_floor = 0;
+            if overflowed {
+                self.pend_stkof();
+            }
+        }
         if stack_failed {
             // The frame is lost; the architecture reports `STKERR` and the
             // fault escalates. Reporting it and continuing into the handler
@@ -1056,16 +1144,29 @@ impl<'a> Exec<'a> {
             self.state.sys.hfsr |= fsr::HF_FORCED;
         }
 
-        let mut lr = if self.state.in_handler() {
-            exc_return::HANDLER_MSP
-        } else if self.state.control & control::SPSEL != 0 {
-            exc_return::THREAD_PSP
+        let from_psp = !self.state.in_handler() && self.state.control & control::SPSEL != 0;
+        let lr = if self.cfg.is_v8m() {
+            #[cfg(feature = "cpu-arm-v8m")]
+            {
+                super::v8m::encode_exc_return(self.state.in_handler(), from_psp, fp_frame)
+            }
+            #[cfg(not(feature = "cpu-arm-v8m"))]
+            {
+                0
+            }
         } else {
-            exc_return::THREAD_MSP
+            let mut lr = if self.state.in_handler() {
+                exc_return::HANDLER_MSP
+            } else if from_psp {
+                exc_return::THREAD_PSP
+            } else {
+                exc_return::THREAD_MSP
+            };
+            if fp_frame {
+                lr &= !exc_return::FP_FRAME;
+            }
+            lr
         };
-        if fp_frame {
-            lr &= !exc_return::FP_FRAME;
-        }
         self.state.r[14] = lr;
 
         // Handler mode, on the main stack, with `ITSTATE` cleared.
@@ -1105,13 +1206,7 @@ impl<'a> Exec<'a> {
         // clear that name the extended frame. A part with no FPU never
         // produces one of the latter, so it rejects them here — which is what
         // makes a stray `EXC_RETURN` a fault rather than a wild unstack.
-        let fp_frame = magic & exc_return::FP_FRAME == 0;
-        let (to_handler, use_psp) = match magic | exc_return::FP_FRAME {
-            exc_return::HANDLER_MSP => (true, false),
-            exc_return::THREAD_MSP => (false, false),
-            exc_return::THREAD_PSP => (false, true),
-            _ => return Err(Trap::INVPC),
-        };
+        let (to_handler, use_psp, fp_frame) = self.decode_exc_return(magic)?;
         if fp_frame && !self.fp_present() {
             return Err(Trap::INVPC);
         }
@@ -1301,7 +1396,18 @@ impl<'a> Exec<'a> {
                 _ => true,
             };
 
+        #[cfg(feature = "cpu-arm-v8m")]
+        {
+            self.stkof = false;
+        }
         let outcome = if passed { self.execute(insn) } else { Ok(()) };
+        // An `SP` write the limit refused, turned into the synchronous fault
+        // the instruction owes (`super::v8m`).
+        #[cfg(feature = "cpu-arm-v8m")]
+        let outcome = match outcome {
+            Ok(()) if self.stkof => Err(Trap::STKOF),
+            other => other,
+        };
 
         // `IT` sets ITSTATE; everything else advances it.
         if !matches!(insn, Insn::It { .. }) && it != 0 {
@@ -1483,6 +1589,9 @@ impl<'a> Exec<'a> {
                 // `LDRD` and `STRD` are always word-aligned, whatever
                 // `UNALIGN_TRP` says (DDI 0403 A7.7.49).
                 self.check_alignment(addr, 4, true)?;
+                if wback {
+                    self.check_sp_writeback(rn, offset)?;
+                }
                 let privileged = self.state.privileged();
                 if load {
                     let a = self.read_mem(addr, 4, privileged)?;
@@ -1858,6 +1967,10 @@ impl<'a> Exec<'a> {
             }
             #[cfg(feature = "cpu-arm-v7m-fp")]
             Insn::Fp(fp) => self.fp_instruction(fp),
+            #[cfg(feature = "cpu-arm-v8m")]
+            Insn::AcqRel { .. } | Insn::Tt { .. } | Insn::Sg | Insn::Bxns { .. } => {
+                self.v8m_instruction(insn)
+            }
             Insn::Udf { .. } | Insn::Undefined => Err(Trap::UNDEFINED),
         }
     }
@@ -1959,6 +2072,9 @@ impl<'a> Exec<'a> {
         // `LDRT`/`STRT` are unprivileged whatever mode the core is in.
         let privileged = self.state.privileged() && !unpriv;
         self.check_alignment(addr, size.bytes(), false)?;
+        if wback {
+            self.check_sp_writeback(rn, offset_addr)?;
+        }
         if load {
             let raw = self.read_mem(addr, size.bytes(), privileged)?;
             let value = extend(raw, size, signed);
@@ -2003,6 +2119,9 @@ impl<'a> Exec<'a> {
         // A block transfer is always word-aligned; the architecture faults on
         // an unaligned base rather than splitting the access.
         self.check_alignment(start, 4, true)?;
+        if wback {
+            self.check_sp_writeback(rn, end_base)?;
+        }
         let privileged = self.state.privileged();
 
         if load && wback {
@@ -2269,6 +2388,13 @@ impl<'a> Exec<'a> {
             }
             19 => u32::from(self.state.faultmask && privileged),
             20 => self.state.control,
+            // `MSPLIM` and `PSPLIM`. Everything with `SYSm[7]` set is a
+            // Secure-state `_NS` alias, and reads as zero on a part without
+            // the Security Extension — the catch-all below.
+            #[cfg(feature = "cpu-arm-v8m")]
+            10 if privileged && self.cfg.is_v8m() => self.state.msplim,
+            #[cfg(feature = "cpu-arm-v8m")]
+            11 if privileged && self.cfg.is_v8m() => self.state.psplim,
             _ => 0,
         }
     }
@@ -2288,8 +2414,14 @@ impl<'a> Exec<'a> {
                     self.state.xpsr = (self.state.xpsr & !xpsr::GE) | (value & xpsr::GE);
                 }
             }
+            // Not checked against the stack limit, so software may move a
+            // stack and its limit in either order (`super::v8m`).
             8 if privileged => self.state.set_msp(value & !3),
             9 if privileged => self.state.set_psp(value & !3),
+            #[cfg(feature = "cpu-arm-v8m")]
+            10 if privileged && self.cfg.is_v8m() => self.state.msplim = value & !7,
+            #[cfg(feature = "cpu-arm-v8m")]
+            11 if privileged && self.cfg.is_v8m() => self.state.psplim = value & !7,
             16 if privileged => self.state.primask = value & 1 != 0,
             17 if privileged => self.state.basepri = value as u8,
             18 if privileged => {
@@ -2377,6 +2509,153 @@ impl<'a> Exec<'a> {
             self.state.control |= control::FPCA;
         } else {
             self.state.control &= !control::FPCA;
+        }
+    }
+
+    /// One word of an exception frame, returning whether it was written.
+    ///
+    /// On Armv8-M, a word below the stack limit is quietly skipped while a
+    /// frame that crossed it is being pushed — the limit violation is what
+    /// gets reported, not a bus fault for a write the architecture forbade.
+    fn stack_write(&mut self, at: u32, value: u32, privileged: bool) -> bool {
+        #[cfg(feature = "cpu-arm-v8m")]
+        if at < self.stack_floor {
+            return true;
+        }
+        self.write_mem(at, 4, value, privileged).is_ok()
+    }
+
+    /// Decode an `EXC_RETURN` into (to Handler mode, on the process stack,
+    /// with an extended frame), or `INVPC`.
+    ///
+    /// ARMv7-M has six legal values: the three integer ones, and the three
+    /// with bit 4 clear that name the extended frame (DDI 0403 B1.5.8).
+    /// Armv8-M has its own format — see `super::v8m::decode_exc_return`.
+    fn decode_exc_return(&self, magic: u32) -> Ex<(bool, bool, bool)> {
+        #[cfg(feature = "cpu-arm-v8m")]
+        if self.cfg.is_v8m() {
+            return match super::v8m::decode_exc_return(magic) {
+                Some(r) => Ok((r.to_handler, r.use_psp, r.fp_frame)),
+                None => Err(Trap::INVPC),
+            };
+        }
+        let fp_frame = magic & exc_return::FP_FRAME == 0;
+        let (to_handler, use_psp) = match magic | exc_return::FP_FRAME {
+            exc_return::HANDLER_MSP => (true, false),
+            exc_return::THREAD_MSP => (false, false),
+            exc_return::THREAD_PSP => (false, true),
+            _ => return Err(Trap::INVPC),
+        };
+        Ok((to_handler, use_psp, fp_frame))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Armv8-M Mainline
+// ---------------------------------------------------------------------------
+
+/// What Armv8-M Mainline adds to the interpreter: the stack-limit checks and
+/// the new instructions. One `#[cfg]`, as the floating-point half is; the
+/// rules it implements are written down in `super::v8m`.
+#[cfg(feature = "cpu-arm-v8m")]
+impl Exec<'_> {
+    /// Whether moving the main (`psp == false`) or process stack pointer to
+    /// `value` violates its limit.
+    ///
+    /// Never on an ARMv7-M part, and not while the execution priority is
+    /// negative with `CCR.STKOFHFNMIGN` set.
+    fn sp_violates(&self, psp: bool, value: u32) -> bool {
+        if !self.cfg.is_v8m() {
+            return false;
+        }
+        let limit = if psp {
+            self.state.psplim
+        } else {
+            self.state.msplim
+        };
+        if value >= limit {
+            return false;
+        }
+        !(self.state.sys.ccr & ccr::STKOFHFNMIGN != 0 && self.state.execution_priority() < 0)
+    }
+
+    /// Record a stack-limit violation on exception entry and pend the fault
+    /// it derives: UsageFault if enabled, else HardFault with `FORCED`.
+    fn pend_stkof(&mut self) {
+        self.state.sys.cfsr |= fsr::UF_STKOF;
+        if self.state.sys.is_enabled(Exception::USAGE_FAULT) {
+            self.state.sys.set_pending(Exception::USAGE_FAULT, true);
+        } else {
+            self.state.sys.hfsr |= fsr::HF_FORCED;
+            self.state.sys.set_pending(Exception::HARD_FAULT, true);
+        }
+    }
+
+    /// Execute one of the Armv8-M-only encodings, or refuse it on ARMv7-M.
+    fn v8m_instruction(&mut self, insn: Insn) -> Ex {
+        let v8 = self.cfg.is_v8m();
+        match insn {
+            // On ARMv7-M these bits were should-be-zero, and the encoding
+            // ran as the `BX`/`BLX` it otherwise is; it still does, so a
+            // v7-M part behaves exactly as it did before this decode existed.
+            Insn::Bxns { link, rm } if !v8 => self.execute(if link {
+                Insn::Blx { rm }
+            } else {
+                Insn::Bx { rm }
+            }),
+            // Every other one is unallocated on ARMv7-M.
+            _ if !v8 => Err(Trap::UNDEFINED),
+            // No Security Extension: no non-secure branch, no secure gateway
+            // to pass through, and no alternate domain to query.
+            Insn::Bxns { .. } | Insn::Tt { alt: true, .. } => Err(Trap::UNDEFINED),
+            Insn::Sg => Ok(()),
+            Insn::Tt { rd, rn, unpriv, .. } => {
+                let addr = self.reg(rn);
+                let resp = self.state.sys.tt_response(
+                    addr,
+                    self.state.privileged(),
+                    unpriv,
+                    self.state.execution_priority(),
+                );
+                self.set_reg(rd, resp);
+                Ok(())
+            }
+            Insn::AcqRel {
+                load,
+                exclusive,
+                size,
+                rd,
+                rt,
+                rn,
+            } => {
+                // Acquire and release are ordering, and this core performs
+                // one access at a time in program order, so what is left is
+                // an access that must be naturally aligned whatever
+                // `CCR.UNALIGN_TRP` says.
+                let addr = self.reg(rn);
+                self.check_alignment(addr, size.bytes(), true)?;
+                let privileged = self.state.privileged();
+                if load {
+                    let value = self.read_mem(addr, size.bytes(), privileged)?;
+                    if exclusive {
+                        self.state.exclusive = Some(addr);
+                    }
+                    self.set_reg(rt, value);
+                } else if exclusive {
+                    let ok = self.state.exclusive == Some(addr);
+                    if ok {
+                        let value = self.reg(rt);
+                        self.write_mem(addr, size.bytes(), value, privileged)?;
+                    }
+                    self.state.exclusive = None;
+                    self.set_reg(rd, u32::from(!ok));
+                } else {
+                    let value = self.reg(rt);
+                    self.write_mem(addr, size.bytes(), value, privileged)?;
+                }
+                Ok(())
+            }
+            _ => Err(Trap::UNDEFINED),
         }
     }
 }
@@ -2690,6 +2969,10 @@ impl Exec<'_> {
                 let bytes = u32::from(count) * 4;
                 let start = if add { base } else { base.wrapping_sub(bytes) };
                 self.check_alignment(start, 4, true)?;
+                if writeback {
+                    let updated = if add { base.wrapping_add(bytes) } else { start };
+                    self.check_sp_writeback(rn, updated)?;
+                }
                 let privileged = self.state.privileged();
                 for k in 0..u32::from(count) {
                     let at = start.wrapping_add(k * 4);
@@ -2761,14 +3044,10 @@ impl Exec<'_> {
             let mut failed = false;
             for k in 0..16u32 {
                 let value = self.state.fp.s(k as u8);
-                failed |= self
-                    .write_mem(base.wrapping_add(k * 4), 4, value, privileged)
-                    .is_err();
+                failed |= !self.stack_write(base.wrapping_add(k * 4), value, privileged);
             }
             let fpscr = self.state.fp.fpscr;
-            failed |= self
-                .write_mem(base.wrapping_add(0x40), 4, fpscr, privileged)
-                .is_err();
+            failed |= !self.stack_write(base.wrapping_add(0x40), fpscr, privileged);
             return failed;
         }
         self.state.sys.fpcar = base;
@@ -2778,8 +3057,22 @@ impl Exec<'_> {
                 | fpccr::HFRDY
                 | fpccr::MMRDY
                 | fpccr::BFRDY
-                | fpccr::MONRDY);
+                | fpccr::MONRDY
+                | fpccr::UFRDY
+                | fpccr::SPLIMVIOL);
         ccr |= fpccr::LSPACT;
+        // Armv8-M records UsageFault's readiness too, and whether the
+        // reserved area is below the stack limit — in which case the
+        // deferred push is never made (DDI 0553, `FPCCR`).
+        #[cfg(feature = "cpu-arm-v8m")]
+        if self.cfg.is_v8m() {
+            if self.state.sys.is_enabled(Exception::USAGE_FAULT) {
+                ccr |= fpccr::UFRDY;
+            }
+            if self.stack_floor != 0 && base < self.stack_floor {
+                ccr |= fpccr::SPLIMVIOL;
+            }
+        }
         // The privilege and mode the deferred push must use are the
         // *interrupted* context's, captured here because by the time the push
         // happens the core is somewhere else entirely.
@@ -2843,6 +3136,11 @@ impl Exec<'_> {
         let base = self.state.sys.fpcar;
         let privileged = self.state.sys.fpccr & fpccr::USER == 0;
         self.state.sys.fpccr &= !fpccr::LSPACT;
+        if self.state.sys.fpccr & fpccr::SPLIMVIOL != 0 {
+            // The reserved area crossed the stack limit: the registers stay
+            // where they are rather than being written below it.
+            return Ok(());
+        }
         for k in 0..16u32 {
             let value = self.state.fp.s(k as u8);
             self.write_mem(base.wrapping_add(k * 4), 4, value, privileged)?;
