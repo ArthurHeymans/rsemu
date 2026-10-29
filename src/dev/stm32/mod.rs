@@ -9,6 +9,7 @@
 //! | Module | Class | Covers |
 //! | --- | --- | --- |
 //! | [`gate`] | — | the peripheral clock gate: the `enable` and `reset` pins RCC's `xxENR`/`xxRSTR` bits drive, and what a gated block does |
+//! | [`devinfo`] | `st.devinfo` | the factory signature: flash size, the 96-bit unique ID and the package code, at the family's own offsets |
 //! | [`gpio`] | `st.gpio` | one general-purpose I/O port: `MODER`…`AFR`, the atomic `BSRR`, and the pin mux |
 //! | [`usart`] | `st.usart` | a USART/UART on the character-device seam, in both the F4 and the F7/H7 register layouts |
 //! | [`sdmmc`] | `stm32.sdmmc` | the H7 family's SDMMC host controller, its FIFO and its internal DMA |
@@ -60,6 +61,10 @@
 //! [`machines/stm32f407.machine`]: https://github.com/KarpelesLab/rsemu/blob/master/machines/stm32f407.machine
 
 pub mod gate;
+
+#[cfg(feature = "dev-stm32")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32")))]
+pub mod devinfo;
 
 #[cfg(feature = "dev-stm32")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32")))]
@@ -190,6 +195,8 @@ use crate::machine::validate::ClassSchema;
 /// If something already claimed one of the names.
 pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
     #[cfg(feature = "dev-stm32")]
+    devinfo::register(registry)?;
+    #[cfg(feature = "dev-stm32")]
     gpio::register(registry)?;
     #[cfg(feature = "dev-stm32")]
     usart::register(registry)?;
@@ -248,6 +255,8 @@ pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
 ///
 /// If one of the classes is already bound.
 pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
+    #[cfg(feature = "dev-stm32")]
+    devinfo::bind(bindings)?;
     #[cfg(feature = "dev-stm32")]
     gpio::bind(bindings)?;
     #[cfg(feature = "dev-stm32")]
@@ -313,7 +322,7 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
 pub fn schemas() -> Vec<ClassSchema> {
     let mut out: Vec<ClassSchema> = alloc::vec![];
     #[cfg(feature = "dev-stm32")]
-    out.extend([gpio::schema(), usart::schema()]);
+    out.extend([devinfo::schema(), gpio::schema(), usart::schema()]);
     #[cfg(feature = "dev-stm32-dma")]
     out.push(dma::schema());
     #[cfg(feature = "dev-stm32-dmamux")]
