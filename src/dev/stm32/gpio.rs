@@ -23,6 +23,26 @@
 //! | `0x20` | `AFRL` | `AFR[0]`: four bits each for pins 0–7 |
 //! | `0x24` | `AFRH` | `AFR[1]`: four bits each for pins 8–15 |
 //!
+//! The **`u5`** variant (STM32U5, RM0456, "General-purpose I/Os (GPIO)"; ST CMSIS `stm32u585xx.h`
+//! (Apache-2.0), `GPIO_TypeDef`) appends three more, for fifty-two bytes:
+//!
+//! | Offset | Register | What it does |
+//! | --- | --- | --- |
+//! | `0x28` | `BRR` | atomic reset alone: a one in bit *n* clears pin *n*. Write-only |
+//! | `0x2C` | `HSLVR` | one bit per pin: the high-speed low-voltage pad option |
+//! | `0x30` | `SECCFGR` | one bit per pin: secure or not. Reset `0x0000_FFFF` |
+//!
+//! `HAL_GPIO_WritePin` clears a pin through `BRR` on that family, so a port
+//! without it has an LED that turns on and never off. `HSLVR` is stored and
+//! read back and changes no level, like `OSPEEDR`. `SECCFGR` is stored and
+//! read back and does nothing else: this model is TrustZone-disabled
+//! (`TZEN = 0`, the option-byte default), where RM0456 has every pin
+//! non-secure whatever the register says. Neither is frozen by `LCKR`, whose
+//! list (the `GPIOx_LCKR` description) is the configuration registers. The `f4` variant
+//! (the default) decodes none of the three — an F4 port is forty bytes — and
+//! the U5's all-analogue reset (`MODER` `0xffff_ffff`, with `GPIOA` and
+//! `GPIOB` keeping the debug pins) is the board's `moder-reset` as ever.
+//!
 //! `BSRR` is the interesting one and the reason the port is usable from an
 //! interrupt handler: a write of `1 << n` sets pin *n*, a write of
 //! `1 << (n + 16)` clears it, and neither is a read-modify-write, so two
@@ -109,7 +129,9 @@
 //! *STM32F405/415, STM32F407/417, STM32F427/437 and STM32F429/439 advanced
 //! Arm-based 32-bit MCUs*, ST **RM0090** rev 21, §8 "General-purpose I/Os
 //! (GPIO)" — §8.3 for the behaviour and §8.4 for the register map and reset
-//! values. No emulator source of any licence was consulted (`ROADMAP.md` §1).
+//! values. The `u5` additions are from ST **RM0456** (STM32U5), the GPIO
+//! chapter, and the `GPIO_TypeDef` in ST CMSIS `stm32u585xx.h` (Apache-2.0)
+//! for the offsets. No emulator source of any licence was consulted (`ROADMAP.md` §1).
 
 use alloc::boxed::Box;
 use alloc::format;
@@ -149,6 +171,33 @@ pub const PINS: u32 = 16;
 /// mirroring registers across an aperture the chip does not mirror them in.
 pub const REGISTER_BYTES: u64 = 0x28;
 
+/// How many bytes the `u5` variant's thirteen registers occupy.
+pub const REGISTER_BYTES_U5: u64 = 0x34;
+
+/// `SECCFGR`'s reset value on the U5: every pin secure (RM0456, `GPIOx_SECCFGR`).
+const SECCFGR_RESET: u32 = 0xffff;
+
+/// Which register file the port has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Variant {
+    /// The F4/F7 port: ten registers, up to `AFRH`.
+    #[default]
+    F4,
+    /// The STM32U5 port: the same ten plus `BRR`, `HSLVR` and `SECCFGR`.
+    U5,
+}
+
+impl Variant {
+    /// How many bytes of the port's kilobyte decode.
+    #[must_use]
+    pub fn register_bytes(self) -> u64 {
+        match self {
+            Variant::F4 => REGISTER_BYTES,
+            Variant::U5 => REGISTER_BYTES_U5,
+        }
+    }
+}
+
 /// `MODER` pin mode: general-purpose output, driven by `ODR`.
 const MODE_OUTPUT: u32 = 0b01;
 /// `MODER` pin mode: alternate function, driven by the `af{n}` input.
@@ -187,6 +236,10 @@ struct State {
     lock_step: Option<(u8, u32)>,
     /// Whether the configuration registers are frozen. Cleared only by reset.
     locked: bool,
+    /// `HSLVR` (`u5` only).
+    hslvr: u32,
+    /// `SECCFGR` (`u5` only).
+    seccfgr: u32,
 }
 
 /// The reset values of the four configuration registers.
@@ -219,6 +272,8 @@ impl State {
             afr: [0; 2],
             lock_step: None,
             locked: false,
+            hslvr: 0,
+            seccfgr: SECCFGR_RESET,
         }
     }
 
@@ -295,6 +350,7 @@ impl State {
 struct Registers {
     state: Mutex<State>,
     reset_values: ResetValues,
+    variant: Variant,
     /// Level driven from outside on each pin, and by an alternate-function
     /// peripheral on each pin. **Not guest state**: what is driving a pin from
     /// outside is the other device's business and it will drive it again
@@ -540,6 +596,10 @@ impl Registers {
             0x1c => Registers::read_lckr(&mut state, debug),
             0x20 => state.afr[0],
             0x24 => state.afr[1],
+            // `BRR` is write-only and reads zero, like `BSRR`.
+            0x28 if self.variant == Variant::U5 => 0,
+            0x2c if self.variant == Variant::U5 => state.hslvr,
+            0x30 if self.variant == Variant::U5 => state.seccfgr,
             _ => 0,
         };
         // The only read with a side effect is `LCKR`'s commit, and it changes
@@ -568,6 +628,16 @@ impl Registers {
             0x1c => Registers::write_lckr(&mut state, value),
             0x20 => state.afr[0] = Registers::write_afr(&state, state.afr[0], value, 0),
             0x24 => state.afr[1] = Registers::write_afr(&state, state.afr[1], value, 1),
+            // `BRR`: `BSRR`'s reset half on its own (RM0456, `GPIOx_BRR`).
+            0x28 if self.variant == Variant::U5 => state.odr &= !(value & 0xffff),
+            0x2c if self.variant == Variant::U5 => {
+                state.hslvr = value & 0xffff;
+                return false;
+            }
+            0x30 if self.variant == Variant::U5 => {
+                state.seccfgr = value & 0xffff;
+                return false;
+            }
             _ => return false,
         }
         true
@@ -674,27 +744,42 @@ impl Gpio {
         let moder = r.or_range("moder-reset", 0u64, 0..=u64::from(u32::MAX))? as u32;
         let ospeedr = r.or_range("ospeedr-reset", 0u64, 0..=u64::from(u32::MAX))? as u32;
         let pupdr = r.or_range("pupdr-reset", 0u64, 0..=u64::from(u32::MAX))? as u32;
+        let variant = match r.or_enum("variant", "f4", &["f4", "u5"])? {
+            "u5" => Variant::U5,
+            _ => Variant::F4,
+        };
         r.finish()?;
-        Ok(Gpio::with_reset(ResetValues {
-            moder,
-            ospeedr,
-            pupdr,
-        }))
+        Ok(Gpio::with_variant(
+            ResetValues {
+                moder,
+                ospeedr,
+                pupdr,
+            },
+            variant,
+        ))
     }
 
-    /// Build one with the given reset values — the route a test takes.
+    /// Build an `f4` port with the given reset values — the route a test
+    /// takes.
     #[must_use]
     pub fn with_reset(reset_values: ResetValues) -> Gpio {
+        Gpio::with_variant(reset_values, Variant::F4)
+    }
+
+    /// Build a port of either register file with the given reset values.
+    #[must_use]
+    pub fn with_variant(reset_values: ResetValues, variant: Variant) -> Gpio {
         let regs = Arc::new(Registers {
             state: Mutex::with_rank(LockRank::DEVICE, State::reset(&reset_values)),
             reset_values,
+            variant,
             pads: Pads::default(),
             out: Mutex::with_rank(LockRank::WIRE, [const { None }; PINS as usize]),
             gate: ClockGate::new(),
         });
         let region = Arc::new(Region::io(
             "gpio",
-            REGISTER_BYTES,
+            variant.register_bytes(),
             Arc::clone(&regs) as Arc<dyn MemOps>,
         ));
         Gpio {
@@ -702,6 +787,12 @@ impl Gpio {
             region,
             pins: Mutex::with_rank(LockRank::DEVICE, Vec::new()),
         }
+    }
+
+    /// Which register file this port has.
+    #[must_use]
+    pub fn variant(&self) -> Variant {
+        self.regs.variant
     }
 
     /// What each pin is at, one bit per pin.
@@ -789,7 +880,15 @@ impl Device for Gpio {
                 w.write_u32(mask)?;
             }
         }
-        w.write_bool(state.locked)
+        w.write_bool(state.locked)?;
+        // The `u5` registers follow, and only on a `u5`: the variant is a
+        // construction property both ends agree on, so an `f4` snapshot keeps
+        // the encoding it always had.
+        if self.regs.variant == Variant::U5 {
+            w.write_u32(state.hslvr)?;
+            w.write_u32(state.seccfgr)?;
+        }
+        Ok(())
         // The pad levels are deliberately absent: they are the levels *other*
         // devices are driving, and each will restore its own and drive them
         // again (`ROADMAP.md` §4.5).
@@ -816,6 +915,10 @@ impl Device for Gpio {
             }
         };
         state.locked = r.read_bool()?;
+        if self.regs.variant == Variant::U5 {
+            state.hslvr = r.read_u32()? & 0xffff;
+            state.seccfgr = r.read_u32()? & 0xffff;
+        }
         *self.regs.state.lock() = state;
         self.regs.refresh_pins();
         Ok(())
@@ -881,6 +984,12 @@ pub static CLASS: DeviceClass = DeviceClass {
             required: false,
             summary: "PUPDR's reset value (0x64000000 for GPIOA, 0x100 for GPIOB, else 0)",
         },
+        PropertySpec {
+            name: "variant",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "register file: f4 (default, to AFRH) or u5 (adds BRR, HSLVR, SECCFGR)",
+        },
     ],
     construct: |props| Ok(Box::new(Gpio::new(props)?)),
 };
@@ -910,6 +1019,7 @@ pub fn schema() -> ClassSchema {
         .prop(PropSchema::new("moder-reset", ValueKind::Uint).range(0, u64::from(u32::MAX)))
         .prop(PropSchema::new("ospeedr-reset", ValueKind::Uint).range(0, u64::from(u32::MAX)))
         .prop(PropSchema::new("pupdr-reset", ValueKind::Uint).range(0, u64::from(u32::MAX)))
+        .prop(PropSchema::new("variant", ValueKind::Str).values(&["f4", "u5"]))
         .region("")
         .region("regs")
         // `p{n}` is the pin; `in{n}` is what drives it from outside when the
@@ -1387,6 +1497,76 @@ mod tests {
         // And the lock came across as a lock, not as a register value.
         poke(&restored, 0x00, 0xffff_ffff);
         assert_eq!(peek(&restored, 0x00), 0xffff_fffc);
+    }
+
+    fn u5_port() -> Gpio {
+        Gpio::with_variant(ResetValues::default(), Variant::U5)
+    }
+
+    #[test]
+    fn the_u5_brr_clears_pins_and_reads_zero() {
+        let gpio = u5_port();
+        assert_eq!(gpio.region.len(), REGISTER_BYTES_U5);
+        poke(&gpio, 0x14, 0x00ff);
+        poke(&gpio, 0x28, 0x0f0f_0011);
+        assert_eq!(peek(&gpio, 0x14), 0x00ee, "only the low half is a pin mask");
+        assert_eq!(peek(&gpio, 0x28), 0, "write-only");
+    }
+
+    #[test]
+    fn the_u5_hslvr_and_seccfgr_store_and_survive_the_lock() {
+        let gpio = u5_port();
+        assert_eq!(peek(&gpio, 0x30), 0xffff, "every pin secure out of reset");
+        assert_eq!(peek(&gpio, 0x2c), 0);
+        poke(&gpio, 0x1c, LCKK | 0xffff);
+        poke(&gpio, 0x1c, 0xffff);
+        poke(&gpio, 0x1c, LCKK | 0xffff);
+        assert_eq!(peek(&gpio, 0x1c) & LCKK, LCKK);
+        poke(&gpio, 0x2c, 0x1_8001);
+        poke(&gpio, 0x30, 0x00f0);
+        assert_eq!(peek(&gpio, 0x2c), 0x8001);
+        assert_eq!(peek(&gpio, 0x30), 0x00f0);
+        Device::reset(&gpio, ResetKind::Cold);
+        assert_eq!(peek(&gpio, 0x2c), 0);
+        assert_eq!(peek(&gpio, 0x30), 0xffff);
+    }
+
+    #[test]
+    fn an_f4_port_does_not_decode_the_u5_registers() {
+        let gpio = port();
+        assert_eq!(gpio.region.len(), REGISTER_BYTES);
+        let props = Props::new().with("variant", Value::from("u5"));
+        assert_eq!(Gpio::new(&props).unwrap().variant(), Variant::U5);
+        assert!(Gpio::new(&Props::new().with("variant", Value::from("l4"))).is_err());
+    }
+
+    #[test]
+    fn a_u5_snapshot_round_trips_to_identical_state() {
+        let saved = u5_port();
+        poke(&saved, 0x2c, 0x0102);
+        poke(&saved, 0x30, 0x0a0a);
+        poke(&saved, 0x14, 0x0300);
+
+        let mut shape = MachineShape::new();
+        shape.add_device("gpio", CLASS_NAME).unwrap();
+        let mut w = StateWriter::new(shape);
+        {
+            let mut chunk = w.chunk("gpio", CLASS_NAME, STATE_VERSION).unwrap();
+            Device::save(&saved, &mut chunk).unwrap();
+        }
+        let bytes = w.to_vec().unwrap();
+
+        let restored = u5_port();
+        let reader = StateReader::new(&bytes).unwrap();
+        let chunk = reader
+            .load("gpio", CLASS_NAME, STATE_VERSION, &Migrations::new())
+            .unwrap();
+        Device::load(&restored, &mut chunk.reader()).unwrap();
+
+        let before: Vec<u32> = (0..13).map(|i| peek_debug(&saved, i * 4)).collect();
+        let after: Vec<u32> = (0..13).map(|i| peek_debug(&restored, i * 4)).collect();
+        assert_eq!(before, after);
+        assert_eq!(after[11], 0x0102);
     }
 
     #[test]
