@@ -31,6 +31,14 @@
 //! seven-, eight-, sixteen- or thirty-two-bit polynomial, a programmable
 //! initial value, and bit reversal on the way in and on the way out.
 //!
+//! `variant = "u5"` is the STM32U5's (RM0456's CRC chapter; `CRC_TypeDef`
+//! and the `CRC_*_Pos` definitions in ST CMSIS `stm32u585xx.h`, Apache-2.0):
+//! the `v2` block at the same offsets with the same `CR`, except that `IDR`
+//! is a full **32-bit** scratch register rather than eight bits. That is the
+//! whole of the difference, and firmware that parks a word in `IDR` across a
+//! reset of the accumulator — which is what the register is for — reads
+//! back three bytes of zeros on a `v2`.
+//!
 //! # How the accumulator moves
 //!
 //! Bit at a time, most significant first, which is the shift register the
@@ -166,6 +174,8 @@ pub enum Variant {
     F4,
     /// The F0/F3/F7/L0/L4/G0/G4/H7/WB block: programmable everything.
     V2,
+    /// The STM32U5 block: `v2` with a 32-bit `IDR`.
+    U5,
 }
 
 impl Variant {
@@ -175,6 +185,7 @@ impl Variant {
         match self {
             Variant::F4 => "f4",
             Variant::V2 => "v2",
+            Variant::U5 => "u5",
         }
     }
 
@@ -183,7 +194,29 @@ impl Variant {
     pub const fn register_bytes(self) -> u64 {
         match self {
             Variant::F4 => F4_BYTES,
-            Variant::V2 => V2_BYTES,
+            Variant::V2 | Variant::U5 => V2_BYTES,
+        }
+    }
+
+    /// Whether `POL`, `INIT`, `POLYSIZE` and the reversals exist.
+    const fn programmable(self) -> bool {
+        !matches!(self, Variant::F4)
+    }
+
+    /// `IDR`'s writable bits: eight, or thirty-two on a U5.
+    const fn idr_mask(self) -> u32 {
+        match self {
+            Variant::F4 | Variant::V2 => 0xff,
+            Variant::U5 => u32::MAX,
+        }
+    }
+
+    /// The snapshot's encoding of the variant.
+    const fn code(self) -> u8 {
+        match self {
+            Variant::F4 => 0,
+            Variant::V2 => 1,
+            Variant::U5 => 2,
         }
     }
 }
@@ -197,8 +230,8 @@ impl Variant {
 struct State {
     /// The CRC register itself, right-aligned in `polysize` bits.
     acc: u32,
-    /// `IDR`: eight bits of scratch the unit never reads.
-    idr: u8,
+    /// `IDR`: eight bits (thirty-two on a U5) of scratch the unit never reads.
+    idr: u32,
     /// `INIT`: what `CR.RESET` reloads `acc` from.
     init: u32,
     /// `POL`: the polynomial, right-aligned in `polysize` bits.
@@ -330,13 +363,13 @@ impl Registers {
                 }
                 Ok(state.output())
             }
-            // "CRC_IDR: general-purpose 8-bit data register."
-            0x04 if len == 1 || len == 4 => Ok(u32::from(state.idr)),
+            // "CRC_IDR: general-purpose 8-bit data register" — 32-bit on a U5.
+            0x04 if len == 1 || len == 4 => Ok(state.idr),
             0x08 if len == 4 => Ok(match self.variant {
                 // The fixed block's `CR` is one self-clearing bit, so it
                 // always reads zero.
                 Variant::F4 => 0,
-                Variant::V2 => {
+                Variant::V2 | Variant::U5 => {
                     (state.polysize << CR_POLYSIZE_SHIFT)
                         | (state.rev_in << CR_REV_IN_SHIFT)
                         | if state.rev_out { CR_REV_OUT } else { 0 }
@@ -346,8 +379,8 @@ impl Registers {
             // parameters are wired into the gates — so the aperture stops
             // short of them and the addresses are a hole rather than a
             // plausible-looking answer.
-            0x10 if len == 4 && self.variant == Variant::V2 => Ok(state.init),
-            0x14 if len == 4 && self.variant == Variant::V2 => Ok(state.pol),
+            0x10 if len == 4 && self.variant.programmable() => Ok(state.init),
+            0x14 if len == 4 && self.variant.programmable() => Ok(state.pol),
             _ => Err(BusError::BadAccess),
         }
     }
@@ -361,16 +394,16 @@ impl Registers {
                     // "Only 32-bit data can be written" on the fixed block: a
                     // byte write there is not a one-byte CRC, it is a mistake,
                     // and answering it would silently give a wrong checksum.
-                    (Variant::F4, 4) | (Variant::V2, 4) => 32,
-                    (Variant::V2, 2) => 16,
-                    (Variant::V2, 1) => 8,
+                    (_, 4) => 32,
+                    (Variant::V2 | Variant::U5, 2) => 16,
+                    (Variant::V2 | Variant::U5, 1) => 8,
                     _ => return Err(BusError::BadAccess),
                 };
                 state.feed(value, bits);
             }
-            0x04 if len == 1 || len == 4 => state.idr = value as u8,
+            0x04 if len == 1 || len == 4 => state.idr = value & self.variant.idr_mask(),
             0x08 if len == 4 => {
-                if self.variant == Variant::V2 {
+                if self.variant.programmable() {
                     state.polysize = (value >> CR_POLYSIZE_SHIFT) & 0x3;
                     state.rev_in = (value >> CR_REV_IN_SHIFT) & 0x3;
                     state.rev_out = value & CR_REV_OUT != 0;
@@ -381,8 +414,8 @@ impl Registers {
                     state.reload();
                 }
             }
-            0x10 if len == 4 && self.variant == Variant::V2 => state.init = value,
-            0x14 if len == 4 && self.variant == Variant::V2 => state.pol = value,
+            0x10 if len == 4 && self.variant.programmable() => state.init = value,
+            0x14 if len == 4 && self.variant.programmable() => state.pol = value,
             _ => return Err(BusError::BadAccess),
         }
         Ok(())
@@ -481,9 +514,10 @@ impl Crc {
         let variant = match r.or_str("variant", "f4")? {
             "f4" => Variant::F4,
             "v2" => Variant::V2,
+            "u5" => Variant::U5,
             other => {
                 return Err(Error::Property(format!(
-                    "`variant` is `f4` or `v2`, not `{other}`"
+                    "`variant` is `f4`, `v2` or `u5`, not `{other}`"
                 )));
             }
         };
@@ -546,12 +580,14 @@ impl Device for Crc {
 
     fn save(&self, w: &mut ChunkWriter<'_>) -> Result<()> {
         let state = *self.regs.state.lock();
-        w.write_u8(match self.regs.variant {
-            Variant::F4 => 0,
-            Variant::V2 => 1,
-        })?;
+        w.write_u8(self.regs.variant.code())?;
         w.write_u32(state.acc)?;
-        w.write_u8(state.idr)?;
+        // A byte, as it always was, except on the block whose `IDR` is a word.
+        if self.regs.variant == Variant::U5 {
+            w.write_u32(state.idr)?;
+        } else {
+            w.write_u8(state.idr as u8)?;
+        }
         w.write_u32(state.init)?;
         w.write_u32(state.pol)?;
         w.write_u32(state.polysize)?;
@@ -563,6 +599,7 @@ impl Device for Crc {
         let variant = match r.read_u8()? {
             0 => Variant::F4,
             1 => Variant::V2,
+            2 => Variant::U5,
             other => {
                 return Err(Error::State(format!(
                     "snapshot has CRC variant {other}, which this build does not know"
@@ -578,7 +615,11 @@ impl Device for Crc {
         }
         let state = State {
             acc: r.read_u32()?,
-            idr: r.read_u8()?,
+            idr: if variant == Variant::U5 {
+                r.read_u32()?
+            } else {
+                u32::from(r.read_u8()?)
+            },
             init: r.read_u32()?,
             pol: r.read_u32()?,
             polysize: r.read_u32()?,
@@ -617,7 +658,8 @@ pub static CLASS: DeviceClass = DeviceClass {
         name: "variant",
         kind: ValueKind::Str,
         required: false,
-        summary: "`f4` (default): a fixed CRC-32. `v2`: programmable POL, INIT and reversal",
+        summary: "`f4` (default): a fixed CRC-32. `v2`: programmable POL, INIT and reversal. \
+                  `u5`: v2 with a 32-bit IDR",
     }],
     construct: |props| Ok(Box::new(Crc::new(props)?)),
 };
@@ -644,7 +686,7 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
 #[must_use]
 pub fn schema() -> ClassSchema {
     let schema = ClassSchema::new(CLASS_NAME)
-        .prop(PropSchema::new("variant", ValueKind::Str).values(&["f4", "v2"]))
+        .prop(PropSchema::new("variant", ValueKind::Str).values(&["f4", "v2", "u5"]))
         .region("")
         .region("regs");
     // `RCC_AHB1ENR.CRCEN` and `RCC_AHB1RSTR.CRCRST`.
@@ -963,6 +1005,55 @@ mod tests {
             Device::reset(&d, ResetKind::Cold);
             assert_eq!(peek(&d, 0x04), 0);
         }
+    }
+
+    #[test]
+    fn the_u5_idr_is_a_whole_word_and_round_trips() {
+        let d = Crc::build(Variant::U5);
+        poke(&d, 0x04, 0xdead_beef);
+        assert_eq!(peek(&d, 0x04), 0xdead_beef);
+        let v = v2();
+        poke(&v, 0x04, 0xdead_beef);
+        assert_eq!(peek(&v, 0x04), 0xef, "eight bits on a v2");
+        // Otherwise it is the v2 block: the same CRC-32 check value.
+        poke(&d, 0x08, CR_RESET);
+        for byte in CHECK {
+            poke_byte(&d, *byte);
+        }
+        let u5_crc = peek(&d, 0x00);
+        poke(&v, 0x08, CR_RESET);
+        for byte in CHECK {
+            poke_byte(&v, *byte);
+        }
+        assert_eq!(u5_crc, peek(&v, 0x00));
+
+        let mut shape = MachineShape::new();
+        shape.add_device("crc", CLASS_NAME).unwrap();
+        let mut w = StateWriter::new(shape);
+        {
+            let mut chunk = w.chunk("crc", CLASS_NAME, STATE_VERSION).unwrap();
+            Device::save(&d, &mut chunk).unwrap();
+        }
+        let bytes = w.to_vec().unwrap();
+        let restored = Crc::build(Variant::U5);
+        let reader = StateReader::new(&bytes).unwrap();
+        let chunk = reader
+            .load("crc", CLASS_NAME, STATE_VERSION, &Migrations::new())
+            .unwrap();
+        Device::load(&restored, &mut chunk.reader()).unwrap();
+        for offset in [0x00, 0x04, 0x08, 0x10, 0x14] {
+            assert_eq!(peek(&restored, offset), peek(&d, offset), "{offset:#x}");
+        }
+        let chunk = reader
+            .load("crc", CLASS_NAME, STATE_VERSION, &Migrations::new())
+            .unwrap();
+        assert!(Device::load(&v2(), &mut chunk.reader()).is_err());
+        assert_eq!(
+            Crc::new(&Props::new().with("variant", Value::from("u5")))
+                .unwrap()
+                .variant(),
+            Variant::U5
+        );
     }
 
     #[test]
