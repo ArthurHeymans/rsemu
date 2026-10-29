@@ -2242,6 +2242,19 @@ impl<'a> Exec<'a> {
             Op::SYSCALL => self.syscall()?,
             Op::SYSRET => self.sysret(f.opsize)?,
             Op::SWAPGS => self.swapgs()?,
+            // A non-temporal store of a general register: `MOV m, r` at four
+            // or eight bytes by `REX.W`, with no cache here to bypass. It is
+            // SSE2's and touches no SIMD state, so the feature is its only
+            // gate — not `CR0.EM`, `CR0.TS` or `CR4.OSFXSR` — and it has no
+            // register form (*Intel SDM* volume 2, `MOVNTI`).
+            Op::MOVNTI => {
+                if !self.cfg.features.sse2 || f.modrm.is_some_and(|m| m.is_register()) {
+                    return Err(Fault::bare(VEC_UD));
+                }
+                let width = if f.rex_w() { 8 } else { 4 };
+                let value = self.read_arg(f, Arg::Gy, width)?;
+                self.write_arg(f, Arg::Ey, width, value)?;
+            }
             // A `REX` prefix never reaches execution: the decoder consumes it
             // and it becomes a field. Reaching here would be a decoder bug,
             // and doing nothing is the least harmful way to say so.

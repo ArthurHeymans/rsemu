@@ -64,7 +64,7 @@ use crate::float::{B32, B64, Category, Env, Flags, Round, binary};
 use super::exec::{Ex, Exec, Fault, VEC_MF, VEC_NM, VEC_UD, VEC_XM};
 use super::flags;
 use super::fpu::{cw, mxcsr, sw};
-use super::isa::{Arg, Fields, Op};
+use super::isa::{Arg, Fields, Op, seg};
 use super::prot::{cr0, cr4};
 
 /// The seven constants `FLD1` and its six siblings push.
@@ -179,12 +179,18 @@ impl Exec<'_> {
                     | Op::CMPPD
                     | Op::CMPSD
                     | Op::COMISD
+                    | Op::CVTDQ2PD
+                    | Op::CVTDQ2PS
+                    | Op::CVTPD2DQ
                     | Op::CVTPD2PS
+                    | Op::CVTPS2DQ
                     | Op::CVTPS2PD
                     | Op::CVTSD2SI
                     | Op::CVTSD2SS
                     | Op::CVTSI2SD
                     | Op::CVTSS2SD
+                    | Op::CVTTPD2DQ
+                    | Op::CVTTPS2DQ
                     | Op::CVTTSD2SI
                     | Op::DIVPD
                     | Op::DIVSD
@@ -199,6 +205,7 @@ impl Exec<'_> {
                     | Op::MOVHPD
                     | Op::MOVLPD
                     | Op::MOVMSKPD
+                    | Op::MOVNTPD
                     | Op::MOVQ
                     | Op::MOVSD
                     | Op::MOVUPD
@@ -1424,6 +1431,15 @@ impl Exec<'_> {
                 }
                 Ok(())
             }
+            // A non-temporal store is an aligned store here (see `66 0F E7`
+            // in `isa`), and like `MOVNTDQ` it has no register form.
+            Op::MOVNTPS | Op::MOVNTPD => {
+                if !from_memory {
+                    return Err(Fault::bare(VEC_UD));
+                }
+                let v = self.state.sse.get(reg);
+                self.sse_write_rm(f, Arg::Wx, true, v)
+            }
             Op::MOVSS | Op::MOVSD => {
                 let wide = op == Op::MOVSD;
                 if f.insn.dst == Arg::Vx {
@@ -1615,6 +1631,103 @@ impl Exec<'_> {
                 Ok(())
             }
 
+            // The packed conversions between the integer and floating-point
+            // lanes. Each lane is the scalar conversion above, through the
+            // same `float` routine and the same environment, so `MXCSR.RC`,
+            // the truncating forms, the integer indefinite `0x8000_0000` for
+            // a NaN or an out-of-range value, and `#XM` on an unmasked `IE` or
+            // `PE` all come with it. The flags of every lane are gathered
+            // before any is raised, so an unmasked exception in one lane
+            // leaves the whole destination untouched (*Intel SDM* volume 1
+            // §11.5.1). A 128-bit memory source must be aligned, as every
+            // legacy-SSE packed operand must; `CVTDQ2PD` reads only 64 bits
+            // and so has no alignment requirement (volume 2, each page's
+            // exception table).
+            Op::CVTDQ2PS => {
+                let src = self.sse_read_rm(f, f.insn.src, true)?;
+                let mut flags = Flags::NONE;
+                let mut out = [0u32; 4];
+                for (i, o) in out.iter_mut().enumerate() {
+                    let lane = i64::from(dword_lane(src, i) as i32);
+                    let (v, fl) = binary::from_signed::<B32>(lane, 32, env);
+                    flags |= fl;
+                    *o = v as u32;
+                }
+                self.sse_raise(flags)?;
+                self.state.sse.set(reg, of_dwords(out));
+                Ok(())
+            }
+            Op::CVTPS2DQ | Op::CVTTPS2DQ => {
+                let src = self.sse_read_rm(f, f.insn.src, true)?;
+                let env = if op == Op::CVTTPS2DQ {
+                    env.round(Round::TowardZero)
+                } else {
+                    env
+                };
+                let mut flags = Flags::NONE;
+                let mut out = [0u32; 4];
+                for (i, o) in out.iter_mut().enumerate() {
+                    let lane = u64::from(dword_lane(src, i));
+                    let (v, fl) = binary::to_signed::<B32>(lane, 32, env);
+                    flags |= fl;
+                    *o = v as u32;
+                }
+                self.sse_raise(flags)?;
+                self.state.sse.set(reg, of_dwords(out));
+                Ok(())
+            }
+            Op::CVTPD2DQ | Op::CVTTPD2DQ => {
+                let src = self.sse_read_rm(f, f.insn.src, true)?;
+                let env = if op == Op::CVTTPD2DQ {
+                    env.round(Round::TowardZero)
+                } else {
+                    env
+                };
+                let (lo, f0) = binary::to_signed::<B64>(src[0], 32, env);
+                let (hi, f1) = binary::to_signed::<B64>(src[1], 32, env);
+                self.sse_raise(f0 | f1)?;
+                // Two results, in the low quadword; the high one is zeroed.
+                self.state
+                    .sse
+                    .set(reg, of_dwords([lo as u32, hi as u32, 0, 0]));
+                Ok(())
+            }
+            Op::CVTDQ2PD => {
+                let src = self.sse_read_rm(f, f.insn.src, false)?;
+                // Every 32-bit integer is exact in binary64, so this cannot
+                // raise anything; the flags are passed on regardless rather
+                // than assumed away.
+                let lane = |i| i64::from(dword_lane(src, i) as i32);
+                let (lo, f0) = binary::from_signed::<B64>(lane(0), 32, env);
+                let (hi, f1) = binary::from_signed::<B64>(lane(1), 32, env);
+                self.sse_raise(f0 | f1)?;
+                self.state.sse.set(reg, [lo, hi]);
+                Ok(())
+            }
+
+            // -- The reciprocal approximations ---------------------------
+            Op::RCPPS | Op::RCPSS | Op::RSQRTPS | Op::RSQRTSS => {
+                let scalar = matches!(op, Op::RCPSS | Op::RSQRTSS);
+                let src = self.sse_read_rm(f, f.insn.src, !scalar)?;
+                let kernel = if matches!(op, Op::RCPPS | Op::RCPSS) {
+                    approx_reciprocal
+                } else {
+                    approx_reciprocal_sqrt
+                };
+                // The scalar forms replace the low lane and keep the other
+                // three, as every `SS` operation does.
+                let mut out = self.state.sse.get(reg);
+                for i in 0..if scalar { 1 } else { 4 } {
+                    let shift = 32 * (i % 2);
+                    let v = u64::from(kernel(dword_lane(src, i)));
+                    out[i / 2] = (out[i / 2] & !(0xffff_ffffu64 << shift)) | (v << shift);
+                }
+                // No `MXCSR` flag and no `#XM`: these raise no SIMD
+                // floating-point exception at all, a signalling NaN included.
+                self.state.sse.set(reg, out);
+                Ok(())
+            }
+
             // -- SSE2's packed-integer half ------------------------------
             _ if op.is_sse2_packed_int() => self.sse_packed(f, op),
 
@@ -1645,6 +1758,35 @@ impl Exec<'_> {
                 }
                 let v = self.state.sse.get(reg);
                 return self.sse_write_rm(f, Arg::Wx, true, v);
+            }
+            // A byte-masked store to an implicit address: `[DS:rDI]` at the
+            // address size, the segment overridable, and only the bytes of
+            // `reg` whose byte in the `r/m` mask has its top bit set are
+            // written (*Intel SDM* volume 2, `MASKMOVDQU`). Register form
+            // only, and no alignment requirement. The bytes go out one at a
+            // time in ascending order, so a fault part-way leaves the earlier
+            // ones written: the manual does not order a masked store's
+            // accesses, so no guest can rely on any other outcome.
+            Op::MASKMOVDQU => {
+                if !register_form {
+                    return Err(Fault::bare(VEC_UD));
+                }
+                let data = self.state.sse.get(reg);
+                let mask = self.state.sse.get(f.rm_num());
+                let sr = f.segment(seg::DS);
+                let regs = &self.state.regs;
+                let base = match f.addrsize {
+                    2 => u64::from(regs.word(7)),
+                    4 => u64::from(regs.dword(7)),
+                    _ => regs.rdi,
+                };
+                for i in 0..16 {
+                    if byte_lane(mask, i) & 0x80 != 0 {
+                        let off = base.wrapping_add(i as u64);
+                        self.write_mem(sr, off, 1, u64::from(byte_lane(data, i)))?;
+                    }
+                }
+                return Ok(());
             }
             // The two that cross between an `XMM` register and a general one.
             Op::PMOVMSKB => {
@@ -2203,6 +2345,96 @@ impl Exec<'_> {
 // a 128-bit value in, a 128-bit value out, no memory, no flags and no
 // exception. That makes every one of them directly testable, which is what the
 // tests at the bottom of `super::tests` do.
+
+/// `RCPPS`/`RCPSS` on one single-precision lane.
+///
+/// The architecture specifies only a bound — a relative error of at most
+/// `1.5 × 2^-12` (*Intel SDM* volume 2, `RCPPS`) — and real parts differ in
+/// the low bits, so there is no one answer to reproduce. This returns the
+/// **correctly rounded** reciprocal, to nearest: it is inside the bound on
+/// every input (its error is at most `2^-24`), it is bit-reproducible on
+/// every host because it is [`binary::div`] and not host arithmetic, and it
+/// is the answer a part with a better table would converge on. A guest that
+/// compares an approximation against one recorded on particular silicon
+/// will see different low bits; one that refines with a Newton step, which is
+/// what the instruction is for, will not notice.
+///
+/// The special cases are the manual's, not the IEEE quotient's where the two
+/// differ: `MXCSR.RC` is ignored, a denormal operand is a zero of its sign
+/// whatever `DAZ` says (so the result is an infinity), a tiny result is a
+/// zero of the operand's sign whatever `FTZ` says, `±inf` gives `±0`, a NaN
+/// comes back quieted, and nothing is raised — the flags `div` reports are
+/// discarded, which is what "no SIMD floating-point exceptions" means.
+pub(super) fn approx_reciprocal(x: u32) -> u32 {
+    let env = Env::X86_SSE.daz(true).ftz(true);
+    let (v, _) = binary::div::<B32>(0x3f80_0000, u64::from(x), env);
+    v as u32
+}
+
+/// `RSQRTPS`/`RSQRTSS` on one single-precision lane: the correctly rounded
+/// `1 / sqrt(x)`, for the reasons [`approx_reciprocal`] gives.
+///
+/// Computed in exact integer arithmetic rather than as a square root followed
+/// by a division, because two roundings are not one: the quotient of a
+/// rounded root can land on the wrong side of a midpoint. Here `x = m · 2^e`
+/// with an even `e`, so `1/sqrt(x) = 2^(-e/2) · sqrt(2^80 / m) · 2^-40`, and
+/// `floor(sqrt(floor(2^80 / m)))` is `floor(sqrt(2^80 / m))` exactly — a 28-
+/// or 29-bit integer with a sticky bit for whatever either step discarded,
+/// rounded once to 24 bits. The result is always a normal number: the
+/// smallest positive normal gives `2^63` and the largest about `2^-64`, so
+/// there is no overflow and no underflow to handle.
+///
+/// Special cases, from the instruction's page: `±0` and a denormal of either
+/// sign (treated as a zero whatever `DAZ` says) give an infinity of the same
+/// sign, `+inf` gives `+0`, anything else negative gives the QNaN
+/// floating-point indefinite `0xffc0_0000`, a NaN comes back quieted, and
+/// nothing is raised.
+pub(super) fn approx_reciprocal_sqrt(x: u32) -> u32 {
+    const SIGN: u32 = 0x8000_0000;
+    const INF: u32 = 0x7f80_0000;
+    const QUIET: u32 = 0x0040_0000;
+    const INDEFINITE: u32 = 0xffc0_0000;
+    let sign = x & SIGN;
+    let field = (x >> 23) & 0xff;
+    let frac = x & 0x007f_ffff;
+    if field == 0xff && frac != 0 {
+        return x | QUIET;
+    }
+    if field == 0 {
+        return sign | INF;
+    }
+    if sign != 0 {
+        return INDEFINITE;
+    }
+    if field == 0xff {
+        return 0;
+    }
+    let mut m = u128::from(frac | 0x0080_0000);
+    let mut e = field as i32 - 150;
+    if e & 1 != 0 {
+        m <<= 1;
+        e -= 1;
+    }
+    let n = (1u128 << 80) / m;
+    let q = n.isqrt();
+    let sticky = !(1u128 << 80).is_multiple_of(m) || q * q != n;
+    // `q` is in `(2^27.5, 2^28.5]`, so four or five bits are rounded away.
+    let shift = 128 - q.leading_zeros() - 24;
+    let mut keep = (q >> shift) as u32;
+    let rest = q & ((1u128 << shift) - 1);
+    let half = 1u128 << (shift - 1);
+    if rest > half || (rest == half && (sticky || keep & 1 != 0)) {
+        keep += 1;
+    }
+    let mut shift = shift as i32;
+    if keep == 1 << 24 {
+        keep >>= 1;
+        shift += 1;
+    }
+    // `keep · 2^(shift - 40 - e/2)`, whose leading bit is 23 places up.
+    let field = (shift - 40 - e / 2 + 23 + 127) as u32;
+    (field << 23) | (keep & 0x007f_ffff)
+}
 
 /// Byte lane `i` of a 128-bit value, numbered from the least significant.
 #[inline]

@@ -966,7 +966,11 @@ const LOWERCASE: &[(&str, &str)] = &[
     ("CMPSS", "cmpss"),
     ("COMISD", "comisd"),
     ("COMISS", "comiss"),
+    ("CVTDQ2PD", "cvtdq2pd"),
+    ("CVTDQ2PS", "cvtdq2ps"),
+    ("CVTPD2DQ", "cvtpd2dq"),
     ("CVTPD2PS", "cvtpd2ps"),
+    ("CVTPS2DQ", "cvtps2dq"),
     ("CVTPS2PD", "cvtps2pd"),
     ("CVTSD2SI", "cvtsd2si"),
     ("CVTSD2SS", "cvtsd2ss"),
@@ -974,6 +978,8 @@ const LOWERCASE: &[(&str, &str)] = &[
     ("CVTSI2SS", "cvtsi2ss"),
     ("CVTSS2SD", "cvtss2sd"),
     ("CVTSS2SI", "cvtss2si"),
+    ("CVTTPD2DQ", "cvttpd2dq"),
+    ("CVTTPS2DQ", "cvttps2dq"),
     ("CVTTSD2SI", "cvttsd2si"),
     ("CVTTSS2SI", "cvttss2si"),
     ("DIVPD", "divpd"),
@@ -1006,6 +1012,9 @@ const LOWERCASE: &[(&str, &str)] = &[
     ("MOVLPS", "movlps"),
     ("MOVMSKPD", "movmskpd"),
     ("MOVMSKPS", "movmskps"),
+    ("MOVNTI", "movnti"),
+    ("MOVNTPD", "movntpd"),
+    ("MOVNTPS", "movntps"),
     ("MOVQ", "movq"),
     ("MOVSD", "movsd"),
     ("MOVSS", "movss"),
@@ -1017,6 +1026,10 @@ const LOWERCASE: &[(&str, &str)] = &[
     ("MULSS", "mulss"),
     ("ORPD", "orpd"),
     ("ORPS", "orps"),
+    ("RCPPS", "rcpps"),
+    ("RCPSS", "rcpss"),
+    ("RSQRTPS", "rsqrtps"),
+    ("RSQRTSS", "rsqrtss"),
     ("PAND", "pand"),
     ("PANDN", "pandn"),
     ("POR", "por"),
@@ -1042,6 +1055,7 @@ const LOWERCASE: &[(&str, &str)] = &[
     ("XORPD", "xorpd"),
     ("XORPS", "xorps"),
     // SSE2's packed-integer half.
+    ("MASKMOVDQU", "maskmovdqu"),
     ("MOVNTDQ", "movntdq"),
     ("PACKSSDW", "packssdw"),
     ("PACKSSWB", "packsswb"),
@@ -1406,7 +1420,11 @@ define_ops! {
     CMPSS = "compare the low singles under an immediate predicate",
     COMISD = "compare the low doubles into the flags, signalling on any NaN",
     COMISS = "compare the low singles into the flags, signalling on any NaN",
+    CVTDQ2PD = "convert the two low packed doublewords to two doubles",
+    CVTDQ2PS = "convert four packed doublewords to four singles",
+    CVTPD2DQ = "convert two packed doubles to two doublewords, current rounding mode",
     CVTPD2PS = "convert two packed doubles to two singles",
+    CVTPS2DQ = "convert four packed singles to four doublewords, current rounding mode",
     CVTPS2PD = "convert two packed singles to two doubles",
     CVTSD2SI = "convert the low double to an integer, current rounding mode",
     CVTSD2SS = "convert the low double to a single",
@@ -1414,6 +1432,8 @@ define_ops! {
     CVTSI2SS = "convert an integer to the low single",
     CVTSS2SD = "convert the low single to a double",
     CVTSS2SI = "convert the low single to an integer, current rounding mode",
+    CVTTPD2DQ = "convert two packed doubles to two doublewords, truncating",
+    CVTTPS2DQ = "convert four packed singles to four doublewords, truncating",
     CVTTSD2SI = "convert the low double to an integer, truncating",
     CVTTSS2SI = "convert the low single to an integer, truncating",
     DIVPD = "divide packed doubles",
@@ -1446,6 +1466,9 @@ define_ops! {
     MOVLPS = "move two singles to or from the low quadword",
     MOVMSKPD = "gather the sign bits of two packed doubles",
     MOVMSKPS = "gather the sign bits of four packed singles",
+    MOVNTI = "store a general register bypassing the cache",
+    MOVNTPD = "store two aligned packed doubles bypassing the cache",
+    MOVNTPS = "store four aligned packed singles bypassing the cache",
     MOVQ = "move a quadword",
     MOVSD = "move the low double, zeroing the rest on a load from memory",
     MOVSS = "move the low single, zeroing the rest on a load from memory",
@@ -1457,6 +1480,10 @@ define_ops! {
     MULSS = "multiply the low singles",
     ORPD = "bitwise OR of packed doubles",
     ORPS = "bitwise OR of packed singles",
+    RCPPS = "approximate the reciprocals of packed singles",
+    RCPSS = "approximate the reciprocal of the low single",
+    RSQRTPS = "approximate the reciprocal square roots of packed singles",
+    RSQRTSS = "approximate the reciprocal square root of the low single",
     PAND = "bitwise AND of a double quadword",
     PANDN = "bitwise AND NOT of a double quadword",
     POR = "bitwise OR of a double quadword",
@@ -1483,6 +1510,7 @@ define_ops! {
     XORPS = "bitwise exclusive OR of packed singles",
 
     // ---- SSE2's packed-integer half --------------------------------------
+    MASKMOVDQU = "store the bytes of a register selected by a mask, to [DS:rDI]",
     MOVNTDQ = "store a double quadword bypassing the cache",
     PACKSSDW = "pack doublewords into words with signed saturation",
     PACKSSWB = "pack words into bytes with signed saturation",
@@ -1863,7 +1891,11 @@ impl Op {
                 | Op::CMPSS
                 | Op::COMISD
                 | Op::COMISS
+                | Op::CVTDQ2PD
+                | Op::CVTDQ2PS
+                | Op::CVTPD2DQ
                 | Op::CVTPD2PS
+                | Op::CVTPS2DQ
                 | Op::CVTPS2PD
                 | Op::CVTSD2SI
                 | Op::CVTSD2SS
@@ -1871,6 +1903,8 @@ impl Op {
                 | Op::CVTSI2SS
                 | Op::CVTSS2SD
                 | Op::CVTSS2SI
+                | Op::CVTTPD2DQ
+                | Op::CVTTPS2DQ
                 | Op::CVTTSD2SI
                 | Op::CVTTSS2SI
                 | Op::DIVPD
@@ -1899,6 +1933,8 @@ impl Op {
                 | Op::MOVLPS
                 | Op::MOVMSKPD
                 | Op::MOVMSKPS
+                | Op::MOVNTPD
+                | Op::MOVNTPS
                 | Op::MOVQ
                 | Op::MOVSD
                 | Op::MOVSS
@@ -1914,6 +1950,10 @@ impl Op {
                 | Op::PANDN
                 | Op::POR
                 | Op::PXOR
+                | Op::RCPPS
+                | Op::RCPSS
+                | Op::RSQRTPS
+                | Op::RSQRTSS
                 | Op::SHUFPD
                 | Op::SHUFPS
                 | Op::SQRTPD
@@ -1933,6 +1973,7 @@ impl Op {
                 | Op::UNPCKLPS
                 | Op::XORPD
                 | Op::XORPS
+                | Op::MASKMOVDQU
                 | Op::MOVNTDQ
                 | Op::PACKSSDW
                 | Op::PACKSSWB
@@ -2011,7 +2052,8 @@ impl Op {
     pub const fn is_sse2_packed_int(self) -> bool {
         matches!(
             self,
-            Op::MOVNTDQ
+            Op::MASKMOVDQU
+                | Op::MOVNTDQ
                 | Op::PACKSSDW
                 | Op::PACKSSWB
                 | Op::PACKUSWB
@@ -2839,10 +2881,18 @@ const SECONDARY: ([Insn; 256], [bool; 256]) = opmap! {
     0x17 MOVHPS   Mq Vx ModAlt Documented;
     0x28 MOVAPS   Vx Wx None   Documented;
     0x29 MOVAPS   Wx Vx None   Documented;
+    // The non-temporal stores are ordinary aligned stores here, for the reason
+    // given at `66 0F E7`; like `MOVAPS` they refuse a misaligned address, and
+    // they have no register form.
+    0x2b MOVNTPS  Wx Vx None   Documented;
     0x2e UCOMISS  Vx Wd None   Documented;
     0x2f COMISS   Vx Wd None   Documented;
     0x50 MOVMSKPS Gy Ux None   Documented;
     0x51 SQRTPS   Vx Wx None   Documented;
+    // The two approximations. The architecture bounds their error rather than
+    // fixing their result; see `fpexec`'s `approximate` for the answer chosen.
+    0x52 RSQRTPS  Vx Wx None   Documented;
+    0x53 RCPPS    Vx Wx None   Documented;
     0x54 ANDPS    Vx Wx None   Documented;
     0x55 ANDNPS   Vx Wx None   Documented;
     0x56 ORPS     Vx Wx None   Documented;
@@ -2852,6 +2902,9 @@ const SECONDARY: ([Insn; 256], [bool; 256]) = opmap! {
     // The source is two singles, so it is a *quadword* even though the
     // destination is a full register.
     0x5a CVTPS2PD Vx Wq None   Documented;
+    // SSE2, despite sitting in the no-prefix map: the packed-integer lanes it
+    // reads are SSE2's.
+    0x5b CVTDQ2PS Vx Wx None   Documented;
     0x5c SUBPS    Vx Wx None   Documented;
     0x5d MINPS    Vx Wx None   Documented;
     0x5e DIVPS    Vx Wx None   Documented;
@@ -2962,6 +3015,11 @@ const SECONDARY: ([Insn; 256], [bool; 256]) = opmap! {
     0xc0 XADD  Eb   Gb   None   Documented;
     0xc1 XADD  Ev   Gv   None   Documented;
     0xc2 CMPPS Vx   Wx  +Ib     None   Documented;
+    // SSE2's one general-register instruction: a plain `MOV` store at four or
+    // eight bytes by `REX.W`, memory only. Gated by `Features::sse2` and by
+    // nothing in `CR0` or `CR4`, because it touches no SIMD state (*Intel SDM*
+    // volume 2, `MOVNTI`).
+    0xc3 MOVNTI Ey  Gy   None   Documented;
     0xc6 SHUFPS Vx  Wx  +Ib     None   Documented;
     // Intel's group 9: the only member is the 64-bit compare-and-exchange,
     // which becomes the 128-bit one under `REX.W`.
@@ -3004,10 +3062,15 @@ const SECONDARY_66: ([Insn; 256], [bool; 256]) = opmap! {
     0x17 MOVHPD   Mq Vx ModAlt Documented;
     0x28 MOVAPD   Vx Wx None   Documented;
     0x29 MOVAPD   Wx Vx None   Documented;
+    0x2b MOVNTPD  Wx Vx None   Documented;
     0x2e UCOMISD  Vx Wq None   Documented;
     0x2f COMISD   Vx Wq None   Documented;
     0x50 MOVMSKPD Gy Ux None   Documented;
     0x51 SQRTPD   Vx Wx None   Documented;
+    // There is no double-precision approximation before AVX-512, and the
+    // encodings a prefix does not name are `#UD` rather than the no-prefix row.
+    0x52 UD       None None None Undefined;
+    0x53 UD       None None None Undefined;
     0x54 ANDPD    Vx Wx None   Documented;
     0x55 ANDNPD   Vx Wx None   Documented;
     0x56 ORPD     Vx Wx None   Documented;
@@ -3015,6 +3078,7 @@ const SECONDARY_66: ([Insn; 256], [bool; 256]) = opmap! {
     0x58 ADDPD    Vx Wx None   Documented;
     0x59 MULPD    Vx Wx None   Documented;
     0x5a CVTPD2PS Vx Wx None   Documented;
+    0x5b CVTPS2DQ Vx Wx None   Documented;
     0x5c SUBPD    Vx Wx None   Documented;
     0x5d MINPD    Vx Wx None   Documented;
     0x5e DIVPD    Vx Wx None   Documented;
@@ -3048,6 +3112,9 @@ const SECONDARY_66: ([Insn; 256], [bool; 256]) = opmap! {
     0x7e MOVD     Ey Vx None   Documented;
     0x7f MOVDQA   Wx Vx None   Documented;
     0xc2 CMPPD    Vx Wx +Ib None Documented;
+    // `MOVNTI` is an `NP` encoding: a mandatory-prefix byte in front of it
+    // makes it invalid (*Intel SDM* volume 2 §3.1.1.1).
+    0xc3 UD       None None None Undefined;
     0xc4 PINSRW     Vx Ew +Ib None Documented;
     0xc5 PEXTRW     Gy Ux +Ib None Documented;
     0xc6 SHUFPD   Vx Wx +Ib None Documented;
@@ -3072,6 +3139,7 @@ const SECONDARY_66: ([Insn; 256], [bool; 256]) = opmap! {
     0xe3 PAVGW      Vx Wx None   Documented;
     0xe4 PMULHUW    Vx Wx None   Documented;
     0xe5 PMULHW     Vx Wx None   Documented;
+    0xe6 CVTTPD2DQ  Vx Wx None   Documented;
     // A non-temporal store is an ordinary one here: there is no cache to
     // bypass, and the architecture guarantees only weaker ordering, which a
     // single-bus core already satisfies.
@@ -3090,6 +3158,9 @@ const SECONDARY_66: ([Insn; 256], [bool; 256]) = opmap! {
     0xf4 PMULUDQ    Vx Wx None   Documented;
     0xf5 PMADDWD    Vx Wx None   Documented;
     0xf6 PSADBW     Vx Wx None   Documented;
+    // The source is `reg` and the mask is `r/m`, register only; the address
+    // is implicit, `[DS:rDI]`.
+    0xf7 MASKMOVDQU Vx Ux None   Documented;
     0xf8 PSUBB      Vx Wx None   Documented;
     0xf9 PSUBW      Vx Wx None   Documented;
     0xfa PSUBD      Vx Wx None   Documented;
@@ -3112,12 +3183,16 @@ const SECONDARY_F3: ([Insn; 256], [bool; 256]) = opmap! {
     0x10 MOVSS     Vx Wd None Documented;
     0x11 MOVSS     Wd Vx None Documented;
     0x2a CVTSI2SS  Vx Ey None Documented;
+    0x2b UD        None None None Undefined;
     0x2c CVTTSS2SI Gy Wd None Documented;
     0x2d CVTSS2SI  Gy Wd None Documented;
     0x51 SQRTSS    Vx Wd None Documented;
+    0x52 RSQRTSS   Vx Wd None Documented;
+    0x53 RCPSS     Vx Wd None Documented;
     0x58 ADDSS     Vx Wd None Documented;
     0x59 MULSS     Vx Wd None Documented;
     0x5a CVTSS2SD  Vx Wd None Documented;
+    0x5b CVTTPS2DQ Vx Wx None Documented;
     0x5c SUBSS     Vx Wd None Documented;
     0x5d MINSS     Vx Wd None Documented;
     0x5e DIVSS     Vx Wd None Documented;
@@ -3130,6 +3205,9 @@ const SECONDARY_F3: ([Insn; 256], [bool; 256]) = opmap! {
     0x7e MOVQ      Vx Wq None Documented;
     0x7f MOVDQU    Wx Vx None Documented;
     0xc2 CMPSS     Vx Wd +Ib None Documented;
+    0xc3 UD        None None None Undefined;
+    // Two doublewords in, so the memory form is a quadword.
+    0xe6 CVTDQ2PD  Vx Wq None Documented;
 };
 
 /// The two-byte map with an `F3` mandatory prefix.
@@ -3145,18 +3223,24 @@ const SECONDARY_F2: ([Insn; 256], [bool; 256]) = opmap! {
     0x10 MOVSD     Vx Wq None Documented;
     0x11 MOVSD     Wq Vx None Documented;
     0x2a CVTSI2SD  Vx Ey None Documented;
+    0x2b UD        None None None Undefined;
     0x2c CVTTSD2SI Gy Wq None Documented;
     0x2d CVTSD2SI  Gy Wq None Documented;
     0x51 SQRTSD    Vx Wq None Documented;
+    0x52 UD        None None None Undefined;
+    0x53 UD        None None None Undefined;
     0x58 ADDSD     Vx Wq None Documented;
     0x59 MULSD     Vx Wq None Documented;
     0x5a CVTSD2SS  Vx Wq None Documented;
+    0x5b UD        None None None Undefined;
     0x5c SUBSD     Vx Wq None Documented;
     0x5d MINSD     Vx Wq None Documented;
     0x5e DIVSD     Vx Wq None Documented;
     0x5f MAXSD     Vx Wq None Documented;
     0x70 PSHUFLW   Vx Wx +Ib None Documented;
     0xc2 CMPSD     Vx Wq +Ib None Documented;
+    0xc3 UD        None None None Undefined;
+    0xe6 CVTPD2DQ  Vx Wx None Documented;
 };
 
 /// The two-byte map with an `F2` mandatory prefix.

@@ -4063,6 +4063,33 @@ mod long_mode {
     }
 
     #[test]
+    fn movnti_with_rex_w_stores_all_eight_bytes() {
+        // mov rax, imm64 ; movnti [MARK], rax ; movnti [MARK+8], eax ; hlt
+        // — absolute addressing through a SIB byte, because `mod == 00`,
+        // `r/m == 101` is `RIP`-relative here.
+        let mut code = alloc::vec![0x48u8, 0xb8];
+        code.extend_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
+        code.extend_from_slice(&[0x48, 0x0f, 0xc3, 0x04, 0x25]);
+        code.extend_from_slice(&(la::MARK as u32).to_le_bytes());
+        code.extend_from_slice(&[0x0f, 0xc3, 0x04, 0x25]);
+        code.extend_from_slice(&((la::MARK + 8) as u32).to_le_bytes());
+        code.push(0xf4);
+        let pc = pc64();
+        pc.write64(la::MARK + 8, u64::MAX);
+        pc.start_protected();
+        pc.prepare_long();
+        pc.write(at::CODE0, &enter_long_mode_code(la::CODE64));
+        pc.write(la::CODE64, &code);
+        assert!(pc.run(200) < 200);
+        assert_eq!(pc.read64(la::MARK), 0x1122_3344_5566_7788);
+        assert_eq!(
+            pc.read64(la::MARK + 8),
+            0xffff_ffff_5566_7788,
+            "without REX.W, four"
+        );
+    }
+
+    #[test]
     fn a_pop_to_the_stack_addresses_its_destination_after_the_increment() {
         // *Intel SDM* volume 2, `POP`: "If the ESP register is used as a base
         // register for addressing a destination operand in memory, the POP
@@ -6941,6 +6968,556 @@ mod fp {
         assert!(listing(&[0x66, 0x0f, 0x73, 0xf9, 0x01]).ends_with("pslldq xmm1, 0x1"));
         assert!(listing(&[0x66, 0x0f, 0xd7, 0xc1]).ends_with("pmovmskb eax, xmm1"));
         assert!(listing(&[0xf3, 0x0f, 0x70, 0xc1, 0x1b]).ends_with("pshufhw xmm0, xmm1, 0x1b"));
+    }
+
+    // -- The thirteen that CPUID claimed and the decoder lacked ----------
+    //
+    // Issue #39: the non-temporal stores, `MASKMOVDQU`, the six packed
+    // integer/floating-point conversions and the four reciprocal
+    // approximations. Expected values are hand-checkable arithmetic or the
+    // special cases on each instruction's page in *Intel SDM* volume 2.
+
+    /// Four doubleword lanes as a register value, lane 0 lowest.
+    fn lanes(l: [u32; 4]) -> [u64; 2] {
+        [
+            u64::from(l[0]) | (u64::from(l[1]) << 32),
+            u64::from(l[2]) | (u64::from(l[3]) << 32),
+        ]
+    }
+
+    /// Load `xmm0`, `xmm1` and `MXCSR`, run `code`, and hand the core back.
+    fn with_sse(a: [u64; 2], b: [u64; 2], mxcsr: u32, code: &[u8]) -> Pc {
+        let pc = ssepc();
+        let mut sse = Sse::new();
+        sse.set(0, a);
+        sse.set(1, b);
+        sse.mxcsr = mxcsr;
+        pc.cpu.set_sse(sse);
+        run(&pc, code);
+        pc
+    }
+
+    /// `op xmm0, xmm1` under a mandatory prefix (`0` for none): `xmm0` and
+    /// the exception flags afterwards.
+    fn convert(prefix: u8, opcode: u8, a: [u64; 2], b: [u64; 2], mxcsr: u32) -> ([u64; 2], u32) {
+        let mut code = Vec::new();
+        if prefix != 0 {
+            code.push(prefix);
+        }
+        code.extend_from_slice(&[0x0f, opcode, 0xc1, 0xf4]);
+        let pc = with_sse(a, b, mxcsr, &code);
+        let sse = pc.cpu.sse();
+        (sse.get(0), sse.mxcsr & mxcsr::EXCEPTIONS)
+    }
+
+    #[test]
+    fn cvttps2dq_truncates_and_returns_the_indefinite_on_overflow() {
+        // [1.9, -1.9, 3e9, NaN]: two truncations, then a value past
+        // `i32::MAX` and a NaN, both of which are the integer indefinite and
+        // both of which are invalid.
+        let src = lanes([0x3ff3_3333, 0xbff3_3333, 0x4f32_d05e, 0x7fc0_0000]);
+        let (out, flags) = convert(0xf3, 0x5b, [0; 2], src, mxcsr::RESET);
+        assert_eq!(out, lanes([1, (-1i32) as u32, 0x8000_0000, 0x8000_0000]));
+        assert_eq!(flags, mxcsr::IE | mxcsr::PE);
+    }
+
+    #[test]
+    fn cvtps2dq_follows_the_mxcsr_rounding_mode() {
+        // [1.5, 2.5, -1.5, -0.5] under each of the four `RC` settings.
+        let src = lanes([0x3fc0_0000, 0x4020_0000, 0xbfc0_0000, 0xbf00_0000]);
+        let at = |rc: u32| {
+            convert(
+                0x66,
+                0x5b,
+                [0; 2],
+                src,
+                mxcsr::RESET | (rc << mxcsr::RC_SHIFT),
+            )
+        };
+        let i = |v: i32| v as u32;
+        assert_eq!(at(0).0, lanes([2, 2, i(-2), 0]), "to nearest, ties to even");
+        assert_eq!(at(1).0, lanes([1, 2, i(-2), i(-1)]), "down");
+        assert_eq!(at(2).0, lanes([2, 3, i(-1), 0]), "up");
+        assert_eq!(at(3).0, lanes([1, 2, i(-1), 0]), "toward zero");
+        assert_eq!(at(0).1, mxcsr::PE, "inexact, and nothing else");
+        // An exact conversion raises nothing.
+        let (out, flags) = convert(0x66, 0x5b, [0; 2], lanes([0x4000_0000; 4]), mxcsr::RESET);
+        assert_eq!(out, lanes([2; 4]));
+        assert_eq!(flags, 0);
+    }
+
+    #[test]
+    fn cvtdq2ps_rounds_what_a_single_cannot_hold() {
+        // 2^24 + 1 is the first integer a single cannot represent, and it is
+        // a tie that goes to the even neighbour; `i32::MIN` is exact.
+        let src = lanes([1, (-2i32) as u32, 16_777_217, 0x8000_0000]);
+        let (out, flags) = convert(0, 0x5b, [0; 2], src, mxcsr::RESET);
+        assert_eq!(
+            out,
+            lanes([0x3f80_0000, 0xc000_0000, 0x4b80_0000, 0xcf00_0000])
+        );
+        assert_eq!(flags, mxcsr::PE);
+    }
+
+    #[test]
+    fn the_packed_double_conversions_zero_or_widen_as_their_pages_say() {
+        let junk = [0xdead_beef_dead_beef, 0xfeed_face_feed_face];
+        // `CVTPD2DQ`: [2.5, -3.7] to nearest is [2, -4], and the upper
+        // quadword of the destination is **zeroed**, not kept.
+        let pd = [0x4004_0000_0000_0000, 0xc00d_9999_9999_999a];
+        let (out, flags) = convert(0xf2, 0xe6, junk, pd, mxcsr::RESET);
+        assert_eq!(out, lanes([2, (-4i32) as u32, 0, 0]));
+        assert_eq!(flags, mxcsr::PE);
+        // `CVTTPD2DQ` truncates the same pair to [2, -3] and zeroes the same
+        // half; 1e10 does not fit and is the indefinite.
+        let (out, _) = convert(0x66, 0xe6, junk, pd, mxcsr::RESET);
+        assert_eq!(out, lanes([2, (-3i32) as u32, 0, 0]));
+        let (out, flags) = convert(0x66, 0xe6, junk, [0x4202_a05f_2000_0000, 0], mxcsr::RESET);
+        assert_eq!(out, lanes([0x8000_0000, 0, 0, 0]));
+        assert_eq!(flags, mxcsr::IE);
+        // `CVTDQ2PD` reads the low two doublewords and widens them exactly.
+        let src = lanes([(-7i32) as u32, 3, 0x1111_1111, 0x2222_2222]);
+        let (out, flags) = convert(0xf3, 0xe6, junk, src, mxcsr::RESET);
+        assert_eq!(out, [0xc01c_0000_0000_0000, 0x4008_0000_0000_0000]);
+        assert_eq!(flags, 0);
+    }
+
+    #[test]
+    fn an_unmasked_invalid_conversion_faults_and_writes_nothing() {
+        // The scalar conversions' `#XM` rule, lane-wise: one bad lane is
+        // enough, and the destination keeps every lane it had.
+        let before = [0x0123_4567_89ab_cdef, 0x0fed_cba9_8765_4321];
+        let src = lanes([0x3f80_0000, 0x7fc0_0000, 0x3f80_0000, 0x3f80_0000]);
+        let pc = ssepc();
+        pc.idt(19, gate(0x08, HANDLER as u32, sys_type::INT_GATE32, 0));
+        pc.write(HANDLER, &[0xf4]);
+        let mut sse = Sse::new();
+        sse.set(0, before);
+        sse.set(1, src);
+        sse.mxcsr = mxcsr::RESET & !mxcsr::IM;
+        pc.cpu.set_sse(sse);
+        run(&pc, &[0xf3, 0x0f, 0x5b, 0xc1, 0xf4]); // cvttps2dq xmm0, xmm1
+        assert_eq!(pc.regs().rip, HANDLED, "#XM");
+        assert_eq!(pc.cpu.sse().get(0), before);
+        assert_ne!(pc.cpu.sse().mxcsr & mxcsr::IE, 0);
+    }
+
+    #[test]
+    fn a_packed_conversion_from_memory_must_be_aligned_except_cvtdq2pd() {
+        // `CVTDQ2PD` reads a quadword and has no alignment requirement; the
+        // 128-bit sources do (*Intel SDM* volume 2, each page's exceptions).
+        let pc = ssepc();
+        pc.idt(13, gate(0x08, HANDLER as u32, sys_type::INT_GATE32, 0));
+        pc.write(HANDLER, &[0xf4]);
+        let mut code = alloc::vec![0x0f, 0x5b]; // cvtdq2ps xmm0, [ODD]
+        code.extend_from_slice(&disp32(0, fpat::ODD));
+        code.push(0xf4);
+        run(&pc, &code);
+        assert_eq!(pc.regs().rip, HANDLED, "#GP on a misaligned CVTDQ2PS");
+
+        let pc = ssepc();
+        write64(
+            &pc,
+            fpat::ODD,
+            u64::from(5u32) | (u64::from((-1i32) as u32) << 32),
+        );
+        let mut code = alloc::vec![0xf3, 0x0f, 0xe6]; // cvtdq2pd xmm0, [ODD]
+        code.extend_from_slice(&disp32(0, fpat::ODD));
+        code.push(0xf4);
+        run(&pc, &code);
+        assert_eq!(pc.regs().rip, at::CODE0 + code.len() as u64);
+        assert_eq!(
+            pc.cpu.sse().get(0),
+            [0x4014_0000_0000_0000, 0xbff0_0000_0000_0000]
+        );
+    }
+
+    #[test]
+    fn movntps_and_movntpd_are_aligned_stores_with_no_register_form() {
+        for prefix in [None, Some(0x66u8)] {
+            let value = [0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210];
+            let code_at = |addr: u64| {
+                let mut code: Vec<u8> = prefix.into_iter().collect();
+                code.extend_from_slice(&[0x0f, 0x2b]);
+                code.extend_from_slice(&disp32(0, addr));
+                code.push(0xf4);
+                code
+            };
+            let pc = with_sse(value, [0; 2], mxcsr::RESET, &code_at(fpat::DATA));
+            assert_eq!(read64(&pc, fpat::DATA), value[0]);
+            assert_eq!(read64(&pc, fpat::DATA + 8), value[1]);
+
+            // Misaligned: `#GP(0)`, as `MOVAPS` does.
+            let pc = ssepc();
+            pc.idt(13, gate(0x08, HANDLER as u32, sys_type::INT_GATE32, 0));
+            pc.write(HANDLER, &[0xf4]);
+            run(&pc, &code_at(fpat::ODD));
+            assert_eq!(pc.regs().rip, HANDLED, "{prefix:?}: #GP when misaligned");
+
+            // `mod == 11` is not an encoding.
+            let pc = ssepc();
+            pc.idt(6, gate(0x08, HANDLER as u32, sys_type::INT_GATE32, 0));
+            pc.write(HANDLER, &[0xf4]);
+            let mut code: Vec<u8> = prefix.into_iter().collect();
+            code.extend_from_slice(&[0x0f, 0x2b, 0xc1, 0xf4]);
+            run(&pc, &code);
+            assert_eq!(
+                pc.regs().rip,
+                HANDLED,
+                "{prefix:?}: #UD for a register form"
+            );
+        }
+    }
+
+    #[test]
+    fn movnti_stores_a_general_register_exactly_as_mov_does() {
+        let pc = ssepc();
+        let mut code = alloc::vec![0xb8]; // mov eax, 0x12345678
+        code.extend_from_slice(&0x1234_5678u32.to_le_bytes());
+        code.extend_from_slice(&[0x0f, 0xc3]); // movnti [DATA], eax
+        code.extend_from_slice(&disp32(0, fpat::DATA));
+        code.push(0xf4);
+        write64(&pc, fpat::DATA, u64::MAX);
+        run(&pc, &code);
+        assert_eq!(
+            read64(&pc, fpat::DATA),
+            0xffff_ffff_1234_5678,
+            "four bytes and no more"
+        );
+
+        // Register form, and a mandatory prefix in front of the `NP`
+        // encoding, are both `#UD`.
+        for bytes in [
+            &[0x0f, 0xc3, 0xc0, 0xf4][..],
+            &[0x66, 0x0f, 0xc3, 0x05, 0, 0xb0, 0, 0, 0xf4],
+        ] {
+            let pc = ssepc();
+            pc.idt(6, gate(0x08, HANDLER as u32, sys_type::INT_GATE32, 0));
+            pc.write(HANDLER, &[0xf4]);
+            run(&pc, bytes);
+            assert_eq!(pc.regs().rip, HANDLED, "{bytes:02x?}");
+        }
+
+        // It does not need `CR4.OSFXSR`: it touches no SIMD state.
+        let pc = Pc::new(Variant::X86_64);
+        pc.start_protected();
+        run(&pc, &code);
+        assert_eq!(read64(&pc, fpat::DATA) & 0xffff_ffff, 0x1234_5678);
+    }
+
+    #[test]
+    fn maskmovdqu_writes_only_the_bytes_whose_mask_bit_is_set() {
+        let data = [0x0706_0504_0302_0100, 0x0f0e_0d0c_0b0a_0908];
+        // Bytes 0, 3, 8 and 15 selected; the other mask bytes have every bit
+        // but the top one set, which must not count.
+        let mask = [0x7f7f_7f7f_807f_7f80, 0x807f_7f7f_7f7f_7f80];
+        let (lo, hi) = (0xaaaa_aaaa_03aa_aa00, 0x0faa_aaaa_aaaa_aa08);
+        let setup = |code: &[u8], fs_base: u64| {
+            let pc = ssepc();
+            let mut sys = pc.cpu.sys();
+            sys.segs[usize::from(isa::seg::FS)].base = fs_base;
+            pc.cpu.set_sys(sys);
+            for addr in [fpat::DATA, fpat::DATA + 0x1000] {
+                write64(&pc, addr, 0xaaaa_aaaa_aaaa_aaaa);
+                write64(&pc, addr + 8, 0xaaaa_aaaa_aaaa_aaaa);
+            }
+            let mut sse = Sse::new();
+            sse.set(0, data);
+            sse.set(1, mask);
+            pc.cpu.set_sse(sse);
+            run(&pc, code);
+            pc
+        };
+        let mut mov_edi = alloc::vec![0xbf];
+        mov_edi.extend_from_slice(&(fpat::DATA as u32).to_le_bytes());
+
+        // maskmovdqu xmm0, xmm1 — to [ds:edi].
+        let mut code = mov_edi.clone();
+        code.extend_from_slice(&[0x66, 0x0f, 0xf7, 0xc1, 0xf4]);
+        let pc = setup(&code, 0);
+        assert_eq!(read64(&pc, fpat::DATA), lo);
+        assert_eq!(read64(&pc, fpat::DATA + 8), hi);
+        assert_eq!(read64(&pc, fpat::DATA + 0x1000), 0xaaaa_aaaa_aaaa_aaaa);
+
+        // An `FS` override moves the store by `FS`'s base.
+        let mut code = mov_edi.clone();
+        code.extend_from_slice(&[0x64, 0x66, 0x0f, 0xf7, 0xc1, 0xf4]);
+        let pc = setup(&code, 0x1000);
+        assert_eq!(read64(&pc, fpat::DATA + 0x1000), lo);
+        assert_eq!(read64(&pc, fpat::DATA + 0x1008), hi);
+        assert_eq!(
+            read64(&pc, fpat::DATA),
+            0xaaaa_aaaa_aaaa_aaaa,
+            "not at ds:edi"
+        );
+
+        // A `67` prefix makes the address `DI`, so the junk in `EDI`'s top
+        // half is ignored rather than added.
+        let mut code = alloc::vec![0xbf];
+        code.extend_from_slice(&(0x7fff_0000 | fpat::DATA as u32).to_le_bytes());
+        code.extend_from_slice(&[0x67, 0x66, 0x0f, 0xf7, 0xc1, 0xf4]);
+        let pc = setup(&code, 0);
+        assert_eq!(read64(&pc, fpat::DATA), lo);
+        assert_eq!(read64(&pc, fpat::DATA + 8), hi);
+
+        // Register form only.
+        let pc = ssepc();
+        pc.idt(6, gate(0x08, HANDLER as u32, sys_type::INT_GATE32, 0));
+        pc.write(HANDLER, &[0xf4]);
+        let mut code = alloc::vec![0x66, 0x0f, 0xf7];
+        code.extend_from_slice(&disp32(0, fpat::DATA));
+        code.push(0xf4);
+        run(&pc, &code);
+        assert_eq!(pc.regs().rip, HANDLED, "#UD with a memory operand");
+    }
+
+    #[test]
+    fn rcpps_and_rsqrtps_give_the_manuals_special_cases_and_raise_nothing() {
+        let rcp = lanes([0x4000_0000, 0x4040_0000, 0x8000_0000, 0x7f80_0000]); // 2, 3, -0, +inf
+        let (out, flags) = convert(0, 0x53, [0; 2], rcp, mxcsr::RESET);
+        assert_eq!(out, lanes([0x3f00_0000, 0x3eaa_aaab, 0xff80_0000, 0]));
+        assert_eq!(flags, 0);
+        // A denormal is a zero of its sign, whatever `DAZ` says; a tiny
+        // result is a zero, whatever `FTZ` says; a signalling NaN comes back
+        // quiet and sets no `IE`.
+        let rcp = lanes([0x0000_0001, 0x8000_0001, 0x7f00_0000, 0x7f80_0001]);
+        let (out, flags) = convert(0, 0x53, [0; 2], rcp, mxcsr::RESET);
+        assert_eq!(out, lanes([0x7f80_0000, 0xff80_0000, 0, 0x7fc0_0001]));
+        assert_eq!(flags, 0);
+
+        // 4, 2, -1, +inf
+        let rsq = lanes([0x4080_0000, 0x4000_0000, 0xbf80_0000, 0x7f80_0000]);
+        let (out, flags) = convert(0, 0x52, [0; 2], rsq, mxcsr::RESET);
+        assert_eq!(out, lanes([0x3f00_0000, 0x3f35_04f3, 0xffc0_0000, 0]));
+        assert_eq!(flags, 0);
+        // +0, -0, a negative denormal, a signalling NaN.
+        let rsq = lanes([0, 0x8000_0000, 0x8000_0001, 0x7f80_0001]);
+        let (out, flags) = convert(0, 0x52, [0; 2], rsq, mxcsr::RESET);
+        assert_eq!(
+            out,
+            lanes([0x7f80_0000, 0xff80_0000, 0xff80_0000, 0x7fc0_0001])
+        );
+        assert_eq!(flags, 0);
+        // `RC` is ignored: round-up gives the same bits as to-nearest.
+        let (up, _) = convert(
+            0,
+            0x53,
+            [0; 2],
+            lanes([0x4040_0000; 4]),
+            mxcsr::RESET | (2 << mxcsr::RC_SHIFT),
+        );
+        assert_eq!(up, lanes([0x3eaa_aaab; 4]));
+    }
+
+    #[test]
+    fn the_scalar_approximations_keep_the_upper_three_lanes() {
+        let dst = lanes([0x1111_1111, 0x2222_2222, 0x3333_3333, 0x4444_4444]);
+        let src = lanes([0x4080_0000, 0x5555_5555, 0x6666_6666, 0x7777_7777]);
+        let (out, _) = convert(0xf3, 0x53, dst, src, mxcsr::RESET);
+        assert_eq!(
+            out,
+            lanes([0x3e80_0000, 0x2222_2222, 0x3333_3333, 0x4444_4444]),
+            "rcpss 4"
+        );
+        let (out, _) = convert(0xf3, 0x52, dst, src, mxcsr::RESET);
+        assert_eq!(
+            out,
+            lanes([0x3f00_0000, 0x2222_2222, 0x3333_3333, 0x4444_4444]),
+            "rsqrtss 4"
+        );
+    }
+
+    /// Whether `y` is the correctly rounded value of `x^-power` (power 1 or
+    /// 2 meaning `1/x` or `1/sqrt(x)`), by exact integer comparison of the
+    /// two midpoints around `y` against the true value — which is then also
+    /// inside the architecture's `1.5 × 2^-12` bound with room to spare.
+    fn correctly_rounded(x: u32, y: u32, square: bool) -> bool {
+        let parts = |v: u32| {
+            let field = ((v >> 23) & 0xff) as i32;
+            (u128::from(v & 0x7f_ffff | 0x80_0000), field - 150)
+        };
+        let (mx, ex) = parts(x);
+        let (my, ey) = parts(y);
+        // `mid · 2^(ey - 1)` for the two midpoints `2·my ∓ 1`; the condition
+        // is `lo^p · x <= 1 <= hi^p · x`.
+        let side = |mid: u128| {
+            let (scaled, k) = if square {
+                (mid * mid * mx, 2 * (ey - 1) + ex)
+            } else {
+                (mid * mx, (ey - 1) + ex)
+            };
+            // Compare `scaled · 2^k` with 1.
+            if k >= 0 {
+                core::cmp::Ordering::Greater
+            } else {
+                scaled.cmp(&(1u128 << (-k)))
+            }
+        };
+        side(2 * my - 1) != core::cmp::Ordering::Greater
+            && side(2 * my + 1) != core::cmp::Ordering::Less
+    }
+
+    #[test]
+    fn the_approximations_are_correctly_rounded_across_the_normal_range() {
+        use crate::cpu::x86::fpexec::{approx_reciprocal, approx_reciprocal_sqrt};
+        // The check itself can say no: one unit in the last place either way
+        // of 1/3 and of 1/sqrt(2) is refused.
+        assert!(correctly_rounded(0x4040_0000, 0x3eaa_aaab, false));
+        assert!(!correctly_rounded(0x4040_0000, 0x3eaa_aaaa, false));
+        assert!(!correctly_rounded(0x4040_0000, 0x3eaa_aaac, false));
+        assert!(correctly_rounded(0x4000_0000, 0x3f35_04f3, true));
+        assert!(!correctly_rounded(0x4000_0000, 0x3f35_04f2, true));
+        assert!(!correctly_rounded(0x4000_0000, 0x3f35_04f4, true));
+        // A stride through every positive normal, plus the significands just
+        // either side of a power of two where the rounding is most delicate.
+        let mut inputs: Vec<u32> = (0x0080_0000u32..0x7f80_0000).step_by(4093).collect();
+        for field in [1u32, 100, 126, 127, 128, 200, 252] {
+            for frac in [0u32, 1, 2, 0x7f_fffe, 0x7f_ffff] {
+                inputs.push((field << 23) | frac);
+            }
+        }
+        for x in inputs {
+            let y = approx_reciprocal_sqrt(x);
+            assert!(
+                correctly_rounded(x, y, true),
+                "rsqrt {x:#010x} -> {y:#010x}"
+            );
+            let r = approx_reciprocal(x);
+            // Above 2^126 the reciprocal is tiny and is flushed to zero.
+            if x < 0x7e80_0000 {
+                assert!(correctly_rounded(x, r, false), "rcp {x:#010x} -> {r:#010x}");
+            } else if x > 0x7e80_0000 {
+                assert_eq!(r, 0, "rcp {x:#010x} is tiny");
+            }
+        }
+    }
+
+    #[test]
+    fn a_part_without_sse2_refuses_the_new_sse2_encodings_and_keeps_the_sse_ones() {
+        let part = || {
+            let features = Features {
+                sse2: false,
+                long: false,
+                nx: false,
+                syscall: false,
+                ..Features::X86_64
+            };
+            let pc = Pc::with_features(Variant::X86_64, features);
+            pc.start_protected();
+            let mut sys = pc.cpu.sys();
+            sys.cr4 |= cr4::OSFXSR | cr4::OSXMMEXCPT;
+            pc.cpu.set_sys(sys);
+            pc.idt(6, gate(0x08, HANDLER as u32, sys_type::INT_GATE32, 0));
+            pc.idt(13, gate(0x08, HANDLER as u32, sys_type::INT_GATE32, 0));
+            pc.write(HANDLER, &[0xf4]);
+            pc
+        };
+        let sse2: [&[u8]; 9] = [
+            &[0x0f, 0x5b, 0xc1],                      // cvtdq2ps
+            &[0x66, 0x0f, 0x5b, 0xc1],                // cvtps2dq
+            &[0xf3, 0x0f, 0x5b, 0xc1],                // cvttps2dq
+            &[0xf2, 0x0f, 0xe6, 0xc1],                // cvtpd2dq
+            &[0x66, 0x0f, 0xe6, 0xc1],                // cvttpd2dq
+            &[0xf3, 0x0f, 0xe6, 0xc1],                // cvtdq2pd
+            &[0x66, 0x0f, 0xf7, 0xc1],                // maskmovdqu
+            &[0x66, 0x0f, 0x2b, 0x05, 0, 0xb0, 0, 0], // movntpd
+            &[0x0f, 0xc3, 0x05, 0, 0xb0, 0, 0],       // movnti
+        ];
+        for bytes in sse2 {
+            let pc = part();
+            let mut code = bytes.to_vec();
+            code.push(0xf4);
+            run(&pc, &code);
+            assert_eq!(pc.regs().rip, HANDLED, "{bytes:02x?} is #UD without SSE2");
+        }
+        // The SSE half is still there.
+        let sse: [&[u8]; 5] = [
+            &[0x0f, 0x53, 0xc1],                // rcpps
+            &[0x0f, 0x52, 0xc1],                // rsqrtps
+            &[0xf3, 0x0f, 0x53, 0xc1],          // rcpss
+            &[0xf3, 0x0f, 0x52, 0xc1],          // rsqrtss
+            &[0x0f, 0x2b, 0x05, 0, 0xb0, 0, 0], // movntps
+        ];
+        for bytes in sse {
+            let pc = part();
+            let mut code = bytes.to_vec();
+            code.push(0xf4);
+            run(&pc, &code);
+            assert_eq!(
+                pc.regs().rip,
+                at::CODE0 + code.len() as u64,
+                "{bytes:02x?} executes"
+            );
+        }
+    }
+
+    #[test]
+    fn a_prefix_the_new_rows_do_not_name_is_an_invalid_opcode() {
+        // `66 0F 52`/`53` (no double-precision approximation before
+        // AVX-512), `F2 0F 5B`, and `F3`/`F2 0F 2B` would otherwise inherit
+        // the no-prefix row.
+        for bytes in [
+            &[0x66, 0x0f, 0x52, 0xc1][..],
+            &[0x66, 0x0f, 0x53, 0xc1],
+            &[0xf2, 0x0f, 0x52, 0xc1],
+            &[0xf2, 0x0f, 0x5b, 0xc1],
+            &[0xf3, 0x0f, 0x2b, 0x05, 0, 0xb0, 0, 0],
+            &[0xf2, 0x0f, 0x2b, 0x05, 0, 0xb0, 0, 0],
+            &[0x0f, 0xe6, 0xc1],
+            &[0x0f, 0xf7, 0xc1],
+        ] {
+            let pc = ssepc();
+            pc.idt(6, gate(0x08, HANDLER as u32, sys_type::INT_GATE32, 0));
+            pc.write(HANDLER, &[0xf4]);
+            let mut code = bytes.to_vec();
+            code.push(0xf4);
+            run(&pc, &code);
+            assert_eq!(pc.regs().rip, HANDLED, "{bytes:02x?}");
+        }
+    }
+
+    #[test]
+    fn the_disassembler_names_the_thirteen() {
+        let pc = ssepc();
+        let listing = |bytes: &[u8]| {
+            pc.write(at::CODE0, bytes);
+            let out = pc.cpu.disassemble(0x08, at::CODE0, 1);
+            alloc::format!("{}", out[0])
+        };
+        let cases: [(&[u8], &str); 15] = [
+            (
+                &[0x0f, 0x2b, 0x05, 0, 0xb0, 0, 0],
+                "movntps xmmword [ds:0xb000], xmm0",
+            ),
+            (
+                &[0x66, 0x0f, 0x2b, 0x0d, 0, 0xb0, 0, 0],
+                "movntpd xmmword [ds:0xb000], xmm1",
+            ),
+            (
+                &[0x0f, 0xc3, 0x05, 0, 0xb0, 0, 0],
+                "movnti dword [ds:0xb000], eax",
+            ),
+            (&[0x66, 0x0f, 0xf7, 0xc1], "maskmovdqu xmm0, xmm1"),
+            (&[0x0f, 0x5b, 0xc1], "cvtdq2ps xmm0, xmm1"),
+            (&[0x66, 0x0f, 0x5b, 0xc1], "cvtps2dq xmm0, xmm1"),
+            (&[0xf3, 0x0f, 0x5b, 0xc1], "cvttps2dq xmm0, xmm1"),
+            (&[0xf2, 0x0f, 0xe6, 0xc1], "cvtpd2dq xmm0, xmm1"),
+            (&[0x66, 0x0f, 0xe6, 0xc1], "cvttpd2dq xmm0, xmm1"),
+            (&[0xf3, 0x0f, 0xe6, 0xc1], "cvtdq2pd xmm0, xmm1"),
+            (&[0x0f, 0x53, 0xc1], "rcpps xmm0, xmm1"),
+            (&[0x0f, 0x52, 0xc1], "rsqrtps xmm0, xmm1"),
+            (&[0xf3, 0x0f, 0x53, 0xc1], "rcpss xmm0, xmm1"),
+            (&[0xf3, 0x0f, 0x52, 0xc1], "rsqrtss xmm0, xmm1"),
+            (
+                &[0xf3, 0x0f, 0xe6, 0x05, 0, 0xb0, 0, 0],
+                "cvtdq2pd xmm0, qword [ds:0xb000]",
+            ),
+        ];
+        for (bytes, text) in cases {
+            let got = listing(bytes);
+            assert!(got.ends_with(text), "{bytes:02x?}: {got}");
+            assert!(!got.contains("rep"), "{got}");
+        }
     }
 }
 
