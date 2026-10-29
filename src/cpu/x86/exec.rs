@@ -3626,7 +3626,20 @@ impl<'a> Exec<'a> {
         // `REP` with a zero count does nothing at all — not even one
         // iteration.
         while self.counter(f) != 0 {
-            self.string_step(f, size, delta)?;
+            if let Err(fault) = self.string_step(f, size, delta) {
+                // A fault part-way through a repeat restarts the instruction
+                // with the iterations already done *kept*: the count and both
+                // indexes say how far it got, and `EIP` is back on the prefix
+                // (*Intel SDM* volume 2, `REP/REPE/REPZ/REPNE/REPNZ`: the
+                // registers are updated to reflect the iterations completed,
+                // so the instruction can be restarted). The restart point is
+                // therefore now, not where the instruction began — and an
+                // iteration faults before it moves an index, which is what
+                // makes the live register file the completed-iterations one.
+                self.entry = self.state.regs;
+                self.entry.rip = self.start_ip;
+                return Err(fault);
+            }
             let count = self.counter(f).wrapping_sub(1);
             self.set_counter(f, count);
             if op.repeat_tests_zf() {
