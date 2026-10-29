@@ -52,6 +52,39 @@
 //! one, which is why it is the `ced` property rather than an assumption. The
 //! four `SR` error bits are the same on every part.
 //!
+//! # The `u5` variant
+//!
+//! The STM32U5's RNG (RM0456, the RNG chapter; `RNG_TypeDef` and the
+//! `RNG_CR_*` definitions in ST CMSIS `stm32u585xx.h`, Apache-2.0) is the same
+//! three registers grown two more and a `CR` full of conditioning
+//! configuration:
+//!
+//! | Offset | Register | Bits |
+//! | --- | --- | --- |
+//! | `0x00` | `CR` | as above, plus `ARDIS` 7, `RNG_CONFIG3` 8–11, `NISTC` 12, `RNG_CONFIG2` 13–15, `CLKDIV` 16–19, `RNG_CONFIG1` 20–25, `CONDRST` 30, `CONFIGLOCK` 31 |
+//! | `0x0C` | `NSCR` | `EN_OSC1`…`EN_OSC6`, three bits each |
+//! | `0x10` | `HTCR` | `HTCFG[31:0]` |
+//!
+//! What firmware depends on is the **conditioning reset**. `HAL_RNG_Init`
+//! writes `CR` with `CONDRST` set and its configuration, writes `HTCR` and
+//! `NSCR`, clears `CONDRST`, and then *spins until `CONDRST` reads zero*
+//! before setting `RNGEN` and waiting for `DRDY`. Here `CONDRST` reads back
+//! what was written, so the spin ends on its first read. While it is set
+//! the block generates nothing; setting it discards the pending word and
+//! the two current error statuses, and releasing it with `RNGEN` set starts
+//! generation again — so it is also the U5's seed-error recovery, alongside
+//! the older `RNGEN` toggle.
+//!
+//! The configuration fields (`CED`, `ARDIS`, `RNG_CONFIG1..3`, `NISTC`,
+//! `CLKDIV`) take a write only while `CONDRST` is set, by that write or
+//! already, and not at all once `CONFIGLOCK` is; `CONFIGLOCK` sets and stays
+//! set until reset. `NSCR` and `HTCR` are likewise frozen by `CONFIGLOCK`.
+//! All of it is stored and read back and none of it changes the numbers: the
+//! stream is the stream. `ARDIS`'s automatic seed-error recovery is not
+//! modelled, and every field resets to zero here except `NSCR`, which comes
+//! up with all oscillators enabled (`0x0003_FFFF`); HAL writes all three
+//! registers before it uses them.
+//!
 //! # Timing
 //!
 //! `DRDY` sets `latency` ticks of the device's own clock domain after `RNGEN`
@@ -128,7 +161,7 @@
 //! ST **RM0090** rev 21 §24 "Random number generator (RNG)" for the F4 block —
 //! the register map, the forty-period figure, the two error conditions and the
 //! seed-error recovery sequence — and ST **RM0351** rev 9 §26 for the L4's
-//! `CED` bit. RM0090 **Table 62** gives the interrupt position, which lives in
+//! `CED` bit; ST **RM0456** for the U5's, as above. RM0090 **Table 62** gives the interrupt position, which lives in
 //! the board file and not here. No emulator source of any licence was
 //! consulted (`ROADMAP.md` §1).
 //!
@@ -168,6 +201,36 @@ pub const IRQ_PIN: &str = "irq";
 /// Table 1 allots it is a hole above that, so a wrong offset faults rather than
 /// answering something plausible.
 pub const REGISTER_BYTES: u64 = 0x0c;
+
+/// How many bytes the `u5` block decodes: through `HTCR`.
+pub const REGISTER_BYTES_U5: u64 = 0x14;
+
+/// `CR.ARDIS`, bit 7 (`u5`).
+const CR_ARDIS: u32 = 1 << 7;
+/// `CR.RNG_CONFIG3`, `NISTC`, `RNG_CONFIG2`, `CLKDIV`, `RNG_CONFIG1`: bits
+/// 8–25 (`u5`).
+const CR_CONFIG: u32 = 0x03ff_ff00;
+/// `CR.CONDRST`, bit 30 (`u5`): the conditioning soft reset.
+const CR_CONDRST: u32 = 1 << 30;
+/// `CR.CONFIGLOCK`, bit 31 (`u5`): freeze the configuration until reset.
+const CR_CONFIGLOCK: u32 = 1 << 31;
+/// The `u5` `CR` fields a write reaches only while `CONDRST` is set.
+const CR_PROTECTED: u32 = CR_CED | CR_ARDIS | CR_CONFIG;
+/// `NSCR`'s six three-bit oscillator enables.
+const NSCR_MASK: u32 = 0x0003_ffff;
+/// `NSCR`'s reset value: every oscillator enabled.
+const NSCR_RESET: u32 = NSCR_MASK;
+
+/// Which register file the block has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Variant {
+    /// `CR`, `SR`, `DR` — the F4, and with `ced` the L4/G4/H7/WB.
+    #[default]
+    F4,
+    /// The STM32U5: `CONDRST`, `CONFIGLOCK` and the conditioning fields in
+    /// `CR`, plus `NSCR` and `HTCR`.
+    U5,
+}
 
 /// `CR.RNGEN`, bit 2.
 const CR_RNGEN: u32 = 1 << 2;
@@ -257,6 +320,10 @@ struct State {
     stream: Stream,
     /// Whether the configured `fault` is still waiting for an `RNGEN` edge.
     armed: bool,
+    /// `NSCR` (`u5`).
+    nscr: u32,
+    /// `HTCR` (`u5`).
+    htcr: u32,
 }
 
 impl State {
@@ -270,12 +337,15 @@ impl State {
             tick: 0,
             stream,
             armed: fault != Fault::None,
+            nscr: NSCR_RESET,
+            htcr: 0,
         }
     }
 
-    /// Whether the block is switched on.
+    /// Whether the block is switched on — and, on a `u5`, not held in its
+    /// conditioning reset. `CONDRST` cannot be set on the other variants.
     const fn enabled(&self) -> bool {
-        self.cr & CR_RNGEN != 0
+        self.cr & CR_RNGEN != 0 && self.cr & CR_CONDRST == 0
     }
 
     /// Whether a seed error is standing, which is what stops generation.
@@ -303,6 +373,8 @@ struct Registers {
     latency: u64,
     /// Whether the part has `CR.CED`.
     ced: bool,
+    /// Which register file.
+    variant: Variant,
     /// Which error the board asked for, if any.
     fault: Fault,
     /// The interrupt output, taken at realize.
@@ -429,7 +501,31 @@ impl Registers {
 
     /// What `CR` reads back: the bits this part implements, and zero elsewhere.
     fn cr_mask(&self) -> u32 {
-        CR_RNGEN | CR_IE | if self.ced { CR_CED } else { 0 }
+        match self.variant {
+            Variant::F4 => CR_RNGEN | CR_IE | if self.ced { CR_CED } else { 0 },
+            Variant::U5 => CR_RNGEN | CR_IE | CR_PROTECTED | CR_CONDRST | CR_CONFIGLOCK,
+        }
+    }
+
+    /// The `CR` a `u5` keeps after `value` is written over `old`.
+    fn u5_cr(old: u32, value: u32) -> u32 {
+        let mut cr =
+            (old & !(CR_RNGEN | CR_IE | CR_CONDRST)) | (value & (CR_RNGEN | CR_IE | CR_CONDRST));
+        // The configuration moves only inside a conditioning reset — "by that
+        // write or already" — and never once it is locked.
+        if (old | value) & CR_CONDRST != 0 && old & CR_CONFIGLOCK == 0 {
+            cr = (cr & !CR_PROTECTED) | (value & CR_PROTECTED);
+        }
+        // `CONFIGLOCK` is set-only until reset.
+        cr | ((old | value) & CR_CONFIGLOCK)
+    }
+
+    /// How many bytes decode.
+    fn register_bytes(&self) -> u64 {
+        match self.variant {
+            Variant::F4 => REGISTER_BYTES,
+            Variant::U5 => REGISTER_BYTES_U5,
+        }
     }
 
     /// Read one register.
@@ -458,6 +554,8 @@ impl Registers {
                 self.publish(&state);
                 Ok(word)
             }
+            0x0c if self.variant == Variant::U5 => Ok(state.nscr),
+            0x10 if self.variant == Variant::U5 => Ok(state.htcr),
             _ => Err(BusError::BadAccess),
         }
     }
@@ -468,15 +566,19 @@ impl Registers {
         match offset {
             0x00 => {
                 let was = state.enabled();
-                state.cr = value & self.cr_mask();
+                state.cr = match self.variant {
+                    Variant::F4 => value & self.cr_mask(),
+                    Variant::U5 => Registers::u5_cr(state.cr, value),
+                };
                 let now = state.enabled();
                 if now && !was {
                     self.start(&mut state);
                 } else if !now && was {
-                    // Switched off: the pending word is gone and so are both
-                    // *current* statuses, which are conditions rather than
-                    // latches. `CEIS` and `SEIS` stay, because only software
-                    // clears those.
+                    // Switched off, or into a `u5`'s conditioning reset: the
+                    // pending word is gone and so are both *current*
+                    // statuses, which are conditions rather than latches.
+                    // `CEIS` and `SEIS` stay, because only software clears
+                    // those.
                     state.sr &= !(SR_DRDY | SR_CECS | SR_SECS);
                     state.dr = 0;
                     state.ready_at = NO_DEADLINE;
@@ -493,6 +595,16 @@ impl Registers {
             }
             // "RNG_DR … Read-only."
             0x08 => {}
+            0x0c if self.variant == Variant::U5 => {
+                if state.cr & CR_CONFIGLOCK == 0 {
+                    state.nscr = value & NSCR_MASK;
+                }
+            }
+            0x10 if self.variant == Variant::U5 => {
+                if state.cr & CR_CONFIGLOCK == 0 {
+                    state.htcr = value;
+                }
+            }
             _ => return Err(BusError::BadAccess),
         }
         self.publish(&state);
@@ -547,7 +659,7 @@ impl Gated for Registers {
 
 impl MemOps for Registers {
     fn read(&self, offset: u64, dst: &mut [u8], attrs: MemAttrs) -> MemResult {
-        if offset >= REGISTER_BYTES {
+        if offset >= self.register_bytes() {
             return Err(BusError::BadAccess);
         }
         if !self.gate.live() {
@@ -574,7 +686,7 @@ impl MemOps for Registers {
     }
 
     fn write(&self, offset: u64, src: &[u8], attrs: MemAttrs) -> MemResult {
-        if offset >= REGISTER_BYTES {
+        if offset >= self.register_bytes() {
             return Err(BusError::BadAccess);
         }
         if attrs.debug {
@@ -632,6 +744,10 @@ impl Rng {
         let seed = r.or("seed", 0u64)?;
         let latency = r.or("latency", DEFAULT_LATENCY)?;
         let ced = r.or("ced", false)?;
+        let variant = match r.or_enum("variant", "f4", &["f4", "u5"])? {
+            "u5" => Variant::U5,
+            _ => Variant::F4,
+        };
         let spelling = r.or_str("fault", "none")?;
         let Some(fault) = Fault::parse(spelling) else {
             return Err(Error::Property(format!(
@@ -640,7 +756,10 @@ impl Rng {
         };
         r.touch("clock");
         r.finish()?;
-        Ok(Rng::build(seed, latency, ced, fault))
+        Ok(match variant {
+            Variant::F4 => Rng::build(seed, latency, ced, fault),
+            Variant::U5 => Rng::build_variant(seed, latency, Variant::U5, fault),
+        })
     }
 
     /// Build one directly — the route a test takes.
@@ -650,10 +769,21 @@ impl Rng {
     /// [`Rng::seed_from_path`].
     #[must_use]
     pub fn build(seed: u64, latency: u64, ced: bool, fault: Fault) -> Rng {
+        Rng::assemble(seed, latency, ced, Variant::F4, fault)
+    }
+
+    /// Build one of the given register file. A `u5` has `CED` by definition.
+    #[must_use]
+    pub fn build_variant(seed: u64, latency: u64, variant: Variant, fault: Fault) -> Rng {
+        Rng::assemble(seed, latency, variant == Variant::U5, variant, fault)
+    }
+
+    fn assemble(seed: u64, latency: u64, ced: bool, variant: Variant, fault: Fault) -> Rng {
         let regs = Arc::new(Registers {
             state: Mutex::with_rank(LockRank::DEVICE, State::reset(Stream::new(seed), fault)),
             latency,
             ced,
+            variant,
             fault,
             irq: Mutex::with_rank(LockRank::WIRE, None),
             lazy: Mutex::with_rank(LockRank::LEAF, None),
@@ -663,7 +793,7 @@ impl Rng {
         });
         let region = Arc::new(Region::io(
             "rng",
-            REGISTER_BYTES,
+            regs.register_bytes(),
             Arc::clone(&regs) as Arc<dyn MemOps>,
         ));
         Rng {
@@ -700,6 +830,12 @@ impl Rng {
     #[must_use]
     pub fn latency(&self) -> u64 {
         self.regs.latency
+    }
+
+    /// Which register file this block has.
+    #[must_use]
+    pub fn variant(&self) -> Variant {
+        self.regs.variant
     }
 
     /// Which error this block is configured to inject.
@@ -781,7 +917,14 @@ impl Device for Rng {
         w.write_bool(state.armed)?;
         // The generator's **position**, without which a restored snapshot
         // deals the guest numbers it has already had.
-        state.stream.save(w)
+        state.stream.save(w)?;
+        // A `u5`'s two extra registers, after everything else so the `f4`
+        // encoding is unchanged.
+        if self.regs.variant == Variant::U5 {
+            w.write_u32(state.nscr)?;
+            w.write_u32(state.htcr)?;
+        }
+        Ok(())
     }
 
     fn load(&self, r: &mut ChunkReader<'_>) -> Result<()> {
@@ -800,6 +943,10 @@ impl Device for Rng {
             state.tick = tick;
             state.armed = armed;
             state.stream.load(r)?;
+            if self.regs.variant == Variant::U5 {
+                state.nscr = r.read_u32()? & NSCR_MASK;
+                state.htcr = r.read_u32()?;
+            }
             if state.ready_at != NO_DEADLINE && state.ready_at < state.tick {
                 return Err(Error::State(format!(
                     "snapshot has an RNG word due at tick {} on a block already at {}",
@@ -899,6 +1046,12 @@ pub static CLASS: DeviceClass = DeviceClass {
             summary: "`none` (default), `seed` or `clock`: one injected error, for a driver's \
                       error path",
         },
+        PropertySpec {
+            name: "variant",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "register file: f4 (default; CR/SR/DR) or u5 (CONDRST, CONFIGLOCK, NSCR, HTCR; implies ced)",
+        },
     ],
     construct: |props| Ok(Box::new(Rng::new(props)?)),
 };
@@ -929,6 +1082,7 @@ pub fn schema() -> ClassSchema {
         .prop(PropSchema::new("latency", ValueKind::Uint))
         .prop(PropSchema::new("ced", ValueKind::Bool))
         .prop(PropSchema::new("fault", ValueKind::Str).values(&["none", "seed", "clock"]))
+        .prop(PropSchema::new("variant", ValueKind::Str).values(&["f4", "u5"]))
         .region("")
         .region("regs")
         .port(IRQ_PIN, PortDir::Out);
@@ -1492,6 +1646,127 @@ mod tests {
             .load("rng", CLASS_NAME, STATE_VERSION, &Migrations::new())
             .unwrap();
         assert!(Device::load(&d, &mut chunk.reader()).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // The u5 variant
+    // -----------------------------------------------------------------------
+
+    const NSCR: u64 = 0x0c;
+    const HTCR: u64 = 0x10;
+
+    fn u5(fault: Fault) -> Rng {
+        let d = Rng::build_variant(5, 40, Variant::U5, fault);
+        realize(&d, "rng");
+        d
+    }
+
+    /// What `HAL_RNG_Init` does on a U5, up to its `DRDY` poll.
+    fn hal_init(d: &Rng) {
+        write(d, CR, 0);
+        write(d, CR, 0x00f0_0d00 | CR_CONDRST);
+        write(d, HTCR, 0xa2b0);
+        write(d, NSCR, 0x1_7cbb);
+        let cr = read(d, CR);
+        write(d, CR, cr & !CR_CONDRST);
+        assert_eq!(read(d, CR) & CR_CONDRST, 0, "the CONDRST spin ends");
+        write(d, CR, read(d, CR) | CR_RNGEN);
+    }
+
+    #[test]
+    fn the_u5_hal_init_sequence_reaches_drdy() {
+        let d = u5(Fault::None);
+        assert_eq!(d.region.len(), REGISTER_BYTES_U5);
+        assert_eq!(read(&d, NSCR), NSCR_RESET);
+        hal_init(&d);
+        assert_eq!(read(&d, CR), 0x00f0_0d00 | CR_RNGEN, "NIST config kept");
+        assert_eq!(read(&d, HTCR), 0xa2b0);
+        assert_eq!(read(&d, NSCR), 0x1_7cbb);
+        assert_eq!(read(&d, SR) & SR_SEIS, 0);
+        d.advance_to(d.tick() + d.latency());
+        assert_eq!(read(&d, SR) & SR_DRDY, SR_DRDY);
+        assert_ne!(read(&d, DR), 0);
+        let mut buf = [0u8; 4];
+        assert!(d.regs.read(0x14, &mut buf, MemAttrs::DEFAULT).is_err());
+    }
+
+    #[test]
+    fn the_u5_configuration_moves_only_under_condrst_and_locks() {
+        let d = u5(Fault::None);
+        // Outside a conditioning reset the configuration does not take.
+        write(&d, CR, CR_RNGEN | 0x00f0_0d00 | CR_CED);
+        assert_eq!(read(&d, CR), CR_RNGEN);
+        // While held there, nothing is generated.
+        write(&d, CR, CR_RNGEN | CR_CONDRST | 0x00f0_0d00);
+        d.advance_to(d.tick() + 1000);
+        assert_eq!(read(&d, SR) & SR_DRDY, 0);
+        write(&d, CR, CR_RNGEN | 0x00f0_0d00 | CR_CONFIGLOCK);
+        d.advance_to(d.tick() + d.latency());
+        assert_eq!(read(&d, SR) & SR_DRDY, SR_DRDY, "released, it generates");
+        // Locked: neither CONDRST nor anything else reaches the configuration,
+        // and CONFIGLOCK cannot be cleared.
+        write(&d, CR, CR_CONDRST | CR_CED);
+        write(&d, CR, 0);
+        assert_eq!(read(&d, CR), 0x00f0_0d00 | CR_CONFIGLOCK);
+        write(&d, HTCR, 0x1234);
+        write(&d, NSCR, 0);
+        assert_eq!((read(&d, HTCR), read(&d, NSCR)), (0, NSCR_RESET));
+        Device::reset(&d, ResetKind::Cold);
+        assert_eq!(read(&d, CR), 0, "only a reset unlocks");
+    }
+
+    #[test]
+    fn the_u5_recovers_a_seed_error_through_condrst() {
+        let d = u5(Fault::Seed);
+        hal_init(&d);
+        assert_eq!(read(&d, SR) & (SR_SECS | SR_SEIS), SR_SECS | SR_SEIS);
+        d.advance_to(d.tick() + 1000);
+        assert_eq!(read(&d, SR) & SR_DRDY, 0, "halted");
+        // Clear SEIS, then pulse CONDRST.
+        write(&d, SR, 0);
+        let cr = read(&d, CR);
+        write(&d, CR, cr | CR_CONDRST);
+        assert_eq!(read(&d, SR) & SR_SECS, 0);
+        write(&d, CR, cr);
+        d.advance_to(d.tick() + d.latency());
+        assert_eq!(read(&d, SR) & SR_DRDY, SR_DRDY);
+    }
+
+    #[test]
+    fn a_u5_snapshot_round_trips_to_an_identical_state() {
+        let saved = u5(Fault::None);
+        hal_init(&saved);
+        write(&saved, CR, read(&saved, CR) | CR_CONFIGLOCK);
+        saved.advance_to(saved.latency() * 2);
+
+        let mut shape = MachineShape::new();
+        shape.add_device("rng", CLASS_NAME).unwrap();
+        let mut w = StateWriter::new(shape);
+        {
+            let mut chunk = w.chunk("rng", CLASS_NAME, STATE_VERSION).unwrap();
+            Device::save(&saved, &mut chunk).unwrap();
+        }
+        let bytes = w.to_vec().unwrap();
+
+        let restored = u5(Fault::None);
+        let reader = StateReader::new(&bytes).unwrap();
+        let chunk = reader
+            .load("rng", CLASS_NAME, STATE_VERSION, &Migrations::new())
+            .unwrap();
+        Device::load(&restored, &mut chunk.reader()).unwrap();
+        let before = *saved.regs.state.lock();
+        let after = *restored.regs.state.lock();
+        assert_eq!(after, before);
+        assert_eq!(read(&restored, HTCR), 0xa2b0);
+        assert_eq!(read(&restored, DR), read(&saved, DR));
+
+        assert_eq!(
+            Rng::new(&Props::new().with("variant", "u5"))
+                .unwrap()
+                .variant(),
+            Variant::U5
+        );
+        assert!(Rng::new(&Props::new().with("variant", "h7")).is_err());
     }
 
     // -----------------------------------------------------------------------
