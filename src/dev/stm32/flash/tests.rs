@@ -47,10 +47,10 @@ fn settle(flash: &Flash) {
 
 /// The unlock sequence, as firmware writes it.
 fn unlock(flash: &Flash) {
-    let keyr = if flash.variant().is_f4() {
-        F4_KEYR
-    } else {
-        L4_KEYR
+    let keyr = match flash.variant() {
+        Variant::F4 => F4_KEYR,
+        Variant::U5 => U5_NSKEYR,
+        Variant::L4 | Variant::L4Plus => L4_KEYR,
     };
     flash.poke(keyr, KEY1).expect("KEY1");
     flash.poke(keyr, KEY2).expect("KEY2");
@@ -58,10 +58,10 @@ fn unlock(flash: &Flash) {
 
 /// The option unlock sequence.
 fn opt_unlock(flash: &Flash) {
-    let reg = if flash.variant().is_f4() {
-        F4_OPTKEYR
-    } else {
-        L4_OPTKEYR
+    let reg = match flash.variant() {
+        Variant::F4 => F4_OPTKEYR,
+        Variant::U5 => U5_OPTKEYR,
+        Variant::L4 | Variant::L4Plus => L4_OPTKEYR,
     };
     flash.poke(reg, OPTKEY1).expect("OPTKEY1");
     flash.poke(reg, OPTKEY2).expect("OPTKEY2");
@@ -1584,4 +1584,409 @@ fn the_published_erase_geometry_is_the_part_s_own() {
             blocksize: page,
         }]
     );
+}
+
+// ---------------------------------------------------------------------------
+// The U5 (RM0456 §7; offsets and bits from ST CMSIS `stm32u585xx.h`)
+// ---------------------------------------------------------------------------
+
+/// A 2 MiB STM32U585: two banks of 1 MiB, 8 KiB pages.
+const U5_SIZE: u64 = 2 * 1024 * 1024;
+
+fn u5() -> Flash {
+    build(Variant::U5, U5_SIZE, None)
+}
+
+/// Store one quad-word as HAL's `FLASH_Program_QuadWord` does: four word
+/// writes, lowest address first.
+fn u5_quad(flash: &Flash, offset: u64, words: [u32; 4]) {
+    for (i, w) in words.iter().enumerate() {
+        flash
+            .store(offset + 4 * i as u64, &w.to_le_bytes())
+            .unwrap();
+    }
+}
+
+#[test]
+fn a_u5_comes_out_of_reset_locked_with_tzen_clear_and_rdp_level_0() {
+    let flash = u5();
+    assert_eq!(flash.peek(U5_NSCR), 0xc000_0000, "LOCK and OPTLOCK");
+    assert_eq!(flash.peek(ACR), 0);
+    assert_eq!(flash.peek(U5_NSSR), 0);
+    let optr = flash.peek(U5_OPTR);
+    assert_eq!(optr & 0xff, 0xaa, "RDP level 0");
+    assert_eq!(optr & U5_OPTR_TZEN, 0, "TrustZone off");
+    assert_ne!(optr & (1 << 21), 0, "DUALBANK");
+    assert_eq!(flash.peek(U5_NSBOOTADD0R) & U5_BOOTADD_MASK, 0x0800_0000);
+    assert_eq!(
+        Device::region(&flash, "regs").map(|r| r.len()),
+        Some(0x100),
+        "FLASH_TypeDef runs to PRIVBB2R4 at +0xFC"
+    );
+    // A board cannot ask for TrustZone, and a U5 has no PCROP.
+    let props = Props::new()
+        .with("variant", Value::Str(String::from("u5")))
+        .with("size", Value::Uint(U5_SIZE))
+        .with("optr", Value::Uint(0x9fef_f8aa));
+    assert!(Flash::new(&props).is_err());
+    let props = Props::new()
+        .with("variant", Value::Str(String::from("u5")))
+        .with("size", Value::Uint(U5_SIZE))
+        .with("pcrop1sr", Value::Uint(0));
+    assert!(Flash::new(&props).is_err());
+    // 4 MiB would be 256 pages a bank, past `PNB[6:0]`.
+    let props = Props::new()
+        .with("variant", Value::Str(String::from("u5")))
+        .with("size", Value::Uint(2 * U5_SIZE));
+    assert!(Flash::new(&props).is_err());
+}
+
+#[test]
+fn the_u5_key_sequences_unlock_and_a_wrong_key_is_a_bus_error_until_reset() {
+    let flash = u5();
+    unlock(&flash);
+    assert!(flash.unlocked());
+    assert_eq!(flash.peek(U5_NSKEYR), 0, "the key register is write-only");
+    opt_unlock(&flash);
+    assert_eq!(flash.peek(U5_NSCR) & L4_CR_OPTLOCK, 0);
+    // Setting OPTLOCK leaves LOCK alone on a U5.
+    flash.poke(U5_NSCR, L4_CR_OPTLOCK).unwrap();
+    assert!(flash.unlocked());
+
+    let flash = u5();
+    flash.poke(U5_NSKEYR, 0x1234_5678).unwrap();
+    assert_eq!(flash.poke(U5_NSKEYR, KEY1), Err(BusError::BadAccess));
+    Device::reset(&flash, ResetKind::Warm);
+    unlock(&flash);
+    assert!(flash.unlocked(), "a reset clears the key error");
+}
+
+#[test]
+fn a_u5_quad_word_is_four_words_and_wdw_says_the_buffer_is_waiting() {
+    let flash = u5();
+    let irq = probe(&flash, IRQ_PIN);
+    unlock(&flash);
+    flash.poke(U5_NSCR, CR_PG | CR_EOPIE).unwrap();
+    let words: [u32; 4] = [0x1111_1111, 0x2222_2222, 0x3333_3333, 0x4444_4444];
+    for (i, w) in words.iter().enumerate().take(3) {
+        flash.store(0x100 + 4 * i as u64, &w.to_le_bytes()).unwrap();
+        assert_eq!(
+            sr(&flash),
+            U5_SR_WDW,
+            "waiting for the rest of the quad-word"
+        );
+    }
+    assert_eq!(
+        word(&flash, 0x100),
+        0xffff_ffff,
+        "nothing is programmed yet"
+    );
+    flash.store(0x10c, &words[3].to_le_bytes()).unwrap();
+    assert_eq!(sr(&flash), SR_BSY, "the fourth word starts the program");
+    settle(&flash);
+    assert_eq!(sr(&flash), SR_EOP);
+    assert!(irq.is_high(), "EOPIE");
+    for (i, w) in words.iter().enumerate() {
+        assert_eq!(word(&flash, 0x100 + 4 * i as u64), *w);
+    }
+    clear_sr(&flash);
+    assert!(!irq.is_high());
+
+    // The words may arrive in any order within the quad-word, and without
+    // EOPIE no EOP is set at all.
+    flash.poke(U5_NSCR, CR_PG).unwrap();
+    for i in [3u64, 1, 0, 2] {
+        flash
+            .store(0x200 + 4 * i, &(i as u32).to_le_bytes())
+            .unwrap();
+    }
+    settle(&flash);
+    assert_eq!(sr(&flash), 0, "EOP needs EOPIE on a U5");
+    assert_eq!(word(&flash, 0x20c), 3);
+}
+
+#[test]
+fn a_u5_refuses_a_programmed_quad_word_but_allows_zeroing_it() {
+    let flash = u5();
+    unlock(&flash);
+    flash.poke(U5_NSCR, CR_PG).unwrap();
+    u5_quad(&flash, 0x40, [0x0f0f_0f0f; 4]);
+    settle(&flash);
+    u5_quad(&flash, 0x40, [0x0000_0f0f; 4]);
+    assert_eq!(sr(&flash) & SR_PROGERR, SR_PROGERR);
+    assert_eq!(sr(&flash) & SR_OPERR, 0, "OPERR only with ERRIE");
+    assert_eq!(word(&flash, 0x40), 0x0f0f_0f0f, "nothing was programmed");
+
+    // An uncleared program error makes the next program a sequence error.
+    u5_quad(&flash, 0x80, [0; 4]);
+    assert_eq!(sr(&flash) & SR_PGSERR, SR_PGSERR);
+    assert_eq!(word(&flash, 0x80), 0xffff_ffff);
+    clear_sr(&flash);
+
+    // All zeroes is allowed over programmed cells.
+    u5_quad(&flash, 0x40, [0; 4]);
+    settle(&flash);
+    assert_eq!(sr(&flash) & U5_ERRORS, 0);
+    assert_eq!(word(&flash, 0x40), 0);
+}
+
+#[test]
+fn a_u5_rejects_narrow_stores_stray_quad_words_and_a_clear_pg() {
+    let flash = u5();
+    let irq = probe(&flash, IRQ_PIN);
+    unlock(&flash);
+    flash.poke(U5_NSCR, CR_PG | CR_ERRIE).unwrap();
+    flash.store(0x0, &[0u8; 2]).unwrap();
+    assert_eq!(sr(&flash), L4_SR_SIZERR | SR_OPERR);
+    assert!(irq.is_high(), "ERRIE");
+    clear_sr(&flash);
+
+    // A word into another quad-word while one is half-filled.
+    flash.store(0x10, &0u32.to_le_bytes()).unwrap();
+    flash.store(0x24, &0u32.to_le_bytes()).unwrap();
+    assert_eq!(sr(&flash), SR_PGAERR | SR_OPERR, "and WDW is gone");
+    clear_sr(&flash);
+    assert_eq!(word(&flash, 0x10), 0xffff_ffff);
+
+    flash.poke(U5_NSCR, 0).unwrap();
+    flash.store(0x30, &0u32.to_le_bytes()).unwrap();
+    assert_eq!(sr(&flash) & SR_PGSERR, SR_PGSERR, "PG clear");
+}
+
+#[test]
+fn a_u5_burst_programs_eight_quad_words_at_once() {
+    let flash = u5();
+    unlock(&flash);
+    flash.poke(U5_NSCR, CR_PG | U5_CR_BWR).unwrap();
+    for i in 0..32u32 {
+        flash
+            .store(0x400 + 4 * u64::from(i), &i.to_le_bytes())
+            .unwrap();
+        if i < 31 {
+            assert_eq!(sr(&flash), U5_SR_WDW);
+        }
+    }
+    assert_eq!(sr(&flash), SR_BSY);
+    settle(&flash);
+    for i in 0..32u32 {
+        assert_eq!(word(&flash, 0x400 + 4 * u64::from(i)), i);
+    }
+}
+
+#[test]
+fn a_u5_page_erase_takes_8_kib_of_the_bank_bker_names() {
+    let flash = u5();
+    flash
+        .load_image(0, &alloc::vec![0u8; U5_SIZE as usize])
+        .unwrap();
+    unlock(&flash);
+    flash
+        .poke(U5_NSCR, L4_CR_PER | L4_CR_BKER | (3 << 3) | CR_STRT)
+        .unwrap();
+    assert_eq!(sr(&flash) & SR_BSY, SR_BSY);
+    settle(&flash);
+    let contents = flash.contents();
+    let page = (U5_SIZE / 2 + 3 * U5_PAGE) as usize;
+    assert!(contents[page..page + 8192].iter().all(|&b| b == 0xff));
+    assert_eq!(contents[page - 1], 0);
+    assert_eq!(contents[page + 8192], 0);
+    assert!(contents[..U5_SIZE as usize / 2].iter().all(|&b| b == 0));
+
+    // A 1 MiB U575 puts bank 2 at 512 KiB.
+    let small = build(Variant::U5, U5_SIZE / 2, None);
+    small
+        .load_image(0, &alloc::vec![0u8; (U5_SIZE / 2) as usize])
+        .unwrap();
+    unlock(&small);
+    small
+        .poke(U5_NSCR, L4_CR_PER | L4_CR_BKER | CR_STRT)
+        .unwrap();
+    settle(&small);
+    let contents = small.contents();
+    assert!(
+        contents[512 * 1024..512 * 1024 + 8192]
+            .iter()
+            .all(|&b| b == 0xff)
+    );
+    assert_eq!(contents[0], 0);
+    // Page 64 is past a 512 KiB bank.
+    small
+        .poke(U5_NSCR, L4_CR_PER | (64 << 3) | CR_STRT)
+        .unwrap();
+    assert_eq!(sr(&small) & SR_PGSERR, SR_PGSERR);
+}
+
+#[test]
+fn hal_s_back_to_back_bank_erases_erase_the_whole_u5() {
+    let flash = u5();
+    flash
+        .load_image(0, &alloc::vec![0u8; U5_SIZE as usize])
+        .unwrap();
+    unlock(&flash);
+    // `FLASH_MassErase(FLASH_BANK_BOTH)`: two read-modify-writes, no wait.
+    flash.poke(U5_NSCR, L4_CR_MER1 | CR_STRT).unwrap();
+    let cr = flash.peek(U5_NSCR);
+    flash.poke(U5_NSCR, cr | L4_CR_MER2 | CR_STRT).unwrap();
+    assert_eq!(sr(&flash) & U5_ERRORS, 0, "not a sequence error");
+    settle(&flash);
+    assert!(flash.contents().iter().all(|&b| b == 0xff));
+
+    // One bank alone leaves the other.
+    let flash = u5();
+    flash
+        .load_image(0, &alloc::vec![0u8; U5_SIZE as usize])
+        .unwrap();
+    unlock(&flash);
+    flash.poke(U5_NSCR, L4_CR_MER2 | CR_STRT).unwrap();
+    settle(&flash);
+    let contents = flash.contents();
+    assert!(contents[..U5_SIZE as usize / 2].iter().all(|&b| b == 0));
+    assert!(contents[U5_SIZE as usize / 2..].iter().all(|&b| b == 0xff));
+}
+
+#[test]
+fn a_u5_wrp_area_refuses_program_and_erase() {
+    let flash = u5();
+    unlock(&flash);
+    opt_unlock(&flash);
+    // Bank 2, pages 2..=3.
+    flash.poke(U5_WRP2AR, 0x8003_0002).unwrap();
+    assert_eq!(flash.peek(U5_WRP2AR), 0x8003_0002);
+    flash.poke(U5_NSCR, CR_PG).unwrap();
+    u5_quad(&flash, U5_SIZE / 2 + 2 * U5_PAGE, [0; 4]);
+    assert_eq!(sr(&flash) & SR_WRPERR, SR_WRPERR);
+    clear_sr(&flash);
+    flash.poke(U5_NSCR, 0).unwrap();
+    flash.poke(U5_NSCR, L4_CR_MER2 | CR_STRT).unwrap();
+    assert_eq!(sr(&flash) & SR_WRPERR, SR_WRPERR);
+    clear_sr(&flash);
+    // The same page in bank 1 is not protected.
+    flash.poke(U5_NSCR, CR_PG).unwrap();
+    u5_quad(&flash, 2 * U5_PAGE, [0; 4]);
+    settle(&flash);
+    assert_eq!(sr(&flash) & U5_ERRORS, 0);
+}
+
+#[test]
+fn u5_option_bytes_commit_with_optstrt_and_load_with_obl_launch() {
+    /// `OPTR.nBOOT0` (`FLASH_OPTR_nBOOT0_Pos` = 27).
+    const NBOOT0: u32 = 1 << 27;
+    let flash = u5();
+    let reset = probe(&flash, RESET_PIN);
+    // Locked: the write does nothing.
+    flash.poke(U5_OPTR, 0).unwrap();
+    assert_eq!(flash.peek(U5_OPTR), 0x1fef_f8aa);
+
+    unlock(&flash);
+    opt_unlock(&flash);
+    let before = flash.peek(U5_OPTR);
+    // TZEN cannot be set; everything else defined can.
+    flash
+        .poke(U5_OPTR, (before & !NBOOT0) | U5_OPTR_TZEN)
+        .unwrap();
+    assert_eq!(flash.peek(U5_OPTR), before & !NBOOT0);
+    flash.poke(U5_NSBOOTADD0R, 0x0810_0000).unwrap();
+    assert_eq!(
+        flash.peek(U5_NSBOOTADD0R),
+        0x0810_007f,
+        "reserved bits kept"
+    );
+
+    flash.poke(U5_NSCR, L4_CR_OPTSTRT | CR_EOPIE).unwrap();
+    assert_eq!(sr(&flash) & SR_BSY, SR_BSY);
+    settle(&flash);
+    assert_eq!(sr(&flash) & SR_EOP, SR_EOP);
+
+    assert!(flash.poke(U5_NSCR, L4_CR_OBL_LAUNCH).unwrap());
+    assert_eq!(reset.rising_edges(), 1);
+    Device::reset(&flash, ResetKind::Warm);
+    assert_eq!(flash.peek(U5_OPTR) & NBOOT0, 0, "committed");
+    assert_eq!(flash.peek(U5_NSBOOTADD0R), 0x0810_007f);
+    assert_eq!(flash.peek(U5_NSCR), 0xc000_0000);
+}
+
+#[test]
+fn the_u5_secure_registers_are_raz_wi_on_a_tzen_0_part() {
+    let flash = u5();
+    unlock(&flash);
+    for offset in [U5_SECKEYR, 0x24, 0x2c, 0x80, 0xa0, 0xc0] {
+        flash.poke(offset, 0xffff_ffff).unwrap();
+        assert_eq!(flash.peek(offset), 0, "{offset:#x}");
+    }
+    flash.poke(U5_PRIVCFGR, 0xffff_ffff).unwrap();
+    assert_eq!(flash.peek(U5_PRIVCFGR), 0b11);
+    flash.poke(ACR, 0xffff_ffff).unwrap();
+    assert_eq!(flash.peek(ACR), U5_ACR_MASK, "PDREQx are not kept");
+    assert_eq!(flash.latency(), 15);
+}
+
+#[test]
+fn a_u5_debug_access_never_moves_the_write_buffer() {
+    let flash = u5();
+    unlock(&flash);
+    flash.poke(U5_NSCR, CR_PG).unwrap();
+    flash.store(0x0, &0u32.to_le_bytes()).unwrap();
+    let before = sr(&flash);
+    // A debugger poking the array goes through the loader's door.
+    Program {
+        shared: Arc::clone(&flash.shared),
+    }
+    .write(0x1000, &0u32.to_le_bytes(), MemAttrs::DEBUG)
+    .unwrap();
+    assert_eq!(word(&flash, 0x1000), 0);
+    let mut buf = [0u8; 4];
+    Registers {
+        shared: Arc::clone(&flash.shared),
+    }
+    .read(U5_NSSR, &mut buf, MemAttrs::DEBUG)
+    .unwrap();
+    assert_eq!(u32::from_le_bytes(buf), before);
+    assert_eq!(sr(&flash), U5_SR_WDW, "the half-filled quad-word is intact");
+    // And it still completes.
+    for i in 1..4u64 {
+        flash.store(4 * i, &0u32.to_le_bytes()).unwrap();
+    }
+    assert_eq!(sr(&flash), SR_BSY);
+}
+
+#[test]
+fn a_u5_snapshot_round_trips_a_half_filled_quad_word() {
+    let saved = u5();
+    unlock(&saved);
+    saved.poke(U5_NSCR, CR_PG | CR_EOPIE).unwrap();
+    u5_quad(&saved, 0x2000, [1, 2, 3, 4]);
+    settle(&saved);
+    clear_sr(&saved);
+    saved.store(0x3000, &0xaaaa_5555u32.to_le_bytes()).unwrap();
+    saved.store(0x3008, &0x1234_5678u32.to_le_bytes()).unwrap();
+
+    let bytes = save(&saved);
+    let restored = u5();
+    restore(&restored, &bytes);
+    assert_eq!(save(&restored), bytes, "identical state");
+    assert_eq!(word(&restored, 0x2004), 2);
+    assert_eq!(sr(&restored), U5_SR_WDW);
+
+    restored.store(0x3004, &7u32.to_le_bytes()).unwrap();
+    restored.store(0x300c, &9u32.to_le_bytes()).unwrap();
+    settle(&restored);
+    assert_eq!(word(&restored, 0x3000), 0xaaaa_5555);
+    assert_eq!(word(&restored, 0x3008), 0x1234_5678);
+    assert_eq!(word(&restored, 0x300c), 9);
+
+    // And a running burst survives too, all 128 bytes of it.
+    let saved = u5();
+    unlock(&saved);
+    saved.poke(U5_NSCR, CR_PG | U5_CR_BWR).unwrap();
+    for i in 0..32u32 {
+        saved
+            .store(0x4000 + 4 * u64::from(i), &(!i).to_le_bytes())
+            .unwrap();
+    }
+    let bytes = save(&saved);
+    let restored = u5();
+    restore(&restored, &bytes);
+    assert_eq!(save(&restored), bytes);
+    settle(&restored);
+    assert_eq!(word(&restored, 0x407c), !31u32);
 }

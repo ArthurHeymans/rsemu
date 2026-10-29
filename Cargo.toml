@@ -2148,8 +2148,12 @@ dev-stm32-hash = []
 # the F4's **unequal** sector sizes (RM0090 Table 5) and the L4's uniform
 # pages, WRP write protection, option bytes with OPTSTRT and the OBL_LAUNCH
 # reset. PCROP and RDP are stored and not enforced; the caches and ECC are not
-# modelled. Written from ST RM0090 §3 and ST RM0351 §3; no emulator source was
-# consulted (ROADMAP.md §1). `no_std + alloc`, no `unsafe`, no dependencies.
+# modelled. `variant = "u5"` adds the STM32U575/U585 (RM0456 §7): two banks of
+# 8 KiB pages, 128-bit quad-word (and 8-quad-word burst) programming through a
+# write buffer with NSSR.WDW, and the non-secure register copies of a TZEN = 0
+# part. Written from ST RM0090 §3, ST RM0351 §3 and ST RM0456 §7 with the ST
+# CMSIS stm32u585xx.h offsets (Apache-2.0); no emulator source was consulted
+# (ROADMAP.md §1). `no_std + alloc`, no `unsafe`, no dependencies.
 dev-stm32-flash = []
 # The STM32 real-time clock (src/dev/stm32/rtc.rs): one class, `st.rtc`, and
 # the only peripheral on the die that keeps its state across a system reset --

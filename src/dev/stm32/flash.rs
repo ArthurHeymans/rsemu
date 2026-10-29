@@ -14,6 +14,14 @@
 //! here rather than a third register map. No emulator source of any licence was
 //! consulted (`ROADMAP.md` §1).
 //!
+//! The **U5** (`variant = "u5"`, STM32U575/U585) is a third register map,
+//! written from ST **RM0456** §7 (embedded flash memory) with every offset and
+//! bit position taken from `FLASH_TypeDef` and the `FLASH_*_Pos` definitions in
+//! ST CMSIS `stm32u585xx.h` (Apache-2.0); ST's STM32U5 HAL
+//! (`stm32u5xx_hal_flash.c`, `_flash_ex.c`, BSD-3-Clause) was read for what
+//! firmware writes and polls, and none of it is copied here. See "The U5",
+//! below.
+//!
 //! **The two families do not share a base address.** RM0090 §2.3 puts the F4's
 //! flash interface at `0x4002_3C00`, the kilobyte above the RCC; RM0351 §2.2.2
 //! puts the L4's at `0x4002_2000`. Neither is in this file — a base is a `map`
@@ -177,6 +185,53 @@
 //!
 //! [`Medium`]: crate::dev::medium::Medium
 //!
+//! # The U5
+//!
+//! RM0456 §7 keeps the L4's shape: pages, `PNB`/`BKER`, `MER1`/`MER2`, the
+//! `KEYR`/`OPTKEYR` key pairs and `OPTSTRT`/`OBL_LAUNCH`. What differs:
+//!
+//! * **The map.** TrustZone splits `KEYR`, `SR` and `CR` into non-secure and
+//!   secure copies (`NSKEYR`/`SECKEYR` at `+0x08`/`+0x0C`, `NSSR`/`SECSR` at
+//!   `+0x20`/`+0x24`, `NSCR`/`SECCR` at `+0x28`/`+0x2C`), `OPTR` moves to
+//!   `+0x40`, and the block runs to `PRIVBB2R4` at `+0xFC`. This model is a
+//!   **`TZEN = 0`** part — the option-byte default — so firmware drives the
+//!   `NS` registers, and every secure-only register (`SECKEYR`, `SECSR`,
+//!   `SECCR`, `SECBBxRy`, `SECHDPCR`) reads as zero and ignores writes, and
+//!   `OPTR.TZEN` cannot be set. The OEM key registers are write-only and
+//!   their `OEMxLOCK` flags never set.
+//! * **Geometry.** Always two banks of `size / 2` (1 MiB each on a 2 MiB
+//!   U575/U585, 512 KiB on a 1 MiB U575), 8 KiB pages, `PNB[6:0]` counting
+//!   within the bank `BKER` names (RM0456 §7.3.1). `SWAP_BANK` is stored and
+//!   does not swap the banks' addresses.
+//! * **Quad-word programming** (RM0456 §7.3.7). Four 32-bit stores into one
+//!   aligned 16-byte quad-word are collected in a write buffer and committed
+//!   together on the fourth; while the buffer is partly filled `NSSR.WDW` is
+//!   set, which is what HAL's `FLASH_WaitForLastOperation` polls beside `BSY`.
+//!   The words may arrive in any order within the quad-word. A store into a
+//!   *different* quad-word while one is partly filled is `PGAERR` and drops
+//!   the buffer; a byte or half-word store is `SIZERR`; a store with `PG`
+//!   clear, with the interface locked, while busy, or while an earlier program
+//!   error is still uncleared is `PGSERR`; a quad-word whose cells are not all
+//!   ones is `PROGERR` and nothing is written — **except** a quad-word of all
+//!   zeroes, which RM0456 allows over programmed cells. `NSCR.BWR` is the
+//!   burst variant: the same rules over eight quad-words (128 aligned bytes).
+//! * **Flags.** `EOP` is set only when `EOPIE` is, and `OPERR` only when
+//!   `ERRIE` is (RM0456 §7.9, `FLASH_NSSR`). `OPTWERR` is the U5's option-write error.
+//! * **HAL's mass erase.** `FLASH_MassErase(FLASH_BANK_BOTH)` sets
+//!   `MER1|STRT` and then `MER2|STRT` with no wait between them. The model
+//!   folds that second strobe into the running bank-1 erase rather than
+//!   calling it a sequence error, so the one-call HAL path works.
+//! * **Option bytes** are storage plus the protections this file already
+//!   enforces: `OPTR` (reset value: `RDP` = `0xAA`, `DUALBANK`, the watchdogs
+//!   in software mode, `TZEN` = 0), `NSBOOTADD0R`/`1R`, `SECBOOTADD0R`, the
+//!   `SECWMxRy` watermarks (stored, not enforced — no secure world), and
+//!   `WRPxAR`/`WRPxBR`, which **are** enforced: two inclusive page ranges per
+//!   bank, disabled when the start is above the end, with `UNLOCK` able to
+//!   be cleared but set again only at `RDP` level 0. `RDP` levels 0, 1 and 2
+//!   behave as above; there is no `PCROP` on a U5. The power-down requests
+//!   (`ACR.PDREQx`, `PDKEYxR`) and the low-power read mode are not modelled:
+//!   `PDREQx` read back zero and `NSSR.PD1`/`PD2` never set.
+//!
 //! # Time
 //!
 //! A program or an erase takes time, and firmware polls `SR.BSY` for it. As in
@@ -221,14 +276,28 @@ pub const RESET_PIN: &str = "reset";
 /// The interrupt output, driven by `EOPIE` and `ERRIE`.
 pub const IRQ_PIN: &str = "irq";
 
-/// How many 32-bit words the widest layout occupies: the L4 map ends at
-/// `WRP2BR` (`+0x50`), so twenty-one words covers every variant and the
-/// snapshot encoding is one shape.
-const WORDS: usize = 0x15;
+/// How many 32-bit words the widest layout occupies: the U5 map ends at
+/// `PRIVBB2R4` (`+0xFC`).
+const WORDS: usize = 0x40;
 
-/// How many option words a variant can have. The L4 has nine: `OPTR`, two
-/// `PCROP` pairs and two `WRP` pairs.
-const OPT_WORDS: usize = 9;
+/// How many register words an F4 or L4 snapshot carries. The L4 map ends at
+/// `WRP2BR` (`+0x50`), and those snapshots were written as twenty-one words
+/// before the U5 widened [`WORDS`]; keeping the count keeps the encoding.
+const LEGACY_WORDS: usize = 0x15;
+
+/// How many option words a variant can have. The U5 has twelve (see
+/// [`Variant::option_words`]).
+const OPT_WORDS: usize = 12;
+
+/// How many option words an F4 or L4 snapshot carries — the L4's nine,
+/// as the encoding had them before the U5.
+const LEGACY_OPT_WORDS: usize = 9;
+
+/// The widest single program: a U5 burst of eight quad-words.
+const PROGRAM_MAX: usize = 128;
+
+/// How many program bytes an F4 or L4 snapshot carries for a pending program.
+const LEGACY_PROGRAM_BYTES: usize = 8;
 
 /// "Nothing is running."
 const NO_DEADLINE: u64 = u64::MAX;
@@ -272,6 +341,9 @@ pub enum Variant {
     /// RM0432 §3: as [`Variant::L4`], with 4 KiB pages in dual-bank mode and
     /// 8 KiB pages in single-bank mode, plus `SR.PEMPTY`.
     L4Plus,
+    /// RM0456 §7: the STM32U5 — two banks of 8 KiB pages, quad-word
+    /// programming, the non-secure register copies of a `TZEN = 0` part.
+    U5,
 }
 
 impl Variant {
@@ -282,12 +354,46 @@ impl Variant {
             Variant::F4 => "f4",
             Variant::L4 => "l4",
             Variant::L4Plus => "l4plus",
+            Variant::U5 => "u5",
         }
     }
 
     /// Whether this is the RM0090 layout.
     fn is_f4(self) -> bool {
         matches!(self, Variant::F4)
+    }
+
+    /// Whether this is the RM0456 layout.
+    fn is_u5(self) -> bool {
+        matches!(self, Variant::U5)
+    }
+
+    /// Whether this is the RM0351/RM0432 layout, the only one with `PCROP`.
+    fn is_l4(self) -> bool {
+        matches!(self, Variant::L4 | Variant::L4Plus)
+    }
+
+    /// How many register words a snapshot of this variant carries.
+    fn saved_words(self) -> usize {
+        if self.is_u5() { WORDS } else { LEGACY_WORDS }
+    }
+
+    /// How many option words a snapshot of this variant carries.
+    fn saved_option_words(self) -> usize {
+        if self.is_u5() {
+            OPT_WORDS
+        } else {
+            LEGACY_OPT_WORDS
+        }
+    }
+
+    /// How many bytes of a pending program a snapshot carries.
+    fn saved_program_bytes(self) -> usize {
+        if self.is_u5() {
+            PROGRAM_MAX
+        } else {
+            LEGACY_PROGRAM_BYTES
+        }
     }
 
     /// How many bytes of the peripheral's kilobyte actually decode.
@@ -298,6 +404,8 @@ impl Variant {
             Variant::F4 => 0x1c,
             // Through `WRP2BR` at `+0x50` (RM0351 §3.7.17).
             Variant::L4 | Variant::L4Plus => 0x54,
+            // Through `PRIVBB2R4` at `+0xFC` (`FLASH_TypeDef`).
+            Variant::U5 => 0x100,
         }
     }
 
@@ -316,6 +424,20 @@ impl Variant {
                 L4_PCROP2ER,
                 L4_WRP2AR,
                 L4_WRP2BR,
+            ],
+            Variant::U5 => &[
+                U5_OPTR,
+                U5_NSBOOTADD0R,
+                U5_NSBOOTADD1R,
+                U5_SECBOOTADD0R,
+                U5_SECWM1R1,
+                U5_SECWM1R2,
+                U5_WRP1AR,
+                U5_WRP1BR,
+                U5_SECWM2R1,
+                U5_SECWM2R2,
+                U5_WRP2AR,
+                U5_WRP2BR,
             ],
         }
     }
@@ -371,6 +493,92 @@ const L4_WRP2AR: u64 = 0x4c;
 /// L4: `FLASH_WRP2BR`.
 const L4_WRP2BR: u64 = 0x50;
 
+// -- U5 register offsets (ST CMSIS `stm32u585xx.h`, `FLASH_TypeDef`) ---------
+
+/// U5: `FLASH_NSKEYR`.
+const U5_NSKEYR: u64 = 0x08;
+/// U5: `FLASH_SECKEYR` — secure, so RAZ/WI on a `TZEN = 0` part.
+const U5_SECKEYR: u64 = 0x0c;
+/// U5: `FLASH_OPTKEYR`.
+const U5_OPTKEYR: u64 = 0x10;
+/// U5: `FLASH_PDKEY1R`.
+const U5_PDKEY1R: u64 = 0x18;
+/// U5: `FLASH_PDKEY2R`.
+const U5_PDKEY2R: u64 = 0x1c;
+/// U5: `FLASH_NSSR`.
+const U5_NSSR: u64 = 0x20;
+/// U5: `FLASH_NSCR`.
+const U5_NSCR: u64 = 0x28;
+/// U5: `FLASH_ECCR`.
+const U5_ECCR: u64 = 0x30;
+/// U5: `FLASH_OPTR`.
+const U5_OPTR: u64 = 0x40;
+/// U5: `FLASH_NSBOOTADD0R`.
+const U5_NSBOOTADD0R: u64 = 0x44;
+/// U5: `FLASH_NSBOOTADD1R`.
+const U5_NSBOOTADD1R: u64 = 0x48;
+/// U5: `FLASH_SECBOOTADD0R`.
+const U5_SECBOOTADD0R: u64 = 0x4c;
+/// U5: `FLASH_SECWM1R1`.
+const U5_SECWM1R1: u64 = 0x50;
+/// U5: `FLASH_SECWM1R2`.
+const U5_SECWM1R2: u64 = 0x54;
+/// U5: `FLASH_WRP1AR`.
+const U5_WRP1AR: u64 = 0x58;
+/// U5: `FLASH_WRP1BR`.
+const U5_WRP1BR: u64 = 0x5c;
+/// U5: `FLASH_SECWM2R1`.
+const U5_SECWM2R1: u64 = 0x60;
+/// U5: `FLASH_SECWM2R2`.
+const U5_SECWM2R2: u64 = 0x64;
+/// U5: `FLASH_WRP2AR`.
+const U5_WRP2AR: u64 = 0x68;
+/// U5: `FLASH_WRP2BR`.
+const U5_WRP2BR: u64 = 0x6c;
+/// U5: `FLASH_OEM1KEYR1`, the first of four write-only OEM key words.
+const U5_OEM1KEYR1: u64 = 0x70;
+/// U5: `FLASH_OEM2KEYR2`, the last of them.
+const U5_OEM2KEYR2: u64 = 0x7c;
+/// U5: `FLASH_PRIVCFGR` — `SPRIV` and `NSPRIV`.
+const U5_PRIVCFGR: u64 = 0xc4;
+/// U5: `FLASH_PRIVBB1R1`, the first privilege block-based word of bank 1.
+const U5_PRIVBB1R1: u64 = 0xd0;
+/// U5: `FLASH_PRIVBB1R4`.
+const U5_PRIVBB1R4: u64 = 0xdc;
+/// U5: `FLASH_PRIVBB2R1`.
+const U5_PRIVBB2R1: u64 = 0xf0;
+/// U5: `FLASH_PRIVBB2R4`.
+const U5_PRIVBB2R4: u64 = 0xfc;
+
+/// U5 `ACR`: `LATENCY[3:0]`, `PRFTEN`, `LPM`, `SLEEP_PD`. `PDREQ1`/`PDREQ2`
+/// are left out — the bank power-down is not modelled (see the module header).
+const U5_ACR_MASK: u32 = 0xf | (1 << 8) | (1 << 11) | (1 << 14);
+/// U5 `NSSR.OPTWERR`: an option write that was refused.
+const U5_SR_OPTWERR: u32 = 1 << 13;
+/// U5 `NSSR.WDW`: the write buffer holds part of a quad-word.
+const U5_SR_WDW: u32 = 1 << 17;
+/// U5 `NSCR.BWR` — burst programming of eight quad-words.
+const U5_CR_BWR: u32 = 1 << 14;
+/// U5 `NSCR.PNB[6:0]`, at bit 3.
+const U5_CR_PNB: u32 = 0x7f << 3;
+/// U5 `OPTR.TZEN`, which this model holds at zero.
+const U5_OPTR_TZEN: u32 = 1 << 31;
+/// U5 `OPTR` bits a write may change: everything defined but `TZEN`
+/// (bit 11 is reserved).
+const U5_OPTR_WRITABLE: u32 = 0x7fff_f7ff;
+/// U5 `WRPxyR.UNLOCK`.
+const U5_WRP_UNLOCK: u32 = 1 << 31;
+/// U5 `WRPxyR`: `PSTRT[6:0]`, `PEND[22:16]`, `UNLOCK`.
+const U5_WRP_MASK: u32 = 0x807f_007f;
+/// U5 `NSBOOTADDxR`/`SECBOOTADD0R`: the address field, bits 31:7.
+const U5_BOOTADD_MASK: u32 = 0xffff_ff80;
+/// U5 `SECBOOTADD0R.BOOT_LOCK`.
+const U5_BOOT_LOCK: u32 = 1 << 0;
+/// U5 `SECWMxR1`: `SECWMx_PSTRT`, `SECWMx_PEND`.
+const U5_SECWM_R1_MASK: u32 = 0x007f_007f;
+/// U5 `SECWMxR2`: `HDPx_PEND`, `HDPxEN`.
+const U5_SECWM_R2_MASK: u32 = 0x807f_0000;
+
 // -- SR bits -----------------------------------------------------------------
 
 /// `SR.EOP`, both families.
@@ -415,6 +623,12 @@ const L4_ERRORS: u32 = SR_OPERR
     | (1 << 9/* FASTERR */)
     | L4_SR_RDERR
     | (1 << 15/* OPTVERR */);
+/// Every U5 error bit (RM0456 `FLASH_NSSR`).
+const U5_ERRORS: u32 =
+    SR_OPERR | SR_PROGERR | SR_WRPERR | SR_PGAERR | L4_SR_SIZERR | SR_PGSERR | U5_SR_OPTWERR;
+/// The U5 program errors that, left uncleared, make the next program a
+/// sequence error.
+const U5_PROGRAM_ERRORS: u32 = SR_PROGERR | SR_WRPERR | SR_PGAERR | L4_SR_SIZERR | SR_PGSERR;
 
 // -- CR bits -----------------------------------------------------------------
 
@@ -465,6 +679,10 @@ const F4_OPTCR_OPTSTRT: u32 = 1 << 1;
 const L4_CR_OPERATION: u32 =
     CR_PG | L4_CR_PER | L4_CR_MER1 | L4_CR_MER2 | L4_CR_BKER | CR_STRT | L4_CR_FSTPG | (0xff << 3);
 
+/// The bits of the U5 `NSCR` that `LOCK` protects.
+const U5_CR_OPERATION: u32 =
+    CR_PG | L4_CR_PER | L4_CR_MER1 | U5_CR_PNB | L4_CR_BKER | U5_CR_BWR | L4_CR_MER2 | CR_STRT;
+
 /// The `RDP` byte that means level 0, no protection (RM0351 Table 14,
 /// RM0090 §3.6.3).
 const RDP_LEVEL0: u32 = 0xaa;
@@ -484,6 +702,9 @@ const PCROP_GRAIN: u64 = 8;
 
 /// A megabyte, the F4's bank size.
 const BANK: u64 = 1 << 20;
+
+/// A U5 page: 8 KiB (RM0456 §7.3.1).
+const U5_PAGE: u64 = 8 * 1024;
 
 // ---------------------------------------------------------------------------
 // Geometry
@@ -576,7 +797,7 @@ enum Pending {
     /// Program `bytes[..len]` at `offset`, clearing bits only.
     Program {
         offset: u64,
-        bytes: [u8; 8],
+        bytes: [u8; PROGRAM_MAX],
         len: u8,
     },
     /// Commit the live option registers into the option-byte storage.
@@ -592,6 +813,12 @@ struct State {
     stored: [u32; OPT_WORDS],
     /// The L4's double-word latch: the offset of the first word and its value.
     latch: Option<(u64, u32)>,
+    /// The U5's write buffer: the aligned base of the quad-word (or burst)
+    /// being filled, one bit per word that has arrived — zero when empty —
+    /// and the words themselves.
+    wbuf_base: u64,
+    wbuf_mask: u32,
+    wbuf: [u8; PROGRAM_MAX],
     /// When the running operation finishes.
     busy_at: u64,
     /// What finishing it does.
@@ -614,6 +841,10 @@ impl State {
             // "Reset value: 0x8000 0000" — the interface comes up locked
             // (RM0090 §3.9.7).
             words[(F4_CR / 4) as usize] = CR_LOCK;
+        } else if variant.is_u5() {
+            // `ACR` resets to zero wait states with the prefetch off, and
+            // `NSCR` with both locks set (RM0456 §7.9).
+            words[(U5_NSCR / 4) as usize] = CR_LOCK | L4_CR_OPTLOCK;
         } else {
             // `ACR` comes up with the caches on: "Reset value: 0x0000 0600"
             // (RM0351 §3.7.1).
@@ -625,6 +856,9 @@ impl State {
             words,
             stored,
             latch: None,
+            wbuf_base: 0,
+            wbuf_mask: 0,
+            wbuf: [0xff; PROGRAM_MAX],
             busy_at: NO_DEADLINE,
             pending: Pending::None,
             key_step: 0,
@@ -701,6 +935,34 @@ fn default_option_bytes(variant: Variant) -> [u32; OPT_WORDS] {
             out[6] = 0x0000_0000;
             out[7] = 0x0000_00ff;
             out[8] = 0x0000_00ff;
+        }
+        Variant::U5 => {
+            // `OPTR` for a dual-bank `TZEN = 0` part at `RDP` level 0:
+            // `RDP` = 0xAA, `BOR_LEV` = 0, the three `nRST_*` and both
+            // `SRAMx_RST`, both watchdogs in software mode and running in
+            // Stop/Standby, `DUALBANK`, the three SRAM ECC disables (active
+            // low), `nSWBOOT0`, `nBOOT0` and `PA15_PUPEN` all set; `SWAP_BANK`,
+            // the two `HSLV` bits and `TZEN` clear (RM0456 §7.4; the bit
+            // positions are `FLASH_OPTR_*` in `stm32u585xx.h`). A board with
+            // other option bytes writes `optr`.
+            out[0] = 0x1fef_f8aa;
+            // Boot address 0 is the user flash, boot address 1 the system
+            // bootloader at `0x0BF9_0000`; the low seven bits are reserved.
+            out[1] = 0x0800_007f;
+            out[2] = 0x0bf9_007f;
+            // The secure boot address, which a `TZEN = 0` part never uses.
+            out[3] = 0x0c00_007c;
+            // No secure watermark area (start above end) and no HDP area.
+            out[4] = 0x0000_007f;
+            out[5] = 0x0000_0000;
+            // `WRP` areas disabled — start page above end page — and
+            // unlocked.
+            out[6] = 0x8000_007f;
+            out[7] = 0x8000_007f;
+            out[8] = 0x0000_007f;
+            out[9] = 0x0000_0000;
+            out[10] = 0x8000_007f;
+            out[11] = 0x8000_007f;
         }
     }
     out
@@ -834,10 +1096,10 @@ impl Shared {
                 // Programming clears bits and never sets them (RM0090 §3.6.2,
                 // RM0351 §3.3.7), so the committed value is the AND of what
                 // was there with what was written.
-                let len = usize::from(len);
-                let mut old = [0u8; 8];
+                let len = usize::from(len).min(PROGRAM_MAX);
+                let mut old = [0u8; PROGRAM_MAX];
                 let _ = self.array.read_at(offset, &mut old[..len]);
-                let mut new = [0u8; 8];
+                let mut new = [0u8; PROGRAM_MAX];
                 for i in 0..len {
                     new[i] = old[i] & bytes[i];
                 }
@@ -847,33 +1109,45 @@ impl Shared {
         }
         let sr = self.sr_offset();
         *state.word_mut(sr) &= !SR_BSY;
-        *state.word_mut(sr) |= SR_EOP;
+        // On a U5 "this bit is set only if the end of operation interrupts
+        // are enabled (EOPIE = 1)" (RM0456 §7.9, `FLASH_NSSR`).
+        if !self.variant.is_u5() || state.word(self.cr_offset()) & CR_EOPIE != 0 {
+            *state.word_mut(sr) |= SR_EOP;
+        }
     }
 
     // -- layout helpers ------------------------------------------------------
 
     fn sr_offset(&self) -> u64 {
-        if self.variant.is_f4() { F4_SR } else { L4_SR }
+        match self.variant {
+            Variant::F4 => F4_SR,
+            Variant::U5 => U5_NSSR,
+            Variant::L4 | Variant::L4Plus => L4_SR,
+        }
     }
 
     fn cr_offset(&self) -> u64 {
-        if self.variant.is_f4() { F4_CR } else { L4_CR }
+        match self.variant {
+            Variant::F4 => F4_CR,
+            Variant::U5 => U5_NSCR,
+            Variant::L4 | Variant::L4Plus => L4_CR,
+        }
     }
 
-    /// Which register holds `RDP`: `OPTCR` on an F4, `OPTR` on an L4.
+    /// Which register holds `RDP`: `OPTCR` on an F4, `OPTR` on an L4 or a U5.
     fn optr_offset(&self) -> u64 {
-        if self.variant.is_f4() {
-            F4_OPTCR
-        } else {
-            L4_OPTR
+        match self.variant {
+            Variant::F4 => F4_OPTCR,
+            Variant::U5 => U5_OPTR,
+            Variant::L4 | Variant::L4Plus => L4_OPTR,
         }
     }
 
     fn errors_mask(&self) -> u32 {
-        if self.variant.is_f4() {
-            F4_ERRORS
-        } else {
-            L4_ERRORS
+        match self.variant {
+            Variant::F4 => F4_ERRORS,
+            Variant::U5 => U5_ERRORS,
+            Variant::L4 | Variant::L4Plus => L4_ERRORS,
         }
     }
 
@@ -887,7 +1161,7 @@ impl Shared {
         if self.variant.is_f4() {
             state.word(F4_OPTCR) & F4_OPTCR_OPTLOCK == 0
         } else {
-            state.word(L4_CR) & L4_CR_OPTLOCK == 0
+            state.word(self.cr_offset()) & L4_CR_OPTLOCK == 0
         }
     }
 
@@ -896,8 +1170,15 @@ impl Shared {
     }
 
     /// Whether `OPTR.DUALBANK` says there are two banks (RM0351 §3.4.1 bit 21).
+    ///
+    /// A U5 is always two banks of `size / 2` here: its `DUALBANK` matters
+    /// only to the smaller parts' single-bank mode, which is not modelled.
     fn dual_bank(&self, state: &State) -> bool {
-        !self.variant.is_f4() && state.word(L4_OPTR) & (1 << 21) != 0
+        match self.variant {
+            Variant::F4 => false,
+            Variant::U5 => true,
+            Variant::L4 | Variant::L4Plus => state.word(L4_OPTR) & (1 << 21) != 0,
+        }
     }
 
     // -- the protections ----------------------------------------------------
@@ -922,7 +1203,9 @@ impl Shared {
     /// An F4 has none — `SPRMOD` is an F42x/F43x bit and this variant decodes
     /// an F405/407 (see the module header).
     fn pcrop_range(&self, state: &State, bank: usize) -> (u64, u64) {
-        if self.variant.is_f4() {
+        // A U5 has no `PCROP` at all; its execute-only areas are the secure
+        // world's, which a `TZEN = 0` part does not have.
+        if !self.variant.is_l4() {
             return (0, 0);
         }
         let dual = self.dual_bank(state);
@@ -1155,7 +1438,8 @@ impl Shared {
     /// The backup registers and SRAM2, which the same sentence erases, are not
     /// this device's to erase and are not modelled — see the module header.
     fn regress_rdp(&self, state: &mut State) {
-        let full = self.variant.is_f4() || state.word(L4_PCROP1ER) & L4_PCROP_RDP != 0;
+        // Only an L4 has `PCROP`, so only an L4 can make this partial.
+        let full = !self.variant.is_l4() || state.word(L4_PCROP1ER) & L4_PCROP_RDP != 0;
         if full {
             let _ = self.array.fill(0, self.size, 0xff);
         } else {
@@ -1175,7 +1459,7 @@ impl Shared {
         } else {
             (stored[0] & !0xff) | RDP_LEVEL0
         };
-        if full && !self.variant.is_f4() {
+        if full && self.variant.is_l4() {
             // "PCROP is disable[d]", and `PCROP_RDP` "is reset after a full
             // mass erase due to a change of RDP from Level 1 to Level 0"
             // (§3.7.10) — so the area goes back to the factory shape, whose
@@ -1220,7 +1504,9 @@ impl Shared {
         // (RM0090 §3.9.5). The L4 sets it for every unsuccessful operation
         // (RM0351 §3.7.6), which is the more useful of the two and not a
         // difference a model may average away.
-        let operr = if self.variant.is_f4() && !errie {
+        // The U5 has the F4's rule: "This bit is set only if error interrupts
+        // are enabled (ERRIE = 1)" (RM0456 §7.9, `FLASH_NSSR`).
+        let operr = if (self.variant.is_f4() || self.variant.is_u5()) && !errie {
             0
         } else {
             SR_OPERR
@@ -1241,11 +1527,38 @@ impl Shared {
         if self.pcrop_protected(state, offset, len) {
             return true;
         }
-        if self.variant.is_f4() {
-            self.f4_protected(state, offset, len)
-        } else {
-            self.l4_protected(state, offset, len)
+        match self.variant {
+            Variant::F4 => self.f4_protected(state, offset, len),
+            Variant::U5 => self.u5_protected(state, offset, len),
+            Variant::L4 | Variant::L4Plus => self.l4_protected(state, offset, len),
         }
+    }
+
+    /// `WRPxAR`/`WRPxBR` on a U5: two inclusive page ranges per bank in
+    /// `PSTRT[6:0]`/`PEND[22:16]`, disabled when the start page is above the
+    /// end page (RM0456 §7.6, `FLASH_WRP1AR`).
+    fn u5_protected(&self, state: &State, offset: u64, len: u64) -> bool {
+        let bank_len = self.size / 2;
+        let end = offset.saturating_add(len.saturating_sub(1));
+        for (reg, bank) in [
+            (U5_WRP1AR, 0u64),
+            (U5_WRP1BR, 0),
+            (U5_WRP2AR, 1),
+            (U5_WRP2BR, 1),
+        ] {
+            let value = state.word(reg);
+            let (strt, stop) = (u64::from(value & 0x7f), u64::from((value >> 16) & 0x7f));
+            if strt > stop {
+                continue;
+            }
+            let base = bank * bank_len;
+            let lo = base + strt * self.page;
+            let hi = base + (stop + 1) * self.page;
+            if offset < hi && end >= lo {
+                return true;
+            }
+        }
+        false
     }
 
     /// `OPTCR.nWRP` / `OPTCR1.nWRP`: a **zero** protects its sector
@@ -1369,10 +1682,10 @@ impl Shared {
         self.sync(attrs);
         {
             let mut state = self.state.lock();
-            if self.variant.is_f4() {
-                self.program_f4(&mut state, offset, src);
-            } else {
-                self.program_l4(&mut state, offset, src);
+            match self.variant {
+                Variant::F4 => self.program_f4(&mut state, offset, src),
+                Variant::U5 => self.program_u5(&mut state, offset, src),
+                Variant::L4 | Variant::L4Plus => self.program_l4(&mut state, offset, src),
             }
             self.republish(&state);
         }
@@ -1408,7 +1721,7 @@ impl Shared {
             self.fail(state, SR_PGAERR);
             return;
         }
-        let mut bytes = [0u8; 8];
+        let mut bytes = [0u8; PROGRAM_MAX];
         bytes[..src.len()].copy_from_slice(src);
         self.start(
             state,
@@ -1468,9 +1781,9 @@ impl Shared {
                     self.fail(state, SR_PROGERR);
                     return;
                 }
-                let mut bytes = [0u8; 8];
+                let mut bytes = [0u8; PROGRAM_MAX];
                 bytes[..4].copy_from_slice(&low.to_le_bytes());
-                bytes[4..].copy_from_slice(&value.to_le_bytes());
+                bytes[4..8].copy_from_slice(&value.to_le_bytes());
                 self.start(
                     state,
                     Pending::Program {
@@ -1482,6 +1795,117 @@ impl Shared {
                 );
             }
         }
+    }
+
+    /// RM0456 §7.3.7: one quad-word — or, with `BWR`, eight — collected from
+    /// 32-bit stores in the write buffer and programmed when it is full.
+    fn program_u5(&self, state: &mut State, offset: u64, src: &[u8]) {
+        let cr = state.word(U5_NSCR);
+        if !self.unlocked(state) || cr & CR_PG == 0 {
+            // A store with `PG` clear or the interface locked programs
+            // nothing and is a sequence error; any half-filled quad-word goes
+            // with it.
+            self.u5_drop_buffer(state);
+            self.fail(state, SR_PGSERR);
+            return;
+        }
+        if src.is_empty() || !src.len().is_multiple_of(4) {
+            // "SIZERR … set when the size of the access is a byte or a
+            // half-word during a program sequence. Only quad-word programming
+            // is allowed by means of successive word accesses".
+            self.u5_drop_buffer(state);
+            self.fail(state, L4_SR_SIZERR);
+            return;
+        }
+        // A double-word store (`STRD`, a 64-bit bus access) is two word
+        // writes to the buffer.
+        for (i, &value) in src.as_chunks::<4>().0.iter().enumerate() {
+            if !self.program_word_u5(state, offset + 4 * i as u64, value) {
+                return;
+            }
+        }
+    }
+
+    /// One word into the U5 write buffer. `false` if it raised an error.
+    fn program_word_u5(&self, state: &mut State, offset: u64, value: [u8; 4]) -> bool {
+        let burst = state.word(U5_NSCR) & U5_CR_BWR != 0;
+        let unit: u64 = if burst { PROGRAM_MAX as u64 } else { 16 };
+        let base = offset & !(unit - 1);
+        if !offset.is_multiple_of(4) {
+            self.u5_drop_buffer(state);
+            self.fail(state, SR_PGAERR);
+            return false;
+        }
+        if state.wbuf_mask == 0 {
+            // The first word of a quad-word starts a program, so this is
+            // where the conditions on starting one are checked: nothing
+            // running, no earlier program error left uncleared.
+            let sr = state.word(U5_NSSR);
+            if self.busy(state) || sr & U5_PROGRAM_ERRORS != 0 {
+                self.fail(state, SR_PGSERR);
+                return false;
+            }
+            if self.protected(state, base, unit) || self.debug_locked(state) {
+                self.fail(state, SR_WRPERR);
+                return false;
+            }
+            state.wbuf_base = base;
+            state.wbuf = [0xff; PROGRAM_MAX];
+        } else if base != state.wbuf_base {
+            // "PGAERR … set when the data to program cannot be contained in
+            // the same quad-word (128-bit) flash memory in case of standard
+            // programming", and the half-filled quad-word is lost.
+            self.u5_drop_buffer(state);
+            self.fail(state, SR_PGAERR);
+            return false;
+        }
+        let slot = ((offset - base) / 4) as usize;
+        state.wbuf[slot * 4..slot * 4 + 4].copy_from_slice(&value);
+        state.wbuf_mask |= 1 << slot;
+        let full = if burst { u32::MAX } else { 0xf };
+        if state.wbuf_mask != full {
+            *state.word_mut(U5_NSSR) |= U5_SR_WDW;
+            return true;
+        }
+        let len = unit as usize;
+        let bytes = state.wbuf;
+        self.u5_drop_buffer(state);
+        // Every quad-word must be erased first — "PROGERR … set when a
+        // quad-word address to be programmed contains a value different from
+        // all 1 before programming, except if the data to write is all 0" —
+        // and a burst fails as a whole.
+        let mut old = [0u8; PROGRAM_MAX];
+        let _ = self.array.read_at(base, &mut old[..len]);
+        let refused = old[..len]
+            .as_chunks::<16>()
+            .0
+            .iter()
+            .zip(bytes[..len].as_chunks::<16>().0)
+            .any(|(was, new)| was.iter().any(|&b| b != 0xff) && new.iter().any(|&b| b != 0));
+        if refused {
+            self.fail(state, SR_PROGERR);
+            return false;
+        }
+        self.start(
+            state,
+            Pending::Program {
+                offset: base,
+                bytes,
+                len: len as u8,
+            },
+            self.program_time,
+        );
+        true
+    }
+
+    /// Forget a half-filled U5 quad-word, and `WDW` with it.
+    fn u5_drop_buffer(&self, state: &mut State) {
+        if !self.variant.is_u5() {
+            return;
+        }
+        state.wbuf_mask = 0;
+        state.wbuf = [0xff; PROGRAM_MAX];
+        *state.word_mut(U5_NSSR) &= !U5_SR_WDW;
     }
 
     /// Set `BSY` and arm the deadline.
@@ -1498,10 +1922,17 @@ impl Shared {
         let state = self.state.lock();
         // The key registers are write-only; reading one returns zero rather
         // than the last key written, so a snapshot of the bus never carries it.
-        let write_only = if self.variant.is_f4() {
-            offset == F4_KEYR || offset == F4_OPTKEYR
-        } else {
-            offset == L4_KEYR || offset == L4_OPTKEYR || offset == L4_PDKEYR
+        let write_only = match self.variant {
+            Variant::F4 => offset == F4_KEYR || offset == F4_OPTKEYR,
+            Variant::U5 => {
+                matches!(
+                    offset,
+                    U5_NSKEYR | U5_SECKEYR | U5_OPTKEYR | U5_PDKEY1R | U5_PDKEY2R
+                ) || (U5_OEM1KEYR1..=U5_OEM2KEYR2).contains(&offset)
+            }
+            Variant::L4 | Variant::L4Plus => {
+                offset == L4_KEYR || offset == L4_OPTKEYR || offset == L4_PDKEYR
+            }
         };
         if write_only {
             return 0;
@@ -1513,11 +1944,12 @@ impl Shared {
     fn write_register(&self, offset: u64, value: u32) -> MemResult<After> {
         let after = {
             let mut state = self.state.lock();
-            let result = if self.variant.is_f4() {
-                self.write_f4(&mut state, offset, value)
-                    .map(|()| After::default())
-            } else {
-                self.write_l4(&mut state, offset, value)
+            let result = match self.variant {
+                Variant::F4 => self
+                    .write_f4(&mut state, offset, value)
+                    .map(|()| After::default()),
+                Variant::U5 => self.write_u5(&mut state, offset, value),
+                Variant::L4 | Variant::L4Plus => self.write_l4(&mut state, offset, value),
             };
             self.republish(&state);
             result?
@@ -1743,6 +2175,193 @@ impl Shared {
         self.start(state, Pending::Erase { offset, len }, time);
     }
 
+    fn write_u5(&self, state: &mut State, offset: u64, value: u32) -> MemResult<After> {
+        let mut after = After::default();
+        match offset {
+            ACR => *state.word_mut(ACR) = value & U5_ACR_MASK,
+            U5_NSKEYR => self.write_key(state, value)?,
+            U5_OPTKEYR => self.write_optkey(state, value)?,
+            U5_PDKEY1R => {
+                // Tracked and no more: the bank power-down it unlocks is not
+                // modelled, so `PDREQ1` reads back zero whatever is written.
+                state.pdkey_step = match (state.pdkey_step, value) {
+                    (0, PDKEY1) => 1,
+                    _ => 0,
+                };
+            }
+            U5_NSSR => {
+                // Write one to clear; `BSY`, `WDW`, the OEM locks and the
+                // power-down flags are hardware's.
+                let clear = value & (SR_EOP | U5_ERRORS);
+                *state.word_mut(U5_NSSR) &= !clear;
+            }
+            U5_NSCR => after = self.write_cr_u5(state, value),
+            U5_ECCR => {
+                // `ECCIE` is a plain enable; `ECCC` and `ECCD` are
+                // write-1-to-clear and nothing here sets them.
+                let eccr = state.word(U5_ECCR);
+                *state.word_mut(U5_ECCR) =
+                    ((eccr & !(1 << 24)) | (value & (1 << 24))) & !(value & 0xc000_0000);
+            }
+            U5_PRIVCFGR => *state.word_mut(U5_PRIVCFGR) = value & 0b11,
+            U5_PRIVBB1R1..=U5_PRIVBB1R4 | U5_PRIVBB2R1..=U5_PRIVBB2R4 => {
+                // Storage: privilege is not enforced on the array here.
+                *state.word_mut(offset) = value;
+            }
+            U5_OPTR | U5_NSBOOTADD0R | U5_NSBOOTADD1R | U5_SECBOOTADD0R | U5_SECWM1R1
+            | U5_SECWM1R2 | U5_WRP1AR | U5_WRP1BR | U5_SECWM2R1 | U5_SECWM2R2 | U5_WRP2AR
+            | U5_WRP2BR
+                if self.opt_unlocked(state) =>
+            {
+                self.write_option_u5(state, offset, value);
+            }
+            // `SECKEYR`, `PDKEY2R`, `SECSR`, `SECCR`, `OPSR`, the OEM keys, the
+            // `SECBB` words and `SECHDPCR`: secure, write-only with nothing
+            // behind them, or read-only. RAZ/WI on a `TZEN = 0` part.
+            _ => {}
+        }
+        Ok(after)
+    }
+
+    /// A U5 option register: each keeps its reserved bits, `TZEN` stays zero
+    /// and a `WRP` area's `UNLOCK` can be cleared but not set again above
+    /// `RDP` level 0.
+    fn write_option_u5(&self, state: &mut State, offset: u64, value: u32) {
+        if self.rdp_level(state) == 2 {
+            // At level 2 the option bytes are frozen; `OPTWERR` is the U5's
+            // flag for an option write that was not allowed.
+            self.fail(state, U5_SR_OPTWERR);
+            return;
+        }
+        let old = state.word(offset);
+        let mask = match offset {
+            U5_OPTR => U5_OPTR_WRITABLE,
+            U5_NSBOOTADD0R | U5_NSBOOTADD1R => U5_BOOTADD_MASK,
+            U5_SECBOOTADD0R => U5_BOOTADD_MASK | U5_BOOT_LOCK,
+            U5_SECWM1R1 | U5_SECWM2R1 => U5_SECWM_R1_MASK,
+            U5_SECWM1R2 | U5_SECWM2R2 => U5_SECWM_R2_MASK,
+            _ => U5_WRP_MASK,
+        };
+        let mut new = (old & !mask) | (value & mask);
+        if matches!(offset, U5_WRP1AR | U5_WRP1BR | U5_WRP2AR | U5_WRP2BR) {
+            if old & U5_WRP_UNLOCK == 0 && self.rdp_level(state) != 0 {
+                // A locked area cannot be moved or unlocked until an `RDP`
+                // regression takes the part back to level 0.
+                new = old;
+            } else if old & U5_WRP_UNLOCK == 0 {
+                new = (new & !U5_WRP_UNLOCK) | (value & U5_WRP_UNLOCK);
+            }
+        }
+        *state.word_mut(offset) = new;
+    }
+
+    fn write_cr_u5(&self, state: &mut State, value: u32) -> After {
+        let mut after = After::default();
+        let before = state.word(U5_NSCR);
+        let locked = before & CR_LOCK != 0;
+        let opt_locked = before & L4_CR_OPTLOCK != 0;
+
+        // Both locks are set by software and cleared only by their key
+        // sequences. Unlike an L4, setting `OPTLOCK` leaves `LOCK` alone:
+        // RM0456 describes them as two independent set-only bits.
+        let mut next = before;
+        if !locked {
+            next = (next & !U5_CR_OPERATION) | (value & U5_CR_OPERATION);
+        }
+        next = (next & !(CR_EOPIE | CR_ERRIE)) | (value & (CR_EOPIE | CR_ERRIE));
+        next |= value & (CR_LOCK | L4_CR_OPTLOCK);
+        // `STRT`, `OPTSTRT` and `OBL_LAUNCH` are strobes, not storage.
+        next &= !(CR_STRT | L4_CR_OPTSTRT | L4_CR_OBL_LAUNCH);
+        *state.word_mut(U5_NSCR) = next;
+
+        if value & CR_STRT != 0 && !locked {
+            self.erase_u5(state, value);
+        }
+        if value & L4_CR_OPTSTRT != 0 && !opt_locked {
+            self.start_options(state);
+        }
+        if value & L4_CR_OBL_LAUNCH != 0 {
+            if opt_locked || self.busy(state) {
+                self.fail(state, SR_PGSERR);
+            } else {
+                state.load_option_bytes(self.variant);
+                after.reset = true;
+            }
+        }
+        after
+    }
+
+    /// `NSCR.STRT` on a U5: a page, a bank, or both banks.
+    fn erase_u5(&self, state: &mut State, value: u32) {
+        let bank_len = self.size / 2;
+        let both = L4_CR_MER1 | L4_CR_MER2;
+        if self.busy(state) {
+            // HAL's `FLASH_MassErase(FLASH_BANK_BOTH)` writes `MER1|STRT` and
+            // then `MER2|STRT` without waiting in between (see the module
+            // header). Fold the second into the bank-1 erase already running
+            // rather than refusing it.
+            if value & both == both
+                && state.pending
+                    == (Pending::Erase {
+                        offset: 0,
+                        len: bank_len,
+                    })
+            {
+                if self.protected(state, bank_len, bank_len) {
+                    self.fail(state, SR_WRPERR);
+                } else {
+                    state.pending = Pending::Erase {
+                        offset: 0,
+                        len: self.size,
+                    };
+                    state.busy_at = state
+                        .busy_at
+                        .max(state.tick.saturating_add(self.mass_erase_time.max(1)));
+                }
+                return;
+            }
+            self.fail(state, SR_PGSERR);
+            return;
+        }
+        if state.word(U5_NSSR) & U5_PROGRAM_ERRORS != 0
+            || value & CR_PG != 0
+            || state.wbuf_mask != 0
+        {
+            // An erase may not start over an uncleared program error, beside
+            // `PG`, or with a quad-word half-written.
+            self.fail(state, SR_PGSERR);
+            return;
+        }
+        let range = if value & both == both {
+            Some((0, self.size))
+        } else if value & L4_CR_MER1 != 0 {
+            Some((0, bank_len))
+        } else if value & L4_CR_MER2 != 0 {
+            Some((bank_len, bank_len))
+        } else if value & L4_CR_PER != 0 {
+            let pnb = u64::from((value & U5_CR_PNB) >> 3);
+            let within = pnb * self.page;
+            let bank = if value & L4_CR_BKER != 0 { bank_len } else { 0 };
+            (within + self.page <= bank_len).then_some((bank + within, self.page))
+        } else {
+            None
+        };
+        let Some((offset, len)) = range.filter(|&(_, len)| len > 0) else {
+            self.fail(state, SR_PGSERR);
+            return;
+        };
+        if self.protected(state, offset, len) || self.debug_locked(state) {
+            self.fail(state, SR_WRPERR);
+            return;
+        }
+        let time = if value & both != 0 {
+            self.mass_erase_time
+        } else {
+            self.erase_time
+        };
+        self.start(state, Pending::Erase { offset, len }, time);
+    }
+
     /// `KEYR`: `KEY1` then `KEY2` clears `LOCK`.
     fn write_key(&self, state: &mut State, value: u32) -> MemResult {
         if state.key_error {
@@ -1793,7 +2412,8 @@ impl Shared {
                 if self.variant.is_f4() {
                     *state.word_mut(F4_OPTCR) &= !F4_OPTCR_OPTLOCK;
                 } else {
-                    *state.word_mut(L4_CR) &= !L4_CR_OPTLOCK;
+                    let cr = self.cr_offset();
+                    *state.word_mut(cr) &= !L4_CR_OPTLOCK;
                 }
             }
             _ => {
@@ -1817,7 +2437,7 @@ impl Shared {
             let eop = sr & SR_EOP != 0 && cr & CR_EOPIE != 0;
             // On an L4 `RDERR` is enabled by `RDERRIE` and by nothing else
             // (RM0351 Table 16); an F4 has no such bit and `ERRIE` covers it.
-            let (errors, rderr) = if self.variant.is_f4() {
+            let (errors, rderr) = if !self.variant.is_l4() {
                 (self.errors_mask(), false)
             } else {
                 (
@@ -1988,9 +2608,10 @@ impl Flash {
     /// that does not fit.
     pub fn new(props: &Props) -> Result<Flash> {
         let mut r = props.reader();
-        let variant = match r.or_enum("variant", "f4", &["f4", "l4", "l4plus"])? {
+        let variant = match r.or_enum("variant", "f4", &["f4", "l4", "l4plus", "u5"])? {
             "l4" => Variant::L4,
             "l4plus" => Variant::L4Plus,
+            "u5" => Variant::U5,
             _ => Variant::F4,
         };
         let size = r.require_size("size")?;
@@ -2019,6 +2640,12 @@ impl Flash {
         if usize::try_from(size).is_err() {
             return Err(config(format!(
                 "a flash of {size} byte(s) is larger than this host's address space"
+            )));
+        }
+        if variant.is_u5() && (!size.is_multiple_of(2 * U5_PAGE) || size / 2 / U5_PAGE > 128) {
+            return Err(config(format!(
+                "a U5 array is two banks of up to 128 8 KiB pages (RM0456 §7.3.1), and {size} \
+                 byte(s) is not"
             )));
         }
         if variant.is_f4() && size > 2 * BANK {
@@ -2054,6 +2681,11 @@ impl Flash {
                      F42x/F43x, which this variant does not decode"
                 )));
             }
+            if variant.is_u5() {
+                return Err(config(format!(
+                    "`{name}` is an L4 option register; a U5 has no PCROP"
+                )));
+            }
             let value = u32::try_from(value).map_err(|_| {
                 config(format!(
                     "`{name}` is a 32-bit register and {value:#x} is not"
@@ -2081,7 +2713,14 @@ impl Flash {
             Variant::L4 => 2048,
             Variant::L4Plus if dual => 4096,
             Variant::L4Plus => 8192,
+            Variant::U5 => U5_PAGE,
         };
+        if variant.is_u5() && stored[0] & U5_OPTR_TZEN != 0 {
+            return Err(config(String::from(
+                "`optr` sets TZEN, and this model is a TZEN = 0 part: TrustZone's secure flash \
+                 world is not modelled",
+            )));
+        }
 
         let array_store = Arc::new(RamStore::new(size));
         // Erased, not zeroed: an unwritten part reads all ones, and firmware
@@ -2100,7 +2739,7 @@ impl Flash {
         let state = State::reset(variant, stored);
         let guard = read_guard
             || rdp_level_of(variant, stored[0]) >= 1
-            || (!variant.is_f4()
+            || (variant.is_l4()
                 && [(L4_PCROP1SR, L4_PCROP1ER), (L4_PCROP2SR, L4_PCROP2ER)]
                     .into_iter()
                     .any(|(sr, er)| pcrop_area(state.word(sr), state.word(er)).1 != 0));
@@ -2193,7 +2832,13 @@ impl Flash {
     /// `ACR.LATENCY`, the wait-state count firmware asked for.
     #[must_use]
     pub fn latency(&self) -> u32 {
-        self.shared.state.lock().word(ACR) & 0b111
+        // Three bits on an F4 or L4, four on a U5 (`FLASH_ACR_LATENCY_Msk`).
+        let mask = if self.shared.variant.is_u5() {
+            0xf
+        } else {
+            0b111
+        };
+        self.shared.state.lock().word(ACR) & mask
     }
 
     /// Whether `CR.LOCK` is clear.
@@ -2304,11 +2949,14 @@ impl Device for Flash {
         // The array first and length-prefixed, so a part whose size changed
         // between snapshot and restore fails loudly rather than half-loading.
         w.write_bytes(&self.contents())?;
+        let variant = self.shared.variant;
         let state = *self.shared.state.lock();
-        for word in state.words {
+        // An F4 or L4 writes exactly the shape it always has; only a U5's
+        // chunk is wider (see `LEGACY_WORDS`).
+        for &word in &state.words[..variant.saved_words()] {
             w.write_u32(word)?;
         }
-        for word in state.stored {
+        for &word in &state.stored[..variant.saved_option_words()] {
             w.write_u32(word)?;
         }
         match state.latch {
@@ -2324,30 +2972,32 @@ impl Device for Flash {
             }
         }
         w.write_u64(state.busy_at)?;
+        let program_bytes = variant.saved_program_bytes();
+        let zeros = [0u8; PROGRAM_MAX];
         match state.pending {
             Pending::None => {
                 w.write_u8(0)?;
                 w.write_u64(0)?;
                 w.write_u64(0)?;
-                w.write_all(&[0u8; 8])?;
+                w.write_all(&zeros[..program_bytes])?;
             }
             Pending::Erase { offset, len } => {
                 w.write_u8(1)?;
                 w.write_u64(offset)?;
                 w.write_u64(len)?;
-                w.write_all(&[0u8; 8])?;
+                w.write_all(&zeros[..program_bytes])?;
             }
             Pending::Program { offset, bytes, len } => {
                 w.write_u8(2)?;
                 w.write_u64(offset)?;
                 w.write_u64(u64::from(len))?;
-                w.write_all(&bytes)?;
+                w.write_all(&bytes[..program_bytes])?;
             }
             Pending::Option => {
                 w.write_u8(3)?;
                 w.write_u64(0)?;
                 w.write_u64(0)?;
-                w.write_all(&[0u8; 8])?;
+                w.write_all(&zeros[..program_bytes])?;
             }
         }
         w.write_u8(state.key_step)?;
@@ -2355,7 +3005,15 @@ impl Device for Flash {
         w.write_u8(state.pdkey_step)?;
         w.write_bool(state.key_error)?;
         w.write_bool(state.optkey_error)?;
-        w.write_u64(state.tick)
+        w.write_u64(state.tick)?;
+        if variant.is_u5() {
+            // The write buffer: a snapshot taken between the second and the
+            // fourth word of a quad-word must finish it on the other side.
+            w.write_u64(state.wbuf_base)?;
+            w.write_u32(state.wbuf_mask)?;
+            w.write_all(&state.wbuf)?;
+        }
+        Ok(())
         // The wire handles are the machine's wiring, not the chip's state.
     }
 
@@ -2368,11 +3026,13 @@ impl Device for Flash {
                 self.shared.size
             )));
         }
-        let mut state = State::reset(self.shared.variant, [0; OPT_WORDS]);
-        for word in &mut state.words {
+        let variant = self.shared.variant;
+        let mut state = State::reset(variant, [0; OPT_WORDS]);
+        state.words = [0; WORDS];
+        for word in &mut state.words[..variant.saved_words()] {
             *word = r.read_u32()?;
         }
-        for word in &mut state.stored {
+        for word in &mut state.stored[..variant.saved_option_words()] {
             *word = r.read_u32()?;
         }
         let has_latch = r.read_bool()?;
@@ -2383,15 +3043,16 @@ impl Device for Flash {
         let tag = r.read_u8()?;
         let offset = r.read_u64()?;
         let len = r.read_u64()?;
-        let raw = r.take(8)?;
-        let mut bytes8 = [0u8; 8];
-        bytes8.copy_from_slice(raw);
+        let program_bytes = variant.saved_program_bytes();
+        let raw = r.take(program_bytes)?;
+        let mut program = [0u8; PROGRAM_MAX];
+        program[..program_bytes].copy_from_slice(raw);
         state.pending = match tag {
             0 => Pending::None,
             1 => Pending::Erase { offset, len },
             2 => Pending::Program {
                 offset,
-                bytes: bytes8,
+                bytes: program,
                 len: u8::try_from(len)
                     .map_err(|_| Error::State(format!("a program of {len} byte(s)")))?,
             },
@@ -2408,6 +3069,11 @@ impl Device for Flash {
         state.key_error = r.read_bool()?;
         state.optkey_error = r.read_bool()?;
         state.tick = r.read_u64()?;
+        if variant.is_u5() {
+            state.wbuf_base = r.read_u64()?;
+            state.wbuf_mask = r.read_u32()?;
+            state.wbuf.copy_from_slice(r.take(PROGRAM_MAX)?);
+        }
 
         self.shared
             .array
@@ -2498,7 +3164,8 @@ pub static CLASS: DeviceClass = DeviceClass {
             name: "variant",
             kind: ValueKind::Str,
             required: false,
-            summary: "which manual: \"f4\" (RM0090 sectors), \"l4\" (RM0351 pages) or \"l4plus\"",
+            summary: "which manual: \"f4\" (RM0090 sectors), \"l4\" (RM0351 pages), \"l4plus\" \
+                      or \"u5\" (RM0456 quad-word programming)",
         },
         PropertySpec {
             name: "size",
@@ -2593,7 +3260,7 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
 #[must_use]
 pub fn schema() -> ClassSchema {
     ClassSchema::new(CLASS_NAME)
-        .prop(PropSchema::new("variant", ValueKind::Str).values(&["f4", "l4", "l4plus"]))
+        .prop(PropSchema::new("variant", ValueKind::Str).values(&["f4", "l4", "l4plus", "u5"]))
         .prop(PropSchema::new("size", ValueKind::Uint).required())
         .prop(PropSchema::new("image", ValueKind::Media))
         .prop(PropSchema::new("optr", ValueKind::Uint))
