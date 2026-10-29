@@ -535,7 +535,11 @@ pub enum Variant {
 ///
 /// Total and un-`cfg`'d, as `riscv::Extensions` is: every field exists in
 /// every build, so `Features` is one type with one shape.
+///
+/// `#[non_exhaustive]`: start from a part's set and change fields, so the
+/// next extension (as `mmx` was) is not a breaking change to every caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct Features {
     /// The 80486 additions: `CPUID`, `BSWAP`, `XADD`, `CMPXCHG`, `INVLPG`, the
     /// cache-control instructions, and `CR0.WP`.
@@ -933,7 +937,12 @@ impl fmt::Display for Variant {
 }
 
 /// How this particular part is configured.
+///
+/// `#[non_exhaustive]`, like [`Features`]: start from a part
+/// ([`Config::X86_64`], [`Config::I80486`], …) and adjust it with the
+/// `with_*` builders, so a new field is not a breaking change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Config {
     /// Which member of the family this is.
     pub variant: Variant,
