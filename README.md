@@ -1198,7 +1198,7 @@ The header is [`include/rsemu.h`](include/rsemu.h). It is **generated** from
 cannot drift; regenerate it with `RSEMU_UPDATE_HEADER=1`. There is no cbindgen
 — the dependency policy has no room for one.
 
-See [`web/README.md`](web/README.md). MSRV is 1.88, pinned by a CI job so it
+See [`web/README.md`](web/README.md). MSRV is 1.91, pinned by a CI job so it
 stays a checked claim.
 
 **Read [`ROADMAP.md`](ROADMAP.md)** — it contains the architecture (memory,

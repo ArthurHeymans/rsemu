@@ -2,12 +2,11 @@
 name          = "rsemu"
 version       = "0.0.6"
 edition       = "2024"
-# Edition 2024 stabilised in 1.85; 1.88 is the floor we hold to, for let-chains
-# and to match the sibling crates (compcol, purecrypto) so the whole family
-# shares one MSRV. The project is stable-only (ROADMAP.md §0) — the sole nightly
-# is one CI job for threaded wasm32-unknown-unknown, impossible on stable
-# (§11.1). CI pins a 1.88 job so the MSRV is a checked claim, not a comment.
-rust-version  = "1.88"
+# Edition 2024 stabilised in 1.85; 1.91 is the floor we hold to. The project is
+# stable-only (ROADMAP.md §0) — the sole nightly is one CI job for threaded
+# wasm32-unknown-unknown, impossible on stable (§11.1). CI pins a 1.91 job so
+# the MSRV is a checked claim, not a comment.
+rust-version  = "1.91"
 authors       = ["Karpeles Lab Inc."]
 license       = "MIT"
 description   = "A multiplatform emulator in pure Rust, built bottom-up on a generic framework."
