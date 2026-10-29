@@ -317,3 +317,81 @@ fn the_schema_and_the_device_agree_about_pins_and_regions() {
     assert!(Device::region(&d, "regs").is_some());
     assert!(Device::region(&d, "idcode").is_none());
 }
+
+// ---------------------------------------------------------------------------
+// The u5 variant
+// ---------------------------------------------------------------------------
+
+fn u5() -> Dbgmcu {
+    Dbgmcu::new(&Props::new().with("variant", Value::from("u5"))).unwrap()
+}
+
+#[test]
+fn the_u5_identifies_itself_and_decodes_its_seven_words() {
+    let d = u5();
+    assert_eq!(d.variant(), Variant::U5);
+    assert_eq!(d.idcode() & 0xfff, 0x482, "a U575/U585 by default");
+    assert_eq!(d.region.len(), REGISTER_BYTES_U5);
+    for (offset, mask) in OFFSETS_U5.iter().zip(WRITE_MASK_U5) {
+        poke(&d, *offset, 0xffff_ffff);
+        assert_eq!(peek(&d, *offset), mask, "offset {offset:#x}");
+    }
+    // The holes between the words read as zero and keep nothing.
+    for hole in [0x18, 0x1c, 0x24] {
+        poke(&d, hole, 0xffff_ffff);
+        assert_eq!(peek(&d, hole), 0);
+    }
+    poke(&d, 0x00, 0);
+    assert_eq!(peek(&d, 0x00), d.idcode());
+}
+
+#[test]
+fn the_u5_watchdog_bits_freeze_the_watchdogs() {
+    let d = u5();
+    let iwdg = watch(&d, "iwdg");
+    let wwdg = watch(&d, "wwdg");
+    let rtc = watch(&d, "rtc");
+    // DBGMCU_APB1FZR1: DBG_IWDG_STOP 12, DBG_WWDG_STOP 11; APB3FZR: RTC 30.
+    poke(&d, 0x08, 1 << 12);
+    poke(&d, 0x14, 1 << 30);
+    d.set_halted(true);
+    assert!(iwdg.is_high());
+    assert!(!wwdg.is_high());
+    assert!(rtc.is_high());
+    assert!(d.freezing("iwdg"));
+    poke(&d, 0x08, 1 << 11);
+    assert!(!iwdg.is_high());
+    assert!(wwdg.is_high());
+    // An F4-only pin is not a U5 pin.
+    assert!(Device::connect(&d, "can1", dummy_source()).is_err());
+    assert!(Device::connect(&d, "gpdma15", dummy_source()).is_ok());
+    assert!(Device::connect(&dbgmcu(), "gpdma15", dummy_source()).is_err());
+}
+
+#[test]
+fn a_u5_snapshot_round_trips_to_identical_state() {
+    let saved = u5();
+    for (offset, mask) in OFFSETS_U5.iter().zip(WRITE_MASK_U5) {
+        poke(&saved, *offset, mask & 0x5555_5555);
+    }
+
+    let mut shape = MachineShape::new();
+    shape.add_device("dbgmcu", CLASS_NAME).unwrap();
+    let mut w = StateWriter::new(shape);
+    {
+        let mut chunk = w.chunk("dbgmcu", CLASS_NAME, STATE_VERSION).unwrap();
+        Device::save(&saved, &mut chunk).unwrap();
+    }
+    let bytes = w.to_vec().unwrap();
+
+    let restored = u5();
+    let reader = StateReader::new(&bytes).unwrap();
+    let chunk = reader
+        .load("dbgmcu", CLASS_NAME, STATE_VERSION, &Migrations::new())
+        .unwrap();
+    Device::load(&restored, &mut chunk.reader()).unwrap();
+    let before: Vec<u32> = (0..11).map(|i| peek(&saved, i * 4)).collect();
+    let after: Vec<u32> = (0..11).map(|i| peek(&restored, i * 4)).collect();
+    assert_eq!(before, after);
+    assert_ne!(after[10], 0, "AHB3FZR came across");
+}
