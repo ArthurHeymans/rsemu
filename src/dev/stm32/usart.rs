@@ -21,6 +21,32 @@
 //! `CTS`/`CTSIF`), so one set of semantics serves both and only the decode
 //! differs.
 //!
+//! A third, **`"u5"`**, is the F7 layout grown up: the same offsets, plus
+//! `RTOR` and `RQR` decoded, a `PRESC` at `+0x2c` and an `AUTOCR` at `+0x30`
+//! (ST CMSIS `stm32u585xx.h` (Apache-2.0), `USART_TypeDef`; RM0456, the
+//! USART chapter). It is named for the part it was written against, but the
+//! H7, G4 and L4+ have the same FIFO-and-`PRESC` USART and only lack `AUTOCR`,
+//! which reads as zero to firmware that never writes it. What it adds:
+//!
+//! * **`TEACK`/`REACK`** (`ISR` bits 21/22), set while `UE` and `TE`/`RE` are.
+//!   `HAL_UART_Init` ends in `UART_CheckIdleState`, which polls them, so
+//!   without them every HAL console times out before printing a byte.
+//! * **The FIFO mode**, `CR1.FIFOEN`: eight bytes each way, `TXE` reading as
+//!   `TXFNF` and `RXNE` as `RXFNE`, plus `TXFE`, `RXFF`, and the `TXFT`/`RXFT`
+//!   thresholds `CR3.TXFTCFG`/`RXFTCFG` select. With `FIFOEN` clear the depth
+//!   is one, which is the F7's behaviour exactly. The thresholds count what
+//!   `HAL_UARTEx` counts: `TXFT` means at least that many *free* transmit
+//!   entries, `RXFT` at least that many received bytes. `TXFE` is derived
+//!   from the queue rather than latched, so `ICR.TXFECF` does not hold it
+//!   clear while the FIFO stays empty.
+//! * **`RQR.RXFRQ`/`TXFRQ`**, which flush the receive and transmit sides.
+//! * **`UE` going low** discards whatever is queued and returns `ISR` to its
+//!   reset value — "all current operations are discarded" — which is what
+//!   firmware that toggles `UE` around a reconfiguration expects to find.
+//!
+//! An LPUART has the same register file with a 20-bit `BRR` and no `GTPR` or
+//! `RTOR`; `lpuart = true` (with `variant = "u5"`) gives it exactly that.
+//!
 //! The default is `"f4"`, because [`machines/stm32f407.machine`] is an F407
 //! and a property whose default matches the board it ships with is one fewer
 //! line in the file.
@@ -72,6 +98,10 @@
 //!
 //! ST **RM0090** rev 21 §30 ("Universal synchronous asynchronous receiver
 //! transmitter") for the F4 layout, and ST **RM0410** rev 4 §34 for the F7's.
+//! The `u5` layout is from ST **RM0456** (STM32U5), the USART and LPUART
+//! chapters, with offsets and bit positions from the `USART_TypeDef` and
+//! `USART_*_Pos` definitions in ST CMSIS `stm32u585xx.h` (Apache-2.0); what
+//! `HAL_UART_Init` polls is from ST's BSD-3-Clause U5 HAL, read for behaviour.
 //! No emulator source of any licence was consulted (`ROADMAP.md` §1).
 //!
 //! [`machines/stm32f407.machine`]: https://github.com/KarpelesLab/rsemu/blob/master/machines/stm32f407.machine
@@ -115,6 +145,12 @@ pub const IRQ_PIN: &str = "irq";
 /// One number for both, because a board's `map` statement should not have to
 /// know which variant it named.
 pub const REGISTER_BYTES: u64 = 0x2c;
+
+/// How many bytes the `u5` register block occupies: through `AUTOCR`.
+pub const REGISTER_BYTES_U5: u64 = 0x34;
+
+/// The `u5` FIFO depth, each way (RM0456: "TXFIFO and RXFIFO … 8 data").
+pub const FIFO_DEPTH: usize = 8;
 
 // -- status flags, in the positions both layouts agree on --------------------
 
@@ -165,6 +201,48 @@ const CR1_UE_F7: u32 = 1 << 0;
 /// `CR3.EIE` — the error interrupt, which is what makes `ORE` raise one.
 const CR3_EIE: u32 = 1 << 0;
 
+// -- the u5 additions (ST CMSIS `stm32u585xx.h`, `USART_*_Pos`) --------------
+
+/// `CR1.FIFOEN`.
+const CR1_FIFOEN: u32 = 1 << 29;
+/// `CR1.TXFEIE`.
+const CR1_TXFEIE: u32 = 1 << 30;
+/// `CR1.RXFFIE`.
+const CR1_RXFFIE: u32 = 1 << 31;
+/// `CR3.TXFTIE`.
+const CR3_TXFTIE: u32 = 1 << 23;
+/// `CR3.RXFTCFG`, three bits.
+const CR3_RXFTCFG_SHIFT: u32 = 25;
+/// `CR3.RXFTIE`.
+const CR3_RXFTIE: u32 = 1 << 28;
+/// `CR3.TXFTCFG`, three bits.
+const CR3_TXFTCFG_SHIFT: u32 = 29;
+/// `ISR.TEACK`: the transmitter has acknowledged `TE`.
+const ISR_TEACK: u32 = 1 << 21;
+/// `ISR.REACK`: the receiver has acknowledged `RE`.
+const ISR_REACK: u32 = 1 << 22;
+/// `ISR.TXFE`: the transmit FIFO is empty.
+const ISR_TXFE: u32 = 1 << 23;
+/// `ISR.RXFF`: the receive FIFO is full.
+const ISR_RXFF: u32 = 1 << 24;
+/// `ISR.RXFT`: the receive FIFO has reached its threshold.
+const ISR_RXFT: u32 = 1 << 26;
+/// `ISR.TXFT`: the transmit FIFO has reached its threshold.
+const ISR_TXFT: u32 = 1 << 27;
+/// `RQR.RXFRQ`: flush the received data.
+const RQR_RXFRQ: u32 = 1 << 3;
+/// `RQR.TXFRQ`: flush the transmit data.
+const RQR_TXFRQ: u32 = 1 << 4;
+/// `PRESC.PRESCALER`, four bits.
+const PRESC_MASK: u32 = 0xf;
+/// `AUTOCR`'s defined bits: `TDN`, `TRIGPOL`, `TRIGEN`, `IDLEDIS`, `TRIGSEL`.
+const AUTOCR_MASK: u32 = 0x007f_ffff;
+
+/// How many entries each `TXFTCFG`/`RXFTCFG` encoding stands for: 1/8, 1/4,
+/// 1/2, 3/4 and 7/8 of eight, then "empty"/"full". 6 and 7 are reserved and
+/// never match.
+const THRESHOLDS: [usize; 6] = [1, 2, 4, 6, 7, 8];
+
 // ---------------------------------------------------------------------------
 // Variant
 // ---------------------------------------------------------------------------
@@ -177,6 +255,9 @@ pub enum Variant {
     /// The F0/F3/F7/L4/H7 map: `CR1` at `+0x00`, `ISR`/`ICR`/`RDR`/`TDR` at
     /// the top.
     F7,
+    /// The F7 map plus `PRESC`, `AUTOCR`, `TEACK`/`REACK` and the eight-deep
+    /// FIFO mode: the STM32U5's USART and LPUART.
+    U5,
 }
 
 impl Variant {
@@ -186,6 +267,7 @@ impl Variant {
         match self {
             Variant::F4 => "f4",
             Variant::F7 => "f7",
+            Variant::U5 => "u5",
         }
     }
 
@@ -193,8 +275,56 @@ impl Variant {
     fn ue(self) -> u32 {
         match self {
             Variant::F4 => CR1_UE_F4,
-            Variant::F7 => CR1_UE_F7,
+            Variant::F7 | Variant::U5 => CR1_UE_F7,
         }
+    }
+
+    /// How many bytes of the aperture decode.
+    fn register_bytes(self) -> u64 {
+        match self {
+            Variant::F4 | Variant::F7 => REGISTER_BYTES,
+            Variant::U5 => REGISTER_BYTES_U5,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The u5 FIFO
+// ---------------------------------------------------------------------------
+
+/// One direction's FIFO on a `u5`. A ring would be faster; eight bytes moved
+/// down by one is not worth the indices.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Fifo {
+    buf: [u8; FIFO_DEPTH],
+    len: u8,
+}
+
+impl Fifo {
+    fn len(&self) -> usize {
+        usize::from(self.len)
+    }
+
+    fn front(&self) -> Option<u8> {
+        (self.len > 0).then_some(self.buf[0])
+    }
+
+    fn push(&mut self, byte: u8) {
+        if self.len() < FIFO_DEPTH {
+            self.buf[self.len()] = byte;
+            self.len += 1;
+        }
+    }
+
+    fn pop(&mut self) -> Option<u8> {
+        let byte = self.front()?;
+        self.buf.copy_within(1.., 0);
+        self.len -= 1;
+        Some(byte)
+    }
+
+    fn clear(&mut self) {
+        *self = Fifo::default();
     }
 }
 
@@ -221,6 +351,16 @@ struct State {
     sr_read: bool,
     /// The level the interrupt output is at.
     irq: bool,
+    /// `PRESC` (`u5`).
+    presc: u32,
+    /// `AUTOCR` (`u5`).
+    autocr: u32,
+    /// `RTOR` (`u5`; stored, the timeout is not modelled).
+    rtor: u32,
+    /// The transmit side (`u5`), one deep unless `FIFOEN`.
+    txq: Fifo,
+    /// The receive side (`u5`), one deep unless `FIFOEN`.
+    rxq: Fifo,
 }
 
 impl State {
@@ -243,6 +383,8 @@ struct Registers {
     /// The name the port was opened under, for `Debug` and diagnostics.
     port_name: String,
     variant: Variant,
+    /// An LPUART: a 20-bit `BRR`, and no `GTPR` or `RTOR`.
+    lpuart: bool,
     /// The interrupt output, connected at realize time.
     irq: Mutex<Option<WireSource>>,
     /// `RCC_APB1ENR.USART2EN` and `RCC_APB1RSTR.USART2RST`, as a board's wires
@@ -275,7 +417,7 @@ impl Registers {
             return false;
         }
         let cr1 = state.cr1;
-        let sr = state.sr;
+        let sr = self.isr(state);
         (sr & SR_TXE != 0 && cr1 & CR1_TXEIE != 0)
             || (sr & SR_TC != 0 && cr1 & CR1_TCIE != 0)
             || (sr & SR_RXNE != 0 && cr1 & CR1_RXNEIE != 0)
@@ -284,6 +426,76 @@ impl Registers {
             // "ORE, NF or FE bits in the USART_SR register" — the error
             // interrupt is `CR3.EIE` and not a `CR1` bit.
             || (sr & (SR_ORE | SR_NF | SR_FE) != 0 && state.cr3 & CR3_EIE != 0)
+            // The `u5` FIFO conditions. The flags are never set on the other
+            // variants, so these cost them nothing.
+            || (sr & ISR_TXFE != 0 && cr1 & CR1_TXFEIE != 0)
+            || (sr & ISR_RXFF != 0 && cr1 & CR1_RXFFIE != 0)
+            || (sr & ISR_TXFT != 0 && state.cr3 & CR3_TXFTIE != 0)
+            || (sr & ISR_RXFT != 0 && state.cr3 & CR3_RXFTIE != 0)
+    }
+
+    /// The status word as the guest reads it. On a `u5` that is the stored
+    /// flags plus the ones derived from `CR1` and the FIFOs; elsewhere it is
+    /// the stored flags.
+    fn isr(&self, state: &State) -> u32 {
+        if self.variant != Variant::U5 {
+            return state.sr;
+        }
+        let mut isr = state.sr;
+        if self.enabled(state) {
+            // "TEACK: … set/reset by hardware, when the TE bit is set/reset";
+            // the same for `REACK`. Instant here: there is no baud clock to
+            // wait a bit time on.
+            if state.cr1 & CR1_TE != 0 {
+                isr |= ISR_TEACK;
+            }
+            if state.cr1 & CR1_RE != 0 {
+                isr |= ISR_REACK;
+            }
+        }
+        if state.cr1 & CR1_FIFOEN != 0 {
+            let tx = state.txq.len();
+            let rx = state.rxq.len();
+            if tx == 0 {
+                isr |= ISR_TXFE;
+            }
+            if rx == FIFO_DEPTH {
+                isr |= ISR_RXFF;
+            }
+            let txft = ((state.cr3 >> CR3_TXFTCFG_SHIFT) & 7) as usize;
+            if THRESHOLDS.get(txft).is_some_and(|&n| FIFO_DEPTH - tx >= n) {
+                isr |= ISR_TXFT;
+            }
+            let rxft = ((state.cr3 >> CR3_RXFTCFG_SHIFT) & 7) as usize;
+            if THRESHOLDS.get(rxft).is_some_and(|&n| rx >= n) {
+                isr |= ISR_RXFT;
+            }
+        }
+        isr
+    }
+
+    /// A `u5`'s FIFO depth: eight with `FIFOEN`, one without.
+    fn depth(state: &State) -> usize {
+        if state.cr1 & CR1_FIFOEN != 0 {
+            FIFO_DEPTH
+        } else {
+            1
+        }
+    }
+
+    /// Bring a `u5`'s stored `TXE`/`RXNE` in line with its queues — which is
+    /// what makes them `TXFNF` and `RXFNE` in FIFO mode.
+    fn sync_fifo_flags(state: &mut State) {
+        if state.txq.len() < Registers::depth(state) {
+            state.sr |= SR_TXE;
+        } else {
+            state.sr &= !SR_TXE;
+        }
+        if state.rxq.len() > 0 {
+            state.sr |= SR_RXNE;
+        } else {
+            state.sr &= !SR_RXNE;
+        }
     }
 
     /// Drive the interrupt pin to whatever the latch now says.
@@ -312,7 +524,12 @@ impl Registers {
             if !self.enabled(&state) || state.cr1 & CR1_RE == 0 {
                 return false;
             }
-            if state.sr & SR_RXNE != 0 {
+            if self.variant == Variant::U5 {
+                if state.rxq.len() >= Registers::depth(&state) {
+                    // Full: the byte stays on the host's side, as below.
+                    return false;
+                }
+            } else if state.sr & SR_RXNE != 0 {
                 // The register is still full, so the byte stays on the host's
                 // side of the seam rather than being taken and dropped. An
                 // overrun is what happens to a byte the *line* delivered, and
@@ -327,6 +544,11 @@ impl Registers {
             return false;
         };
         let mut state = self.state.lock();
+        if self.variant == Variant::U5 {
+            state.rxq.push(byte);
+            Registers::sync_fifo_flags(&mut state);
+            return true;
+        }
         state.rdr = byte;
         state.sr |= SR_RXNE;
         state.sr_read = false;
@@ -339,6 +561,9 @@ impl Registers {
     /// `TXE` clear, which stalls a guest polling it — back pressure arriving
     /// as the hardware would deliver it, not a dropped character.
     fn transmit(&self) -> bool {
+        if self.variant == Variant::U5 {
+            return self.transmit_fifo();
+        }
         let byte = {
             let state = self.state.lock();
             if state.sr & SR_TXE != 0 {
@@ -351,6 +576,24 @@ impl Registers {
         }
         let mut state = self.state.lock();
         state.sr |= SR_TXE | SR_TC;
+        true
+    }
+
+    /// [`transmit`](Self::transmit) on a `u5`: the head of the queue goes, and
+    /// `TC` sets once nothing is left behind it.
+    fn transmit_fifo(&self) -> bool {
+        let Some(byte) = self.state.lock().txq.front() else {
+            return false;
+        };
+        if !self.port.write_byte(byte) {
+            return false;
+        }
+        let mut state = self.state.lock();
+        state.txq.pop();
+        if state.txq.len() == 0 {
+            state.sr |= SR_TC;
+        }
+        Registers::sync_fifo_flags(&mut state);
         true
     }
 
@@ -368,6 +611,17 @@ impl Registers {
 
     /// Read the data register: the byte, and `RXNE` cleared.
     fn read_data(&self, state: &mut State, debug: bool) -> u32 {
+        if self.variant == Variant::U5 {
+            // An empty FIFO reads the last byte again, as the part does.
+            if debug {
+                return u32::from(state.rxq.front().unwrap_or(state.rdr));
+            }
+            if let Some(byte) = state.rxq.pop() {
+                state.rdr = byte;
+            }
+            Registers::sync_fifo_flags(state);
+            return u32::from(state.rdr);
+        }
         if debug {
             return u32::from(state.rdr);
         }
@@ -382,6 +636,16 @@ impl Registers {
             // A disabled transmitter latches nothing. Firmware that forgot
             // `TE` should see `TXE` stay set and its bytes go nowhere, which
             // is what happens on the part.
+            return;
+        }
+        if self.variant == Variant::U5 {
+            // A write to a full FIFO is lost: firmware is told by `TXFNF`.
+            if state.txq.len() < Registers::depth(state) {
+                state.txq.push(value as u8);
+                state.tdr = value as u8;
+                state.sr &= !SR_TC;
+            }
+            Registers::sync_fifo_flags(state);
             return;
         }
         state.tdr = value as u8;
@@ -409,21 +673,30 @@ impl Registers {
             (Variant::F4, 0x14) => state.cr3,
             (Variant::F4, 0x18) => state.gtpr,
 
-            (Variant::F7, 0x00) => state.cr1,
-            (Variant::F7, 0x04) => state.cr2,
-            (Variant::F7, 0x08) => state.cr3,
-            (Variant::F7, 0x0c) => state.brr,
-            (Variant::F7, 0x10) => state.gtpr,
+            // The `u5` additions first; it shares the rest with the F7.
+            (Variant::U5, 0x10 | 0x14) if self.lpuart => 0,
+            (Variant::U5, 0x14) => state.rtor,
+            // `RQR` is write-only.
+            (Variant::U5, 0x18) => 0,
+            (Variant::U5, 0x1c) => self.isr(&state),
+            (Variant::U5, 0x2c) => state.presc,
+            (Variant::U5, 0x30) => state.autocr,
+
+            (Variant::F7 | Variant::U5, 0x00) => state.cr1,
+            (Variant::F7 | Variant::U5, 0x04) => state.cr2,
+            (Variant::F7 | Variant::U5, 0x08) => state.cr3,
+            (Variant::F7 | Variant::U5, 0x0c) => state.brr,
+            (Variant::F7 | Variant::U5, 0x10) => state.gtpr,
             // `ISR` has no read side effect at all on an F7: `ICR` is what
             // clears a flag, which is the whole reason ST changed it.
             (Variant::F7, 0x1c) => state.sr,
             // "The USART_ICR register should be written only …"; it reads as
             // zero.
-            (Variant::F7, 0x20) => 0,
-            (Variant::F7, 0x24) => self.read_data(&mut state, debug),
+            (Variant::F7 | Variant::U5, 0x20) => 0,
+            (Variant::F7 | Variant::U5, 0x24) => self.read_data(&mut state, debug),
             // `TDR` is write-only in effect; a read returns what was last put
             // there, which is what the part does and what nothing relies on.
-            (Variant::F7, 0x28) => u32::from(state.tdr),
+            (Variant::F7 | Variant::U5, 0x28) => u32::from(state.tdr),
             // `RTOR` and `RQR` are not modelled; they read as zero, as does
             // anything else in the aperture.
             _ => 0,
@@ -446,16 +719,44 @@ impl Registers {
             (Variant::F4, 0x14) => state.cr3 = value,
             (Variant::F4, 0x18) => state.gtpr = value & 0xffff,
 
+            (Variant::U5, 0x00) => {
+                let was_enabled = self.enabled(&state);
+                state.cr1 = value;
+                if was_enabled && !self.enabled(&state) {
+                    // "When UE = 0 … all current operations are discarded …
+                    // all the USART_ISR status flags are reset" (RM0456).
+                    state.txq.clear();
+                    state.rxq.clear();
+                    state.sr = SR_RESET;
+                }
+                Registers::sync_fifo_flags(&mut state);
+            }
+            (Variant::U5, 0x0c) if self.lpuart => state.brr = value & 0xf_ffff,
+            (Variant::U5, 0x10 | 0x14) if self.lpuart => {}
+            (Variant::U5, 0x14) => state.rtor = value,
+            (Variant::U5, 0x18) => {
+                if value & RQR_RXFRQ != 0 {
+                    state.rxq.clear();
+                }
+                if value & RQR_TXFRQ != 0 {
+                    state.txq.clear();
+                    state.sr |= SR_TC;
+                }
+                Registers::sync_fifo_flags(&mut state);
+            }
+            (Variant::U5, 0x2c) => state.presc = value & PRESC_MASK,
+            (Variant::U5, 0x30) => state.autocr = value & AUTOCR_MASK,
+
             (Variant::F7, 0x00) => state.cr1 = value,
-            (Variant::F7, 0x04) => state.cr2 = value,
-            (Variant::F7, 0x08) => state.cr3 = value,
-            (Variant::F7, 0x0c) => state.brr = value & 0xffff,
-            (Variant::F7, 0x10) => state.gtpr = value & 0xffff,
+            (Variant::F7 | Variant::U5, 0x04) => state.cr2 = value,
+            (Variant::F7 | Variant::U5, 0x08) => state.cr3 = value,
+            (Variant::F7 | Variant::U5, 0x0c) => state.brr = value & 0xffff,
+            (Variant::F7 | Variant::U5, 0x10) => state.gtpr = value & 0xffff,
             // `ISR` is read-only on an F7.
-            (Variant::F7, 0x1c) => {}
-            (Variant::F7, 0x20) => state.sr &= !(value & ICR_MASK),
-            (Variant::F7, 0x24) => {}
-            (Variant::F7, 0x28) => self.write_data(&mut state, value),
+            (Variant::F7 | Variant::U5, 0x1c) => {}
+            (Variant::F7 | Variant::U5, 0x20) => state.sr &= !(value & ICR_MASK),
+            (Variant::F7 | Variant::U5, 0x24) => {}
+            (Variant::F7 | Variant::U5, 0x28) => self.write_data(&mut state, value),
             _ => {}
         }
     }
@@ -552,33 +853,62 @@ impl Usart {
     pub fn new(props: &Props) -> Result<Usart> {
         let mut r = props.reader();
         let port_name = r.or("port", String::from(DEFAULT_PORT))?;
-        let variant = match r.or_enum("variant", "f4", &["f4", "f7"])? {
+        let variant = match r.or_enum("variant", "f4", &["f4", "f7", "u5"])? {
             "f7" => Variant::F7,
+            "u5" => Variant::U5,
             _ => Variant::F4,
         };
+        let lpuart = r.or("lpuart", false)?;
         r.finish()?;
-        Ok(Usart::with_port(
-            ports::attach(props, &port_name)?,
-            port_name,
-            variant,
-        ))
+        if lpuart && variant != Variant::U5 {
+            return Err(Error::Property(
+                "`lpuart` needs `variant = \"u5\"`: an LPUART is modelled on that register file only"
+                    .to_string(),
+            ));
+        }
+        let port = ports::attach(props, &port_name)?;
+        Ok(Usart::build(port, port_name, variant, lpuart))
+    }
+
+    /// Build an LPUART against a character device the caller already has: the
+    /// `u5` register file with a 20-bit `BRR`, and `GTPR` and `RTOR` reading
+    /// as zero.
+    #[must_use]
+    pub fn lpuart_with_port(port: Arc<dyn CharDevice>, port_name: String) -> Usart {
+        Usart::build(port, port_name, Variant::U5, true)
+    }
+
+    /// Whether this is an LPUART.
+    #[must_use]
+    pub fn is_lpuart(&self) -> bool {
+        self.regs.lpuart
     }
 
     /// Build one against a character device the caller already has — the route
     /// a test takes, holding the other end of the port.
     #[must_use]
     pub fn with_port(port: Arc<dyn CharDevice>, port_name: String, variant: Variant) -> Usart {
+        Usart::build(port, port_name, variant, false)
+    }
+
+    fn build(
+        port: Arc<dyn CharDevice>,
+        port_name: String,
+        variant: Variant,
+        lpuart: bool,
+    ) -> Usart {
         let regs = Arc::new(Registers {
             state: Mutex::with_rank(LockRank::DEVICE, State::reset()),
             port,
             port_name,
             variant,
+            lpuart,
             irq: Mutex::with_rank(LockRank::WIRE, None),
             gate: ClockGate::new(),
         });
         let region = Arc::new(Region::io(
             "usart",
-            REGISTER_BYTES,
+            variant.register_bytes(),
             Arc::clone(&regs) as Arc<dyn MemOps>,
         ));
         Usart { regs, region }
@@ -639,7 +969,21 @@ impl Device for Usart {
         w.write_u8(state.rdr)?;
         w.write_u8(state.tdr)?;
         w.write_bool(state.sr_read)?;
-        w.write_bool(state.irq)
+        w.write_bool(state.irq)?;
+        // The `u5` state follows, on a `u5` only: the variant is a construction
+        // property, so the F4 and F7 encodings are what they always were.
+        if self.regs.variant == Variant::U5 {
+            w.write_u32(state.presc)?;
+            w.write_u32(state.autocr)?;
+            w.write_u32(state.rtor)?;
+            for q in [state.txq, state.rxq] {
+                w.write_u8(q.len)?;
+                for byte in q.buf {
+                    w.write_u8(byte)?;
+                }
+            }
+        }
+        Ok(())
         // The port's queues are deliberately absent: what a user has typed and
         // not yet been read, and what the terminal has shown, are the host's
         // state and not the machine's (`ROADMAP.md` §4.5).
@@ -657,6 +1001,23 @@ impl Device for Usart {
         state.tdr = r.read_u8()?;
         state.sr_read = r.read_bool()?;
         state.irq = r.read_bool()?;
+        if self.regs.variant == Variant::U5 {
+            state.presc = r.read_u32()? & PRESC_MASK;
+            state.autocr = r.read_u32()? & AUTOCR_MASK;
+            state.rtor = r.read_u32()?;
+            for q in [&mut state.txq, &mut state.rxq] {
+                let len = r.read_u8()?;
+                if usize::from(len) > FIFO_DEPTH {
+                    return Err(Error::State(format!(
+                        "snapshot has {len} bytes in an {FIFO_DEPTH}-deep FIFO"
+                    )));
+                }
+                q.len = len;
+                for byte in &mut q.buf {
+                    *byte = r.read_u8()?;
+                }
+            }
+        }
         *self.regs.state.lock() = state;
         self.regs.refresh_irq();
         Ok(())
@@ -721,7 +1082,7 @@ impl Instance for Usart {}
 pub static CLASS: DeviceClass = DeviceClass {
     name: CLASS_NAME,
     version: STATE_VERSION,
-    summary: "STM32 USART over a character port, in the F4 (SR/DR) or F7 (ISR/RDR/TDR) layout",
+    summary: "STM32 USART over a character port, in the F4 (SR/DR), F7 (ISR/RDR/TDR) or U5 (FIFO, PRESC) layout",
     properties: &[
         PropertySpec {
             name: "port",
@@ -733,7 +1094,13 @@ pub static CLASS: DeviceClass = DeviceClass {
             name: "variant",
             kind: ValueKind::Str,
             required: false,
-            summary: "which register layout: \"f4\" (SR/DR) or \"f7\" (ISR/RDR/TDR)",
+            summary: "which register layout: \"f4\" (SR/DR), \"f7\" (ISR/RDR/TDR) or \"u5\" (F7 plus FIFO, PRESC, AUTOCR)",
+        },
+        PropertySpec {
+            name: "lpuart",
+            kind: ValueKind::Bool,
+            required: false,
+            summary: "an LPUART (20-bit BRR, no GTPR/RTOR); u5 only (default false)",
         },
     ],
     construct: |props| Ok(Box::new(Usart::new(props)?)),
@@ -762,7 +1129,8 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
 pub fn schema() -> ClassSchema {
     let schema = ClassSchema::new(CLASS_NAME)
         .prop(PropSchema::new("port", ValueKind::Str))
-        .prop(PropSchema::new("variant", ValueKind::Str).values(&["f4", "f7"]))
+        .prop(PropSchema::new("variant", ValueKind::Str).values(&["f4", "f7", "u5"]))
+        .prop(PropSchema::new("lpuart", ValueKind::Bool))
         .region("")
         .region("regs")
         // An M-profile board wires this straight to the core: `wire
@@ -830,7 +1198,7 @@ mod tests {
         );
         let map = match variant {
             Variant::F4 => &F4_MAP,
-            Variant::F7 => &F7_MAP,
+            Variant::F7 | Variant::U5 => &F7_MAP,
         };
         (usart, port, map)
     }
@@ -945,7 +1313,7 @@ mod tests {
 
     #[test]
     fn a_byte_written_to_the_data_register_reaches_the_host() {
-        for variant in [Variant::F4, Variant::F7] {
+        for variant in [Variant::F4, Variant::F7, Variant::U5] {
             let (usart, port, map) = wired(variant);
             enable(&usart, map);
             assert_eq!(peek(&usart, map.sr) & SR_TXE, SR_TXE, "{variant:?}: idle");
@@ -988,7 +1356,7 @@ mod tests {
 
     #[test]
     fn a_byte_from_the_host_arrives_in_the_data_register() {
-        for variant in [Variant::F4, Variant::F7] {
+        for variant in [Variant::F4, Variant::F7, Variant::U5] {
             let (usart, port, map) = wired(variant);
             enable(&usart, map);
             port.feed(b"Z");
@@ -1257,6 +1625,238 @@ mod tests {
         assert!(Device::region(&usart, "").is_some());
         assert!(Device::region(&usart, "regs").is_some());
         assert!(Device::region(&usart, "fifo").is_none());
+    }
+
+    // -- the u5 variant -------------------------------------------------------
+
+    const PRESC: u64 = 0x2c;
+    const AUTOCR: u64 = 0x30;
+    const RQR: u64 = 0x18;
+    const GTPR: u64 = 0x10;
+    const RTOR: u64 = 0x14;
+
+    #[test]
+    fn the_u5_hal_init_sequence_completes_and_prints() {
+        // What `HAL_UART_Init` does on a U5: `UE` off, `CR1`/`CR2`/`CR3`,
+        // `PRESC`, `BRR`, then `HAL_UARTEx_DisableFifoMode` (read `CR1`, drop
+        // `UE`, drop `FIFOEN`, write it back), `UE` on, and
+        // `UART_CheckIdleState` polling `TEACK` and `REACK`.
+        let (usart, port, map) = wired(Variant::U5);
+        assert_eq!(usart.region.len(), REGISTER_BYTES_U5);
+        assert_eq!(peek(&usart, map.sr), SR_RESET, "ISR's reset value");
+        poke(&usart, map.cr1, 0);
+        poke(&usart, map.cr1, CR1_TE | CR1_RE);
+        poke(&usart, 0x04, 0);
+        poke(&usart, map.cr3, 0);
+        poke(&usart, PRESC, 0);
+        poke(&usart, map.brr, 0x0115); // 32 MHz / 115200
+        let cr1 = peek(&usart, map.cr1);
+        poke(&usart, map.cr1, cr1 & !CR1_UE_F7 & !CR1_FIFOEN);
+        poke(&usart, map.cr1, cr1 | CR1_UE_F7);
+        let isr = peek(&usart, map.sr);
+        assert_eq!(isr & (ISR_TEACK | ISR_REACK), ISR_TEACK | ISR_REACK);
+        assert_eq!(
+            isr & (ISR_TXFE | ISR_TXFT),
+            0,
+            "no FIFO flags out of FIFO mode"
+        );
+        assert_eq!(peek(&usart, PRESC), 0);
+        assert_eq!(peek(&usart, map.brr), 0x0115);
+
+        // `HAL_UART_Transmit`: wait `TXE`, write `TDR`, and finally wait `TC`.
+        for &byte in b"ok" {
+            assert_eq!(peek(&usart, map.sr) & SR_TXE, SR_TXE);
+            poke(&usart, map.tdr, u32::from(byte));
+            assert_eq!(peek(&usart, map.sr) & SR_TXE, 0, "one deep without FIFOEN");
+            tick(&usart);
+        }
+        assert_eq!(peek(&usart, map.sr) & SR_TC, SR_TC);
+        assert_eq!(port.drain(), b"ok");
+
+        // And `TEACK` follows `TE`.
+        poke(&usart, map.cr1, CR1_UE_F7 | CR1_RE);
+        assert_eq!(peek(&usart, map.sr) & (ISR_TEACK | ISR_REACK), ISR_REACK);
+    }
+
+    #[test]
+    fn the_u5_fifo_holds_eight_each_way_and_reports_its_thresholds() {
+        let (usart, port, map) = wired(Variant::U5);
+        // TXFTCFG = 0b010 (half: four free), RXFTCFG = 0b001 (a quarter: two).
+        poke(
+            &usart,
+            map.cr3,
+            (0b010 << CR3_TXFTCFG_SHIFT) | (0b001 << CR3_RXFTCFG_SHIFT),
+        );
+        poke(&usart, map.cr1, CR1_FIFOEN | CR1_UE_F7 | CR1_TE | CR1_RE);
+        let isr = peek(&usart, map.sr);
+        assert_eq!(
+            isr & (ISR_TXFE | ISR_TXFT | SR_TXE),
+            ISR_TXFE | ISR_TXFT | SR_TXE
+        );
+
+        for byte in b"01234" {
+            poke(&usart, map.tdr, u32::from(*byte));
+        }
+        let isr = peek(&usart, map.sr);
+        assert_eq!(isr & ISR_TXFE, 0);
+        assert_eq!(
+            isr & ISR_TXFT,
+            0,
+            "three free is below the threshold of four"
+        );
+        assert_eq!(isr & SR_TXE, SR_TXE, "TXFNF: not full yet");
+        for byte in b"567X" {
+            poke(&usart, map.tdr, u32::from(*byte));
+        }
+        assert_eq!(peek(&usart, map.sr) & SR_TXE, 0, "full; the ninth was lost");
+        for _ in 0..8 {
+            tick(&usart);
+        }
+        assert_eq!(port.drain(), b"01234567");
+        let isr = peek(&usart, map.sr);
+        assert_eq!(isr & (ISR_TXFE | SR_TC), ISR_TXFE | SR_TC);
+
+        port.feed(b"abcdefghij");
+        // Reading `ISR` pulls one byte in at a time; ticks bring the rest.
+        let _ = peek(&usart, map.sr);
+        for _ in 0..10 {
+            tick(&usart);
+        }
+        let isr = peek(&usart, map.sr);
+        assert_eq!(
+            isr & (ISR_RXFF | ISR_RXFT | SR_RXNE),
+            ISR_RXFF | ISR_RXFT | SR_RXNE
+        );
+        let got: Vec<u8> = (0..7).map(|_| peek(&usart, map.rdr) as u8).collect();
+        assert_eq!(got, b"abcdefg");
+        // Each read polled the host first, so the FIFO has taken "hij" too.
+        assert_eq!(peek_debug(&usart, map.rdr), u32::from(b'h'));
+        assert_eq!(peek(&usart, map.rdr), u32::from(b'h'));
+        assert_eq!(peek(&usart, map.rdr), u32::from(b'i'));
+        assert_eq!(peek_debug(&usart, map.sr) & ISR_RXFT, 0, "one is below two");
+        assert_eq!(peek(&usart, map.rdr), u32::from(b'j'));
+        assert_eq!(peek(&usart, map.sr) & SR_RXNE, 0);
+        assert_eq!(
+            peek(&usart, map.rdr),
+            u32::from(b'j'),
+            "empty reads the last again"
+        );
+    }
+
+    #[test]
+    fn the_u5_fifo_interrupts_follow_their_enables() {
+        let (usart, _port, map) = wired(Variant::U5);
+        poke(&usart, map.cr1, CR1_FIFOEN | CR1_UE_F7 | CR1_TE);
+        assert_eq!(usart.irq_level(), Level::Low);
+        poke(
+            &usart,
+            map.cr1,
+            CR1_FIFOEN | CR1_UE_F7 | CR1_TE | CR1_TXFEIE,
+        );
+        assert_eq!(usart.irq_level(), Level::High, "TXFE with TXFEIE");
+        poke(&usart, map.tdr, u32::from(b'x'));
+        assert_eq!(usart.irq_level(), Level::Low);
+        poke(&usart, map.cr3, CR3_TXFTIE); // TXFTCFG 0: one free entry
+        assert_eq!(usart.irq_level(), Level::High, "TXFT with TXFTIE");
+    }
+
+    #[test]
+    fn the_u5_flushes_on_rqr_and_on_ue_going_low() {
+        let (usart, port, map) = wired(Variant::U5);
+        poke(&usart, map.cr1, CR1_FIFOEN | CR1_UE_F7 | CR1_TE | CR1_RE);
+        port.feed(b"rx");
+        let _ = peek(&usart, map.sr);
+        tick(&usart);
+        poke(&usart, map.tdr, u32::from(b't'));
+        poke(&usart, RQR, RQR_RXFRQ | RQR_TXFRQ);
+        let isr = peek_debug(&usart, map.sr);
+        assert_eq!(isr & (SR_RXNE | ISR_TXFE | SR_TC), ISR_TXFE | SR_TC);
+        assert_eq!(peek(&usart, RQR), 0, "write-only");
+        tick(&usart);
+        assert!(port.drain().is_empty(), "the flushed byte never left");
+
+        poke(&usart, map.tdr, u32::from(b'u'));
+        usart.regs.state.lock().sr |= SR_ORE;
+        poke(&usart, map.cr1, CR1_FIFOEN | CR1_TE | CR1_RE);
+        assert_eq!(peek(&usart, map.sr), SR_RESET | ISR_TXFE | ISR_TXFT);
+        poke(&usart, map.cr1, CR1_FIFOEN | CR1_UE_F7 | CR1_TE | CR1_RE);
+        tick(&usart);
+        assert!(port.drain().is_empty(), "UE = 0 discarded it");
+    }
+
+    #[test]
+    fn the_u5_extra_registers_store_their_defined_bits() {
+        let (usart, _port, map) = wired(Variant::U5);
+        poke(&usart, PRESC, 0xffff_ffff);
+        poke(&usart, AUTOCR, 0xffff_ffff);
+        poke(&usart, RTOR, 0x1234_5678);
+        poke(&usart, map.brr, 0xf_ffff);
+        assert_eq!(peek(&usart, PRESC), 0xf);
+        assert_eq!(peek(&usart, AUTOCR), AUTOCR_MASK);
+        assert_eq!(peek(&usart, RTOR), 0x1234_5678);
+        assert_eq!(peek(&usart, map.brr), 0xffff, "a USART's BRR is 16 bits");
+
+        // An LPUART: 20-bit `BRR`, no `GTPR`, no `RTOR`.
+        let port = Arc::new(CharPort::new());
+        let lp = Usart::lpuart_with_port(Arc::clone(&port) as Arc<dyn CharDevice>, "lp".into());
+        assert!(lp.is_lpuart());
+        poke(&lp, map.brr, 0xfff_ffff);
+        poke(&lp, GTPR, 0xffff);
+        poke(&lp, RTOR, 0xffff);
+        assert_eq!(peek(&lp, map.brr), 0xf_ffff);
+        assert_eq!((peek(&lp, GTPR), peek(&lp, RTOR)), (0, 0));
+        poke(&lp, map.cr1, CR1_UE_F7 | CR1_TE);
+        poke(&lp, map.tdr, u32::from(b'L'));
+        tick(&lp);
+        assert_eq!(port.drain(), b"L");
+
+        let props = Props::new()
+            .with("variant", Value::from("u5"))
+            .with("lpuart", Value::from(true));
+        assert!(Usart::new(&props).unwrap().is_lpuart());
+        let props = Props::new().with("lpuart", Value::from(true));
+        assert!(Usart::new(&props).is_err(), "an LPUART is a u5");
+    }
+
+    #[test]
+    fn a_u5_snapshot_round_trips_to_identical_state() {
+        let (saved, port, map) = wired(Variant::U5);
+        poke(&saved, map.cr1, CR1_FIFOEN | CR1_UE_F7 | CR1_TE | CR1_RE);
+        poke(&saved, PRESC, 3);
+        poke(&saved, AUTOCR, 0x2_0004);
+        poke(&saved, RTOR, 77);
+        for byte in b"abc" {
+            poke(&saved, map.tdr, u32::from(*byte));
+        }
+        port.feed(b"xy");
+        let _ = peek(&saved, map.sr);
+        tick(&saved);
+        let _ = port.drain();
+
+        let mut shape = MachineShape::new();
+        shape.add_device("usart", CLASS_NAME).unwrap();
+        let mut w = StateWriter::new(shape);
+        {
+            let mut chunk = w.chunk("usart", CLASS_NAME, STATE_VERSION).unwrap();
+            Device::save(&saved, &mut chunk).unwrap();
+        }
+        let bytes = w.to_vec().unwrap();
+
+        let (restored, other, _) = wired(Variant::U5);
+        let reader = StateReader::new(&bytes).unwrap();
+        let chunk = reader
+            .load("usart", CLASS_NAME, STATE_VERSION, &Migrations::new())
+            .unwrap();
+        Device::load(&restored, &mut chunk.reader()).unwrap();
+
+        let before: Vec<u32> = (0..13).map(|i| peek_debug(&saved, i * 4)).collect();
+        let after: Vec<u32> = (0..13).map(|i| peek_debug(&restored, i * 4)).collect();
+        assert_eq!(before, after);
+        let saved_state = *saved.regs.state.lock();
+        assert_eq!(saved_state, *restored.regs.state.lock());
+        tick(&restored);
+        tick(&restored);
+        assert_eq!(other.drain(), b"bc", "the transmit FIFO came across");
     }
 
     /// A wire with one source, so a pin has something to drive.
