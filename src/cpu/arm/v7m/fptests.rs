@@ -561,6 +561,106 @@ fn vpush_and_vpop_round_trip_sixteen_registers() {
     }
 }
 
+// The doubleword data movement. An FPv4-SP-D16 unit has D0-D15 as views of
+// S-register pairs, and the instructions that only move bits through them are
+// present (module docs of `fpisa`). Encodings are GNU as 2.45 output for
+// `-mcpu=cortex-m4 -mfpu=fpv4-sp-d16`, which accepts every one of them.
+/// `VLDR D1, [R0]`.
+const VLDR_D1_R0: u32 = 0xed90_1b00;
+/// `VSTR D1, [R0, #8]`.
+const VSTR_D1_R0_8: u32 = 0xed80_1b02;
+/// `VPUSH {D8-D15}`.
+const VPUSH_D8_D15: u32 = 0xed2d_8b10;
+/// `VPOP {D8-D15}`.
+const VPOP_D8_D15: u32 = 0xecbd_8b10;
+/// `VMOV D2, R2, R3`.
+const VMOV_D2_R2_R3: u32 = 0xec43_2b12;
+/// `VMOV R4, R5, D2`.
+const VMOV_R4_R5_D2: u32 = 0xec55_4b12;
+/// `VLDMIA R0!, {D0-D1}`.
+const VLDMIA_R0_D0_D1: u32 = 0xecb0_0b04;
+
+#[test]
+fn doubleword_loads_and_stores_move_two_singles_on_a_single_precision_part() {
+    // GCC copies an eight-byte constant through `d7` on an M4F; an STM32U5 HAL
+    // build hit this in `HAL_UART_MspInit` before it was decoded.
+    let mut halves = program(&[VLDR_D1_R0, VSTR_D1_R0_8]);
+    halves.push(PARK);
+    let h = Harness::m4f(&halves);
+    h.set_word(0x800, 0x1111_1111);
+    h.set_word(0x804, 0x2222_2222);
+    h.cpu.set_reg(0, 0x800);
+    h.steps(1);
+    assert_eq!(
+        h.cpu.s(2),
+        0x1111_1111,
+        "D1's low half is S2, the lower address"
+    );
+    assert_eq!(h.cpu.s(3), 0x2222_2222, "D1's high half is S3");
+    h.steps(1);
+    assert_eq!(h.word(0x808), 0x1111_1111);
+    assert_eq!(h.word(0x80c), 0x2222_2222);
+}
+
+#[test]
+fn doubleword_lists_and_transfers_map_onto_the_single_precision_file() {
+    let mut halves = program(&[
+        VPUSH_D8_D15,
+        VPOP_D8_D15,
+        VMOV_D2_R2_R3,
+        VMOV_R4_R5_D2,
+        VLDMIA_R0_D0_D1,
+    ]);
+    halves.push(PARK);
+    let h = Harness::m4f(&halves);
+    for k in 16..32u8 {
+        h.cpu.set_s(k, 0x5000_0000 + u32::from(k));
+    }
+    let sp = h.cpu.reg(13);
+    h.steps(1);
+    assert_eq!(
+        h.cpu.reg(13),
+        sp - 0x40,
+        "eight doublewords are sixteen words"
+    );
+    assert_eq!(h.word(sp - 0x40), 0x5000_0010, "D8 is S16:S17");
+    for k in 16..32u8 {
+        h.cpu.set_s(k, 0);
+    }
+    h.steps(1);
+    assert_eq!(h.cpu.reg(13), sp);
+    assert_eq!(h.cpu.s(31), 0x5000_001f);
+
+    h.cpu.set_reg(2, 0xaaaa_aaaa);
+    h.cpu.set_reg(3, 0xbbbb_bbbb);
+    h.steps(2);
+    assert_eq!((h.cpu.s(4), h.cpu.s(5)), (0xaaaa_aaaa, 0xbbbb_bbbb));
+    assert_eq!((h.cpu.reg(4), h.cpu.reg(5)), (0xaaaa_aaaa, 0xbbbb_bbbb));
+
+    for (k, v) in [0x11u32, 0x22, 0x33, 0x44].iter().enumerate() {
+        h.set_word(0x900 + 4 * k as u32, *v);
+    }
+    h.cpu.set_reg(0, 0x900);
+    h.steps(1);
+    assert_eq!(
+        [h.cpu.s(0), h.cpu.s(1), h.cpu.s(2), h.cpu.s(3)],
+        [0x11, 0x22, 0x33, 0x44]
+    );
+    assert_eq!(h.cpu.reg(0), 0x910, "writeback past four words");
+}
+
+#[test]
+fn doubleword_moves_disassemble_as_doublewords_and_d16_up_is_undefined() {
+    let text = |w: u32| alloc::format!("{}", fpisa::decode((w >> 16) as u16, w as u16).unwrap());
+    assert_eq!(text(VLDR_D1_R0), "VLDR d1, [r0]");
+    assert_eq!(text(VPUSH_D8_D15), "VPUSH {d8-d15}");
+    assert_eq!(text(VMOV_D2_R2_R3), "VMOV d2, r2, r3");
+    // `VLDR D16, [R0]` sets the D bit: a register a -D16 unit does not have.
+    assert!(fpisa::decode(0xedd0, 0x0b00).is_none());
+    // `VLDMIA R0, {D15-D16}` runs off the end of the file.
+    assert!(fpisa::decode(0xec90, 0xfb04).is_none());
+}
+
 #[test]
 fn vmrs_and_vmsr_reach_fpscr_and_the_mode_bits_stick() {
     let mut halves = program(&[VMSR_R0, VMRS_R0]);

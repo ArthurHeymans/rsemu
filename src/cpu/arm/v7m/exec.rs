@@ -2907,7 +2907,10 @@ impl Exec<'_> {
                 Ok(())
             }
 
-            FpInsn::MovCore2 { to_fp, rt, rt2, m } => {
+            // The doubleword form moves the same two words.
+            FpInsn::MovCore2 {
+                to_fp, rt, rt2, m, ..
+            } => {
                 if to_fp {
                     let (a, b) = (self.reg(rt), self.reg(rt2));
                     self.state.fp.set_s(m, a);
@@ -2929,6 +2932,7 @@ impl Exec<'_> {
                 rn,
                 imm,
                 add,
+                double,
             } => {
                 // `Rn == PC` is the literal form, and the base is the
                 // instruction's own address aligned down to a word — not the
@@ -2947,12 +2951,27 @@ impl Exec<'_> {
                 // unaligned, whatever `CCR.UNALIGN_TRP` says.
                 self.check_alignment(addr, 4, true)?;
                 let privileged = self.state.privileged();
+                // A doubleword is two word accesses, lower address first,
+                // into `Sd` and `Sd+1` (DDI 0403E A7.7.230). Both reads
+                // happen before either register is written, so a fault on the
+                // second leaves the register file as it was.
+                let words = if double { 2 } else { 1 };
                 if load {
-                    let value = self.read_mem(addr, 4, privileged)?;
-                    self.state.fp.set_s(d, value);
+                    let lo = self.read_mem(addr, 4, privileged)?;
+                    let hi = if double {
+                        self.read_mem(addr.wrapping_add(4), 4, privileged)?
+                    } else {
+                        0
+                    };
+                    self.state.fp.set_s(d, lo);
+                    if double {
+                        self.state.fp.set_s(d.wrapping_add(1), hi);
+                    }
                 } else {
-                    let value = self.state.fp.s(d);
-                    self.write_mem(addr, 4, value, privileged)?;
+                    for k in 0..words {
+                        let value = self.state.fp.s(d.wrapping_add(k));
+                        self.write_mem(addr.wrapping_add(u32::from(k) * 4), 4, value, privileged)?;
+                    }
                 }
                 Ok(())
             }
@@ -2964,6 +2983,7 @@ impl Exec<'_> {
                 count,
                 add,
                 writeback,
+                ..
             } => {
                 let base = self.reg(rn);
                 let bytes = u32::from(count) * 4;

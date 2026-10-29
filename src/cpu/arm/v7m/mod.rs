@@ -92,8 +92,11 @@
 //!
 //! - **Double-precision floating point.** The two units modelled are
 //!   FPv4-SP-D16 and FPv5-SP-D16, which are real part configurations;
-//!   `MVFR0.D_Precision` reads zero and every coprocessor 11 encoding is
-//!   UNDEFINED. An FPv5-D16 Cortex-M7 with double precision is not modelled.
+//!   `MVFR0.D_Precision` reads zero and every coprocessor 11 *arithmetic*
+//!   encoding is UNDEFINED. The doubleword data movement — `VLDR`/`VSTR.64`,
+//!   D-register `VLDM`/`VSTM`/`VPUSH`/`VPOP`, `VMOV Dm, Rt, Rt2` — is present,
+//!   as it is on those parts. An FPv5-D16 Cortex-M7 with double precision is
+//!   not modelled.
 //!   `FPSCR.AHP` — the alternative half-precision format — is RES0 for the
 //!   same reason: it reads back as zero so a guest can tell.
 //!   `tests/conformance/ledgers/cpu-arm-v7m-fp.txt` is the full list.

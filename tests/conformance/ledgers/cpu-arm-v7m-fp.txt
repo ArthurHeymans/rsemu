@@ -39,8 +39,10 @@ double-precision            # FPv5-D16's F64 arithmetic. `MVFR0.D_Precision`
                             # reads zero, so the part advertises itself as
                             # FPv4-SP-D16 / FPv5-SP-D16 -- both of which are
                             # real configurations -- and every coprocessor 11
-                            # encoding is UNDEFINED, which is what a
-                            # single-precision part does. Firmware built
+                            # arithmetic encoding is UNDEFINED, which is what a
+                            # single-precision part does. (The doubleword loads,
+                            # stores and core-pair moves are not arithmetic and
+                            # are implemented.) Firmware built
                             # `-mfpu=fpv5-d16` traps on its first `VADD.F64`
                             # rather than computing something wrong.
                             # DDI 0403E A2.5.2, A7.7.

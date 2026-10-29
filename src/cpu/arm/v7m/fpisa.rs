@@ -19,10 +19,23 @@
 //!
 //! The `coproc` field (bits 11:8 of the second halfword) is `0b1010` for
 //! single precision and `0b1011` for double. This core is single-precision
-//! only, so `0b1011` decodes to nothing here and the caller sees an ordinary
-//! coprocessor encoding — which the interpreter then turns into UNDEFINED when
-//! an FPU is present, because a double-precision instruction on an FPv4-SP
-//! part is exactly that.
+//! only, so `0b1011` *arithmetic* decodes to nothing here and the caller sees
+//! an ordinary coprocessor encoding — which the interpreter then turns into
+//! UNDEFINED when an FPU is present, because a double-precision operation on
+//! an FPv4-SP part is exactly that.
+//!
+//! The `0b1011` **data movement** is another matter. An FPv4-SP-D16 or
+//! FPv5-SP-D16 unit still has `D0`–`D15`, as views of the pairs `S2n`/`S2n+1`,
+//! and the instructions that only move bits through them are present:
+//! `VLDR`/`VSTR` of a doubleword, `VLDM`/`VSTM`/`VPUSH`/`VPOP` of a D-register
+//! list, and `VMOV` between two core registers and a doubleword (DDI 0403E
+//! A6.4, "Floating-point register transfers", and A7.7's entries for each,
+//! where the `.64` forms carry no double-precision requirement). Compilers use
+//! them freely on single-precision parts — GCC copies an eight-byte struct
+//! through `d7`, and an RTOS saves `{d8-d15}` — so they decode here, mapped
+//! onto the single-precision register file. D-register numbers are `D:Vd`,
+//! with `D` as the *top* bit, the other way round from an S register; a
+//! number above fifteen does not exist on a `-D16` unit and is UNDEFINED.
 //!
 //! # Sources
 //!
@@ -343,6 +356,9 @@ pub enum FpInsn {
         rt2: u8,
         /// The first single-precision register.
         m: u8,
+        /// The doubleword form, `VMOV Dm, Rt, Rt2`: the same two words, named
+        /// as `D(m/2)`.
+        double: bool,
     },
     /// `VMRS`/`VMSR`.
     Sys {
@@ -366,6 +382,9 @@ pub enum FpInsn {
         imm: u32,
         /// Add the offset rather than subtract it.
         add: bool,
+        /// `VLDR.64`/`VSTR.64`: two words, into `Sd` and `Sd+1` — which is
+        /// `D(d/2)`.
+        double: bool,
     },
     /// `VLDM`/`VSTM`, and their `VPOP`/`VPUSH` spellings.
     Multi {
@@ -381,6 +400,10 @@ pub enum FpInsn {
         add: bool,
         /// Write the updated base back.
         writeback: bool,
+        /// The register list was written as doublewords. `d` and `count`
+        /// are still in single-precision registers (words); this only
+        /// changes how the list is spelled.
+        double: bool,
     },
 }
 
@@ -409,6 +432,10 @@ impl FpInsn {
 /// this core does not have.
 const CP_SINGLE: u32 = 0b1010;
 
+/// The `coproc` value that means double precision. Only its data movement is
+/// decoded.
+const CP_DOUBLE: u32 = 0b1011;
+
 /// Decode a thirty-two-bit coprocessor encoding as a floating-point
 /// instruction, or `None` if it is not one this core implements.
 ///
@@ -418,7 +445,16 @@ const CP_SINGLE: u32 = 0b1010;
 #[must_use]
 pub fn decode(hw1: u16, hw2: u16) -> Option<FpInsn> {
     let w = (u32::from(hw1) << 16) | u32::from(hw2);
-    if field(w, 11, 8) != CP_SINGLE {
+    let coproc = field(w, 11, 8);
+    if coproc == CP_DOUBLE {
+        // Only the data movement exists for doublewords; see the module
+        // documentation.
+        return match field(w, 31, 24) {
+            0xec | 0xed => decode_load_store_double(w),
+            _ => None,
+        };
+    }
+    if coproc != CP_SINGLE {
         return None;
     }
     match field(w, 31, 24) {
@@ -600,6 +636,7 @@ fn decode_load_store(w: u32) -> Option<FpInsn> {
             rt: field(w, 15, 12) as u8,
             rt2: field(w, 19, 16) as u8,
             m: rm(w),
+            double: false,
         });
     }
 
@@ -611,6 +648,7 @@ fn decode_load_store(w: u32) -> Option<FpInsn> {
             rn: base,
             imm: imm8 * 4,
             add: u,
+            double: false,
         });
     }
     // Everything else is a multiple transfer; `imm8` is the register count.
@@ -628,6 +666,7 @@ fn decode_load_store(w: u32) -> Option<FpInsn> {
             count: count as u8,
             add: true,
             writeback: wb,
+            double: false,
         }),
         // Decrement before, always with writeback. `VPUSH`/`VPOP` is this
         // with `Rn == SP`.
@@ -638,9 +677,80 @@ fn decode_load_store(w: u32) -> Option<FpInsn> {
             count: count as u8,
             add: false,
             writeback: true,
+            double: false,
         }),
         _ => None,
     }
+}
+
+/// The `coproc == 0b1011` rows of the extension-register load/store window:
+/// the same table as [`decode_load_store`], with every register a doubleword.
+///
+/// Each form is returned in single-precision terms — `D(n)` is `S(2n)` and
+/// `S(2n+1)`, and a list of `k` doublewords is `2k` words — so the interpreter
+/// runs it through the single-precision paths, and `double` only changes how a
+/// listing spells it.
+fn decode_load_store_double(w: u32) -> Option<FpInsn> {
+    let p = bit(w, 24);
+    let u = bit(w, 23);
+    let wb = bit(w, 21);
+    let load = bit(w, 20);
+    let base = field(w, 19, 16) as u8;
+    // `D:Vd`: the `D` bit is the top bit of a doubleword register number.
+    let dreg = (u32::from(bit(w, 22)) << 4) | field(w, 15, 12);
+    let imm8 = field(w, 7, 0);
+
+    // `VMOV Dm, Rt, Rt2` and back: `P:U:W == 000` with bit 22 set. The
+    // register is `M:Vm`, top bit first, like `Dd`.
+    if !p && !u && bit(w, 22) && !wb {
+        if field(w, 7, 6) != 0 || !bit(w, 4) {
+            return None;
+        }
+        let m = (u32::from(bit(w, 5)) << 4) | field(w, 3, 0);
+        if m > 15 {
+            return None;
+        }
+        return Some(FpInsn::MovCore2 {
+            to_fp: !load,
+            rt: field(w, 15, 12) as u8,
+            rt2: field(w, 19, 16) as u8,
+            m: (m * 2) as u8,
+            double: true,
+        });
+    }
+    if dreg > 15 {
+        return None;
+    }
+    if p && !wb {
+        return Some(FpInsn::Mem {
+            load,
+            d: (dreg * 2) as u8,
+            rn: base,
+            imm: imm8 * 4,
+            add: u,
+            double: true,
+        });
+    }
+    // A multiple transfer: `imm8` is twice the register count. An odd `imm8`
+    // is `FLDMX`/`FSTMX`, which ARMv7-M does not have, and an empty list or one
+    // that runs past `D15` is UNPREDICTABLE; all three are refused.
+    if imm8 == 0 || !imm8.is_multiple_of(2) || dreg + imm8 / 2 > 16 {
+        return None;
+    }
+    let (add, writeback) = match (p, u, wb) {
+        (false, true, _) => (true, wb),
+        (true, false, true) => (false, true),
+        _ => return None,
+    };
+    Some(FpInsn::Multi {
+        load,
+        d: (dreg * 2) as u8,
+        rn: base,
+        count: imm8 as u8,
+        add,
+        writeback,
+        double: true,
+    })
 }
 
 /// The FPv5 group in the unconditional `0b1111 1110` window.
@@ -808,7 +918,26 @@ impl fmt::Display for FpInsn {
                     write!(f, "VMOV {}, {}", RegName(rt), S(n))
                 }
             }
-            FpInsn::MovCore2 { to_fp, rt, rt2, m } => {
+            FpInsn::MovCore2 {
+                to_fp,
+                rt,
+                rt2,
+                m,
+                double: true,
+            } => {
+                if to_fp {
+                    write!(f, "VMOV d{}, {}, {}", m / 2, RegName(rt), RegName(rt2))
+                } else {
+                    write!(f, "VMOV {}, {}, d{}", RegName(rt), RegName(rt2), m / 2)
+                }
+            }
+            FpInsn::MovCore2 {
+                to_fp,
+                rt,
+                rt2,
+                m,
+                double: false,
+            } => {
                 if to_fp {
                     write!(
                         f,
@@ -847,13 +976,19 @@ impl fmt::Display for FpInsn {
                 rn,
                 imm,
                 add,
+                double,
             } => {
                 let op = if load { "VLDR" } else { "VSTR" };
                 let sign = if add { "" } else { "-" };
-                if imm == 0 && add {
-                    write!(f, "{op} {}, [{}]", S(d), RegName(rn))
+                let reg = if double {
+                    alloc::format!("d{}", d / 2)
                 } else {
-                    write!(f, "{op} {}, [{}, #{sign}{imm}]", S(d), RegName(rn))
+                    alloc::format!("{}", S(d))
+                };
+                if imm == 0 && add {
+                    write!(f, "{op} {reg}, [{}]", RegName(rn))
+                } else {
+                    write!(f, "{op} {reg}, [{}, #{sign}{imm}]", RegName(rn))
                 }
             }
             FpInsn::Multi {
@@ -863,27 +998,27 @@ impl fmt::Display for FpInsn {
                 count,
                 add,
                 writeback,
+                double,
             } => {
+                let list = if double {
+                    alloc::format!("d{}-d{}", d / 2, (d + count) / 2 - 1)
+                } else {
+                    alloc::format!("{}-{}", S(d), S(d + count - 1))
+                };
                 // `VPUSH`/`VPOP` is the `SP` spelling of the same encoding,
                 // and is what a listing should say when it sees one.
                 if rn == 13 && writeback {
                     if load && add {
-                        return write!(f, "VPOP {{{}-{}}}", S(d), S(d + count - 1));
+                        return write!(f, "VPOP {{{list}}}");
                     }
                     if !load && !add {
-                        return write!(f, "VPUSH {{{}-{}}}", S(d), S(d + count - 1));
+                        return write!(f, "VPUSH {{{list}}}");
                     }
                 }
                 let op = if load { "VLDM" } else { "VSTM" };
                 let mode = if add { "IA" } else { "DB" };
                 let bang = if writeback { "!" } else { "" };
-                write!(
-                    f,
-                    "{op}{mode} {}{bang}, {{{}-{}}}",
-                    RegName(rn),
-                    S(d),
-                    S(d + count - 1)
-                )
+                write!(f, "{op}{mode} {}{bang}, {{{list}}}", RegName(rn))
             }
         }
     }
