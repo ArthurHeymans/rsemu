@@ -1,6 +1,7 @@
-# STM32 clock and power: `st.rcc` and `st.pwr`
+# STM32 clock and power: `st.rcc`, `st.pwr` and `st.icache`
 
-Consumed by: `src/dev/stm32/rcc.rs`, `src/dev/stm32/pwr.rs`. Every other STM32
+Consumed by: `src/dev/stm32/rcc.rs`, `src/dev/stm32/pwr.rs`,
+`src/dev/stm32/icache.rs`. Every other STM32
 peripheral consumes the *interfaces* below, so this page is a source register
 first and an interface contract second.
 
@@ -13,6 +14,9 @@ first and an interface contract second.
 | ST **RM0351** rev 9, §6 "Reset and clock control" | The L4 tree (§6.2), the MSI, the register map (§6.4) | st.com, `DM00083560` |
 | ST **RM0351** rev 9, §5 "Power control" | `CR1`…`CR4`, `SR1`/`SR2`, `SCR`, the `PUCRx`/`PDCRx` pulls | same |
 | ST **DS8626** rev 9 (F407VG datasheet) | Which crystal a package expects, and the HSE/LSE limits | st.com |
+| ST **RM0456** (STM32U5), §11 "Reset and clock control", §10 "Power control", and the ICACHE/DCACHE chapters | The U5 tree, MSI ranges (§11.4), RCC map (§11.8); `VOSR`/`SVMSR`, EPOD boost, SMPS/LDO; the cache control blocks | st.com |
+| ST CMSIS **`stm32u585xx.h`** (cmsis-device-u5, Apache-2.0) | `RCC_TypeDef`, `PWR_TypeDef`, `ICACHE_TypeDef`, `DCACHE_TypeDef` offsets, every `_Pos`/`_Msk` | github.com/STMicroelectronics/cmsis-device-u5 |
+| ST **STM32U5 HAL** (stm32u5xx-hal-driver, BSD-3-Clause) | Which flags firmware spins on; `HAL_RCC_DeInit`'s reset values; `SystemCoreClockUpdate`'s PLL1 formula | github.com/STMicroelectronics/stm32u5xx-hal-driver |
 
 Nothing here was written from an emulator of any licence (`ROADMAP.md` §1).
 Reset values, bit positions and divider tables are facts from the manuals
@@ -184,7 +188,80 @@ that could never be opened would be a board bug wearing a device bug's clothes.
 `CSR`'s `xxRSTF` flags are latched by a rising edge on an input pin, and cleared
 by `RMVF`. The pins are `borrst`, `pinrst`, `porrst` (F4 only), `sftrst`,
 `iwdgrst`, `wwdgrst`, `lpwrrst`, and on an L4 `fwrst` and `oblrst`. A watchdog
-or a reset controller drives one; the RCC does not guess.
+or a reset controller drives one; the RCC does not guess. A U5 has `oblrst`,
+`pinrst`, `borrst`, `sftrst`, `iwdgrst`, `wwdgrst`, `lpwrrst` (no `porrst`, no
+`fwrst`), with `RMVF` at bit 23.
+
+## The U5 (`variant = "u5"`)
+
+### `st.rcc`
+
+Map: RM0456 §11.8 / `RCC_TypeDef`, decoding `0x118` bytes at `0x4602_0C00`.
+
+- **Boot**: `CR` = `0x35` (MSIS and MSIK on and ready), `SW` = `SWS` = MSIS at
+  4 MHz, `CSR` = `0x0C00_4400` (PIN + BOR, both standby MSI ranges 4 MHz),
+  `PLLxDIVR` = `0x0101_0280`, `ICSCR1` = `0x4400_0000`.
+- **MSIS** comes from `CSR.MSISSRANGE[15:12]` until `ICSCR1.MSIRGSEL` (23)
+  selects `ICSCR1.MSISRANGE[31:28]`. Sixteen ranges, four RCs ÷ 1/2/3/4, kept
+  as exact rationals (range 6 is 4 MHz ÷ 3; ST's `MSIRangeTable` rounds).
+- **Switch**: `CFGR1.SW[1:0]`/`SWS[3:2]`, 00 MSIS, 01 HSI16, 10 HSE, 11 PLL1,
+  refused while the source is not ready.
+- **Prescalers**: `CFGR2.HPRE[3:0]`, `PPRE1[6:4]`, `PPRE2[10:8]`;
+  `CFGR3.PPRE3[6:4]`. `ClockOutput::PCLK3` (property `pclk3`, parent `hclk`)
+  is new and zero on the F4/L4.
+- **PLL1**: `src / (M+1) × (N+1 + FRACN/8192)`, `R+1` behind `PLL1REN` for
+  `SYSCLK`, `Q+1` behind `PLL1QEN` for `pll48`; FRACN only while `PLL1FRACEN`.
+  `PLL1MBOOST` divides the EPOD booster's clock, not the VCO input.
+- **Ready bits** (twelve): `CR` MSIS 0→2, MSIK 4→5, HSI 8→10, HSI48 12→13,
+  SHSI 14→15, HSE 16→17, PLL1 24→25, PLL2 26→27, PLL3 28→29; `BDCR` LSE 0→1,
+  LSESYS 7→11, **LSI 26→27** (in the backup domain on a U5, so behind `DBP`).
+  `CIER`/`CIFR`/`CICR` at `0x50/0x54/0x58`, flags `0x1DFF`. NVIC 9.
+- **Gate pins** (`<n>` = the header's `_Pos`):
+
+  | enable | register | reset | register |
+  | --- | --- | --- | --- |
+  | `ahb1en<n>` | `AHB1ENR` | `ahb1rst<n>` | `AHB1RSTR` |
+  | `ahb2en<n>` | `AHB2ENR1` | `ahb2rst<n>` | `AHB2RSTR1` |
+  | `ahb2enb<n>` | `AHB2ENR2` | `ahb2rstb<n>` | `AHB2RSTR2` |
+  | `ahb3en<n>` | `AHB3ENR` | `ahb3rst<n>` | `AHB3RSTR` |
+  | `apb1en<n>` | `APB1ENR1` | `apb1rst<n>` | `APB1RSTR1` |
+  | `apb1enb<n>` | `APB1ENR2` | `apb1rstb<n>` | `APB1RSTR2` |
+  | `apb2en<n>` | `APB2ENR` | `apb2rst<n>` | `APB2RSTR` |
+  | `apb3en<n>` | `APB3ENR` | `apb3rst<n>` | `APB3RSTR` |
+
+  The second word of a pair takes a letter, as the L4's `apb1enb` did, so
+  `ahb2en21` can only mean `AHB2ENR1` bit 21. Examples: PWR `ahb3en2`, GPIOA
+  `ahb2en0`, USART1 `apb2en14`, USART2 `apb1en17`, LPUART1 `apb3en6`,
+  DCACHE1 `ahb1en30`.
+
+### `st.pwr`
+
+Map: RM0456 §10 / `PWR_TypeDef`, `0x98` bytes at `0x4602_0800`.
+
+| firmware writes | and waits for | model |
+| --- | --- | --- |
+| `VOSR.VOS[17:16]` | `VOSR.VOSRDY` (15), `SVMSR.ACTVOSRDY` (15) | a change clears both; `ready-delay` ticks later both set and `SVMSR.ACTVOS` copies `VOS` |
+| `VOSR.BOOSTEN` (18) | `VOSR.BOOSTRDY` (14) | set after `ready-delay`, cleared with `BOOSTEN` |
+| `CR3.REGSEL` (1) | `SVMSR.REGS` (1) | follows after `ready-delay` |
+| `DBPR.DBP` (0) | read-back | drives the `dbp` output to `rcc.dbp` |
+
+Reset: range 4 on the LDO, `VOSR` = `SVMSR` = `0x8000`. Supply monitors
+(`SVMCR` 24–27) report their supply present at once; `SR.CSSF` and `WUSCR`
+clear; `UCPDR`, `SECCFGR`, `PRIVCFGR`, `APCR`, the pulls are storage. The gate
+is `rcc.ahb3en2 -> pwr.enable`; there is no `PWRRST`, so no `reset` wire.
+
+### `st.icache`
+
+The ICACHE (`variant = "icache"`, `0x4003_0400`, NVIC 107) and DCACHE1
+(`variant = "dcache"`, `0x4003_1400`, NVIC 111) control blocks, `0x30` bytes
+each. No caching; the flags firmware polls are live. `CR.CACHEINV` — and the
+ICACHE's `EN` falling — sets `SR.BUSYF`, which clears after `busy-delay`
+ticks (default 16; 0 = inside the write) with `BSYENDF` set and `CACHEINV`
+cleared. The DCACHE's `STARTCMD` with a non-zero `CACHECMD` runs `BUSYCMDF`
+to `CMDENDF`. `irq` = `SR & IER`; `FCR` is write-one-to-clear; the monitors
+read zero; `WAYSEL` and `CRRx` are frozen while `EN` is set. Lazily advanced
+like the RCC, with `enable`/`reset` gate inputs (`rcc.ahb1en30` for DCACHE1;
+the ICACHE has no enable bit, so leave it undrawn).
 
 ## Implementation notes
 
@@ -228,6 +305,10 @@ or a reset controller drives one; the RCC does not guess.
   say *which* crystal an output came from: a board with one high-speed
   oscillator models HSI and the PLL as exact ratios of HSE. The rate a guest
   measures is exact; the independence of the two cans is not modelled.
+- **U5 enable registers reset to zero**, as do its `*SMENR`; RM0456 has some
+  SRAM and flash-interface clocks on out of reset. `CCIPR1`…`CCIPR3`, PLL2/3,
+  MSIK, HSI48 and SHSI answer their ready bits and drive nothing, and the U5's
+  `SECCFGR`/`PRIVCFGR` are storage (TrustZone off).
 - The F4 `*LPENR` and L4 `*SMENR` low-power gate registers reset to zero rather
   than to the manual's "every implemented peripheral enabled" constants, which
   were not to hand to check. Nothing in a startup path reads them.

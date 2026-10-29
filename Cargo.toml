@@ -238,6 +238,7 @@ full = [
     "dev-stm32-rtc",
     "dev-stm32-rcc",
     "dev-stm32-pwr",
+    "dev-stm32-icache",
     "dev-stm32-rng",
     "machine-stm32f407",
     "cpu-z80",
@@ -2210,6 +2211,18 @@ dev-stm32-rcc = []
 # SVMSR.REGS and DBPR.DBP are what ST's U5 HAL spins on.
 # `no_std + alloc`, no `unsafe`, no dependencies.
 dev-stm32-pwr = []
+
+# The STM32U5 ICACHE and DCACHE control blocks (src/dev/stm32/icache.rs): one
+# class, `st.icache`, with `variant = "icache"` or `"dcache"`. No line is ever
+# cached -- the core already sees memory coherently -- but the register file
+# firmware polls is real: CR.CACHEINV (and the ICACHE's EN falling) sets
+# SR.BUSYF and, after a configurable number of ticks of the device's own
+# lazily-advanced clock domain, BSYENDF; the DCACHE's CR.STARTCMD runs
+# BUSYCMDF to CMDENDF; IER drives an `irq` pin, FCR clears, the hit/miss
+# monitors read zero. Without it HAL_ICACHE_Invalidate, HAL_ICACHE_Disable and
+# HAL_DCACHE_CleanByAddr spin forever. From RM0456 and ST's Apache-2.0 CMSIS
+# `stm32u585xx.h`. `no_std + alloc`, no `unsafe`, no dependencies.
+dev-stm32-icache = []
 
 # The STM32 random number generator (src/dev/stm32/rng.rs): one class, `st.rng`,
 # three registers -- CR, SR, DR -- and the determinism problem behind them.

@@ -28,6 +28,7 @@
 //! | [`wwdg`] | `st.wwdg` | the window watchdog, which also resets the board when a kick comes *early* |
 //! | [`dbgmcu`] | `st.dbgmcu` | the debug unit: `IDCODE` and the freeze bits that stop a peripheral while a debugger has the core halted |
 //! | [`rcc`] | `st.rcc` | the reset and clock controller: ready bits, the PLL and prescaler tree, the peripheral gates, the backup domain |
+//! | [`icache`] | `st.icache` | the U5 ICACHE and DCACHE control blocks: invalidation and clean commands with their busy and end flags, no actual caching |
 //! | [`pwr`] | `st.pwr` | the power controller: `DBP`, voltage scaling and the F42x over-drive |
 //! | [`rng`] | `st.rng` | the random number generator: `CR`/`SR`/`DR`, both error paths, and a stream the machine seeds |
 //! | [`rtc`] | `st.rtc` | the real-time clock: a BCD calendar, both alarms, the wakeup timer and the thirty-two backup registers |
@@ -146,6 +147,10 @@ pub mod wwdg;
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-pwr")))]
 pub mod pwr;
 
+#[cfg(feature = "dev-stm32-icache")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-icache")))]
+pub mod icache;
+
 #[cfg(feature = "dev-stm32-rng")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-rng")))]
 pub mod rng;
@@ -228,6 +233,8 @@ pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
     rcc::register(registry)?;
     #[cfg(feature = "dev-stm32-pwr")]
     pwr::register(registry)?;
+    #[cfg(feature = "dev-stm32-icache")]
+    icache::register(registry)?;
     #[cfg(feature = "dev-stm32-rng")]
     rng::register(registry)?;
     #[cfg(feature = "dev-stm32-rtc")]
@@ -285,6 +292,8 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
     rcc::bind(bindings)?;
     #[cfg(feature = "dev-stm32-pwr")]
     pwr::bind(bindings)?;
+    #[cfg(feature = "dev-stm32-icache")]
+    icache::bind(bindings)?;
     #[cfg(feature = "dev-stm32-rng")]
     rng::bind(bindings)?;
     #[cfg(feature = "dev-stm32-rtc")]
@@ -341,6 +350,8 @@ pub fn schemas() -> Vec<ClassSchema> {
     out.push(rcc::schema());
     #[cfg(feature = "dev-stm32-pwr")]
     out.push(pwr::schema());
+    #[cfg(feature = "dev-stm32-icache")]
+    out.push(icache::schema());
     #[cfg(feature = "dev-stm32-rng")]
     out.push(rng::schema());
     #[cfg(feature = "dev-stm32-rtc")]

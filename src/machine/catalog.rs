@@ -1297,6 +1297,7 @@ pub fn registry() -> Result<Registry> {
         feature = "dev-stm32-flash",
         feature = "dev-stm32-rcc",
         feature = "dev-stm32-pwr",
+        feature = "dev-stm32-icache",
         feature = "dev-stm32-rtc",
         feature = "dev-stm32-rng",
         feature = "machine-spi-flash"
@@ -1465,6 +1466,7 @@ pub fn bindings() -> Result<Bindings> {
         feature = "dev-stm32-flash",
         feature = "dev-stm32-rcc",
         feature = "dev-stm32-pwr",
+        feature = "dev-stm32-icache",
         feature = "dev-stm32-rtc",
         feature = "dev-stm32-rng",
         feature = "machine-spi-flash"
@@ -1648,6 +1650,7 @@ pub fn classes() -> ClassTable {
         feature = "dev-stm32-flash",
         feature = "dev-stm32-rcc",
         feature = "dev-stm32-pwr",
+        feature = "dev-stm32-icache",
         feature = "dev-stm32-rtc",
         feature = "dev-stm32-rng",
         feature = "machine-spi-flash"
