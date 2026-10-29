@@ -37,6 +37,25 @@
 //! catches a program that has started running its main loop twice as fast as
 //! it should, which a plain timeout cannot.
 //!
+//! # The `u5` variant
+//!
+//! The STM32U5's IWDG (`variant = "u5"`; RM0456, the IWDG chapter, with
+//! offsets and bits from `IWDG_TypeDef` and `IWDG_*_Pos` in ST CMSIS
+//! `stm32u585xx.h`, Apache-2.0) has `WINR` and adds three things:
+//!
+//! * `PR` is **four** bits: dividers /4 through /1024, with every encoding
+//!   past `1000` saturating at /1024.
+//! * `EWCR` at `0x14`, the **early wakeup**: `EWIT[11:0]` is a compare value
+//!   and `EWIE` (bit 15) arms it, so the counter reaching `EWIT` sets
+//!   `SR.EWIF` (bit 14) and drives the `irq` output — `IWDG_IRQn` on a U5 —
+//!   until software writes `EWIC` (bit 14 of `EWCR`). `EWIT` and `EWIE` are
+//!   behind the `0x5555` unlock like the rest and raise `SR.EWU` (bit 3) for
+//!   five LSI cycles, which `HAL_IWDG_Init` polls along with the other three;
+//!   `EWIC` is not locked, because `HAL_IWDG_IRQHandler` writes it with the
+//!   registers closed.
+//! * The flag is set only with `EWIE` set, so a comparator nobody armed never
+//!   raises one.
+//!
 //! # Time
 //!
 //! The device is [lazily advanced](crate::core::sched) on its own clock
@@ -117,6 +136,33 @@ const STATE_VERSION: u32 = 1;
 /// register in an allotted kilobyte does.
 pub const REGISTER_BYTES: u64 = 0x14;
 
+/// How many bytes the `u5` registers occupy: through `EWCR`.
+pub const REGISTER_BYTES_U5: u64 = 0x18;
+
+/// `SR.EWU`: an `EWCR` write has not crossed into the LSI domain yet (`u5`).
+const SR_EWU: u32 = 1 << 3;
+/// `SR.EWIF`: the early wakeup interrupt is pending (`u5`).
+const SR_EWIF: u32 = 1 << 14;
+/// `EWCR.EWIT`: the early wakeup compare value (`u5`).
+const EWCR_EWIT: u32 = 0xfff;
+/// `EWCR.EWIC`: write one to clear `EWIF` (`u5`).
+const EWCR_EWIC: u32 = 1 << 14;
+/// `EWCR.EWIE`: the early wakeup interrupt enable (`u5`).
+const EWCR_EWIE: u32 = 1 << 15;
+
+/// The name of the early wakeup interrupt output (`u5`).
+pub const IRQ_PIN: &str = "irq";
+
+/// Which register file the watchdog has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Variant {
+    /// `KR`, `PR`, `RLR`, `SR`, and `WINR` where `window` says so.
+    #[default]
+    F4,
+    /// The STM32U5: `WINR`, a four-bit `PR`, and `EWCR` with its interrupt.
+    U5,
+}
+
 /// `KR`: start counting.
 const KEY_START: u32 = 0xcccc;
 /// `KR`: reload the counter from `RLR`.
@@ -165,8 +211,18 @@ struct State {
     prescale: u32,
     /// Where the device has advanced to, in its own clock domain.
     tick: u64,
-    /// The tick each of `PVU`, `RVU` and `WVU` stops reading as one at.
-    update: [Option<u64>; 3],
+    /// The tick each of `PVU`, `RVU`, `WVU` and (`u5`) `EWU` stops reading
+    /// as one at.
+    update: [Option<u64>; 4],
+    /// `EWCR.EWIT` (`u5`).
+    ewit: u32,
+    /// `EWCR.EWIE` (`u5`).
+    ewie: bool,
+    /// `SR.EWIF` (`u5`).
+    ewif: bool,
+    /// Whether `PR` runs to /1024 (`u5`) rather than stopping at /256. A
+    /// property of the part, so not saved: it is restored from the variant.
+    wide_pr: bool,
 }
 
 impl Default for State {
@@ -181,7 +237,11 @@ impl Default for State {
             counter: COUNTER_MAX,
             prescale: 0,
             tick: 0,
-            update: [None; 3],
+            update: [None; 4],
+            ewit: 0,
+            ewie: false,
+            ewif: false,
+            wide_pr: false,
         }
     }
 }
@@ -193,7 +253,28 @@ impl State {
     /// the table stops at /256, so an out-of-range value saturates there
     /// rather than inventing a divider of 512.
     fn divider(&self) -> u64 {
-        4u64 << self.pr.min(6)
+        // A U5's four bits run to /1024, "1xxx" all meaning it.
+        4u64 << self.pr.min(if self.wide_pr { 8 } else { 6 })
+    }
+
+    /// The reset state of a watchdog of `variant`.
+    fn fresh(variant: Variant) -> State {
+        State {
+            wide_pr: variant == Variant::U5,
+            ..State::default()
+        }
+    }
+
+    /// LSI cycles until the counter reaches `EWIT`, if that is armed and ahead.
+    fn until_ewi(&self, frozen: bool) -> Option<u64> {
+        if !self.started || frozen || !self.ewie || self.ewif || self.counter <= self.ewit {
+            return None;
+        }
+        let divider = self.divider();
+        Some(
+            (divider - u64::from(self.prescale))
+                + u64::from(self.counter - self.ewit - 1) * divider,
+        )
     }
 
     /// LSI cycles from here until the reset, if one is coming.
@@ -207,7 +288,10 @@ impl State {
 
     /// LSI cycles until the next thing that changes what the guest can read.
     fn next_event(&self, frozen: bool) -> Option<u64> {
-        let mut soonest = self.until_reset(frozen);
+        let mut soonest = match (self.until_reset(frozen), self.until_ewi(frozen)) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
         for deadline in self.update.iter().flatten() {
             let delta = deadline.saturating_sub(self.tick);
             soonest = Some(match soonest {
@@ -253,6 +337,11 @@ impl State {
                     break;
                 }
                 self.counter -= 1;
+                if self.ewie && !self.ewif && self.counter == self.ewit {
+                    // "EWIF … set by hardware when the counter reaches the
+                    // value programmed in EWIT" (RM0456).
+                    self.ewif = true;
+                }
             }
         }
         self.tick = end;
@@ -274,6 +363,10 @@ struct Registers {
     state: Mutex<State>,
     /// Whether this part has `WINR`.
     window: bool,
+    /// Which register file.
+    variant: Variant,
+    /// The early wakeup interrupt output (`u5`). A level.
+    irq_out: Mutex<Option<WireSource>>,
     /// Whether the debug unit is holding the counter still.
     ///
     /// An atomic rather than a field of [`State`] for two reasons: it is read
@@ -339,6 +432,28 @@ impl Registers {
         }
     }
 
+    /// Drive the early wakeup interrupt to what `EWIE` and `EWIF` say.
+    ///
+    /// **Never called with the state lock held**, for `pulse_reset`'s reason.
+    fn refresh_irq(&self) {
+        let level = {
+            let state = self.state.lock();
+            Level::from_bool(state.ewie && state.ewif)
+        };
+        let source = self.irq_out.lock().clone();
+        if let Some(source) = source {
+            source.set(level);
+        }
+    }
+
+    /// How many bytes decode.
+    fn register_bytes(&self) -> u64 {
+        match self.variant {
+            Variant::F4 => REGISTER_BYTES,
+            Variant::U5 => REGISTER_BYTES_U5,
+        }
+    }
+
     /// Advance to `target` of the watchdog's own clock domain.
     ///
     /// One iteration per internal event rather than one jump: the reset has to
@@ -347,11 +462,12 @@ impl Registers {
     /// running machine the loop turns once.
     fn advance_to(&self, target: u64) {
         loop {
-            let (reached, fired) = {
+            let (reached, fired, ewi) = {
                 let mut state = self.state.lock();
                 if target <= state.tick {
                     return;
                 }
+                let ewif = state.ewif;
                 let span = target - state.tick;
                 // At least one tick, so catch-up always makes progress.
                 let step = state
@@ -360,8 +476,11 @@ impl Registers {
                     .clamp(1, span);
                 let fired = state.step(step, self.frozen());
                 self.publish(&state);
-                (state.tick >= target, fired)
+                (state.tick >= target, fired, state.ewif != ewif)
             };
+            if ewi {
+                self.refresh_irq();
+            }
             if fired {
                 self.pulse_reset();
             }
@@ -408,22 +527,31 @@ impl Registers {
             0x08 => state.rlr,
             0x0c => {
                 let mut sr = 0;
-                for (bit, deadline) in [SR_PVU, SR_RVU, SR_WVU].iter().zip(state.update) {
+                for (bit, deadline) in [SR_PVU, SR_RVU, SR_WVU, SR_EWU].iter().zip(state.update) {
                     if deadline.is_some() {
                         sr |= bit;
                     }
                 }
+                if state.ewif {
+                    sr |= SR_EWIF;
+                }
                 sr
             }
             0x10 if self.window => state.winr,
+            0x14 if self.variant == Variant::U5 => {
+                // `EWIC` is write-only and reads zero.
+                state.ewit | if state.ewie { EWCR_EWIE } else { 0 }
+            }
             _ => 0,
         }
     }
 
-    /// Write one register. Returns whether the machine is being reset.
-    fn write_register(&self, offset: u64, value: u32) -> bool {
+    /// Write one register. Returns whether the machine is being reset and
+    /// whether the early wakeup line may have moved.
+    fn write_register(&self, offset: u64, value: u32) -> (bool, bool) {
         let mut state = self.state.lock();
         let mut fired = false;
+        let mut irq = false;
         match offset {
             0x00 => {
                 match value & 0xffff {
@@ -445,7 +573,11 @@ impl Registers {
             }
             0x04 => {
                 if state.unlocked {
-                    state.pr = value & 0x7;
+                    state.pr = value
+                        & match self.variant {
+                            Variant::F4 => 0x7,
+                            Variant::U5 => 0xf,
+                        };
                     let at = state.tick + UPDATE_CYCLES;
                     state.update[0] = Some(at);
                 }
@@ -472,13 +604,26 @@ impl Registers {
                 state.counter = state.rlr;
                 state.prescale = 0;
             }
+            0x14 if self.variant == Variant::U5 => {
+                if value & EWCR_EWIC != 0 {
+                    state.ewif = false;
+                    irq = true;
+                }
+                if state.unlocked {
+                    state.ewit = value & EWCR_EWIT;
+                    state.ewie = value & EWCR_EWIE != 0;
+                    let at = state.tick + UPDATE_CYCLES;
+                    state.update[3] = Some(at);
+                    irq = true;
+                }
+            }
             _ => {}
         }
         if fired {
             state.started = false;
         }
         self.publish(&state);
-        fired
+        (fired, irq)
     }
 }
 
@@ -507,8 +652,12 @@ impl MemOps for Registers {
         }
         self.sync(attrs);
         let value = u32::from_le_bytes([*a, *b, *c, *d]);
-        if self.write_register(offset & !3, value) {
-            // Outside the critical section, as `pulse_reset` requires.
+        let (fired, irq) = self.write_register(offset & !3, value);
+        // Outside the critical section, as `pulse_reset` requires.
+        if irq {
+            self.refresh_irq();
+        }
+        if fired {
             self.pulse_reset();
         }
         Ok(())
@@ -543,17 +692,36 @@ impl Iwdg {
     pub fn new(props: &Props) -> Result<Iwdg> {
         let mut r = props.reader();
         let window = r.or("window", false)?;
+        let variant = match r.or_enum("variant", "f4", &["f4", "u5"])? {
+            "u5" => Variant::U5,
+            _ => Variant::F4,
+        };
         r.touch("clock");
         r.finish()?;
-        Ok(Iwdg::with_window(window))
+        Ok(match variant {
+            Variant::F4 => Iwdg::with_window(window),
+            Variant::U5 => Iwdg::u5(),
+        })
     }
 
     /// Build one directly — the route a test takes.
     #[must_use]
     pub fn with_window(window: bool) -> Iwdg {
+        Iwdg::assemble(window, Variant::F4)
+    }
+
+    /// Build a U5's: `WINR`, the four-bit `PR`, and `EWCR`.
+    #[must_use]
+    pub fn u5() -> Iwdg {
+        Iwdg::assemble(true, Variant::U5)
+    }
+
+    fn assemble(window: bool, variant: Variant) -> Iwdg {
         let regs = Arc::new(Registers {
-            state: Mutex::with_rank(LockRank::DEVICE, State::default()),
+            state: Mutex::with_rank(LockRank::DEVICE, State::fresh(variant)),
             window,
+            variant,
+            irq_out: Mutex::with_rank(LockRank::WIRE, None),
             frozen: AtomicBool::new(false),
             reset_out: Mutex::with_rank(LockRank::WIRE, None),
             lazy: Mutex::with_rank(LockRank::LEAF, None),
@@ -562,7 +730,7 @@ impl Iwdg {
         });
         let region = Arc::new(Region::io(
             "iwdg",
-            REGISTER_BYTES,
+            regs.register_bytes(),
             Arc::clone(&regs) as Arc<dyn MemOps>,
         ));
         Iwdg {
@@ -576,6 +744,18 @@ impl Iwdg {
     #[must_use]
     pub fn has_window(&self) -> bool {
         self.regs.window
+    }
+
+    /// Which register file this watchdog has.
+    #[must_use]
+    pub fn variant(&self) -> Variant {
+        self.regs.variant
+    }
+
+    /// Whether the early wakeup interrupt is pending (`u5`).
+    #[must_use]
+    pub fn early_wakeup(&self) -> bool {
+        self.regs.state.lock().ewif
     }
 
     /// Whether `0xCCCC` has started the counter.
@@ -631,11 +811,14 @@ impl Device for Iwdg {
         // architectural state but this device's cursor in its own clock
         // domain, and the domain does not rewind because a chip on it was
         // reset.
-        let mut state = self.regs.state.lock();
-        let tick = state.tick;
-        *state = State::default();
-        state.tick = tick;
-        self.regs.publish(&state);
+        {
+            let mut state = self.regs.state.lock();
+            let tick = state.tick;
+            *state = State::fresh(self.regs.variant);
+            state.tick = tick;
+            self.regs.publish(&state);
+        }
+        self.regs.refresh_irq();
     }
 
     fn save(&self, w: &mut ChunkWriter<'_>) -> Result<()> {
@@ -651,14 +834,25 @@ impl Device for Iwdg {
         // and without this the two would disagree and the next catch-up would
         // advance the counter by however long the machine had been running.
         w.write_u64(state.tick)?;
-        for deadline in state.update {
+        // Three deadlines on an F4, as ever; a `u5` adds `EWU`'s and `EWCR`
+        // after them.
+        let deadlines = match self.regs.variant {
+            Variant::F4 => 3,
+            Variant::U5 => 4,
+        };
+        for deadline in &state.update[..deadlines] {
             match deadline {
                 None => w.write_bool(false)?,
                 Some(at) => {
                     w.write_bool(true)?;
-                    w.write_u64(at)?;
+                    w.write_u64(*at)?;
                 }
             }
+        }
+        if self.regs.variant == Variant::U5 {
+            w.write_u32(state.ewit)?;
+            w.write_bool(state.ewie)?;
+            w.write_bool(state.ewif)?;
         }
         Ok(())
         // `frozen` is absent on purpose: it is the debug unit's state, not the
@@ -675,12 +869,29 @@ impl Device for Iwdg {
             counter: r.read_u32()?,
             prescale: r.read_u32()?,
             tick: r.read_u64()?,
-            update: [None; 3],
+            ..State::fresh(self.regs.variant)
         };
-        for deadline in &mut state.update {
+        let deadlines = match self.regs.variant {
+            Variant::F4 => 3,
+            Variant::U5 => 4,
+        };
+        for deadline in &mut state.update[..deadlines] {
             *deadline = r.read_bool()?.then(|| r.read_u64()).transpose()?;
         }
-        if state.pr > 7 || state.rlr > COUNTER_MAX || state.counter > COUNTER_MAX {
+        if self.regs.variant == Variant::U5 {
+            state.ewit = r.read_u32()?;
+            state.ewie = r.read_bool()?;
+            state.ewif = r.read_bool()?;
+        }
+        let pr_max = match self.regs.variant {
+            Variant::F4 => 7,
+            Variant::U5 => 15,
+        };
+        if state.pr > pr_max
+            || state.rlr > COUNTER_MAX
+            || state.counter > COUNTER_MAX
+            || state.ewit > EWCR_EWIT
+        {
             return Err(Error::State(format!(
                 "snapshot has an IWDG with PR={}, RLR={}, counter={}",
                 state.pr, state.rlr, state.counter
@@ -693,9 +904,12 @@ impl Device for Iwdg {
                 state.divider()
             )));
         }
-        let mut live = self.regs.state.lock();
-        *live = state;
-        self.regs.publish(&live);
+        {
+            let mut live = self.regs.state.lock();
+            *live = state;
+            self.regs.publish(&live);
+        }
+        self.regs.refresh_irq();
         Ok(())
     }
 
@@ -704,14 +918,28 @@ impl Device for Iwdg {
     }
 
     fn connect(&self, port: &str, source: WireSource) -> Result<()> {
-        if port != "reset" {
-            return Err(Error::Config {
-                at: String::from(port),
-                message: String::from("an IWDG drives one pin, `reset`"),
-            });
+        match port {
+            "reset" => *self.regs.reset_out.lock() = Some(source),
+            IRQ_PIN if self.regs.variant == Variant::U5 => {
+                *self.regs.irq_out.lock() = Some(source);
+                self.regs.refresh_irq();
+            }
+            _ => {
+                return Err(Error::Config {
+                    at: String::from(port),
+                    message: String::from(
+                        "an IWDG drives `reset`, and on a `u5` the early wakeup `irq`",
+                    ),
+                });
+            }
         }
-        *self.regs.reset_out.lock() = Some(source);
         Ok(())
+    }
+
+    fn announce(&self, port: &str) {
+        if port == IRQ_PIN {
+            self.regs.refresh_irq();
+        }
     }
 
     fn sink(&self, port: &str, sources: &[WireId]) -> Option<SinkPin> {
@@ -757,12 +985,20 @@ pub static CLASS: DeviceClass = DeviceClass {
     name: CLASS_NAME,
     version: STATE_VERSION,
     summary: "STM32 independent watchdog: the LSI down-counter, its key register and its window",
-    properties: &[PropertySpec {
-        name: "window",
-        kind: ValueKind::Bool,
-        required: false,
-        summary: "whether the part has WINR (an F4 has not; an F0/F3/F7/L0/L4 has)",
-    }],
+    properties: &[
+        PropertySpec {
+            name: "window",
+            kind: ValueKind::Bool,
+            required: false,
+            summary: "whether the part has WINR (an F4 has not; an F0/F3/F7/L0/L4 has)",
+        },
+        PropertySpec {
+            name: "variant",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "register file: f4 (default) or u5 (WINR, four-bit PR, EWCR and the irq pin)",
+        },
+    ],
     construct: |props| Ok(Box::new(Iwdg::new(props)?)),
 };
 
@@ -789,9 +1025,12 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
 pub fn schema() -> ClassSchema {
     ClassSchema::new(CLASS_NAME)
         .prop(PropSchema::new("window", ValueKind::Bool))
+        .prop(PropSchema::new("variant", ValueKind::Str).values(&["f4", "u5"]))
         .region("")
         .region("regs")
         .port("reset", PortDir::Out)
+        // The early wakeup, `u5` only: `IWDG_IRQn` (27) on a U5.
+        .port(IRQ_PIN, PortDir::Out)
         .port("freeze", PortDir::In)
 }
 
@@ -886,6 +1125,145 @@ mod tests {
         poke(d, 0x04, pr);
         poke(d, 0x08, rlr);
         poke(d, 0x00, KEY_START);
+    }
+
+    // -- the u5 variant ------------------------------------------------------
+
+    /// Follows the level of the early wakeup line.
+    #[derive(Debug, Default)]
+    struct Level1 {
+        high: AtomicU32,
+    }
+
+    impl WireSink for Level1 {
+        fn set_level(&self, _src: WireId, _line: u32, level: Level) {
+            self.high
+                .store(u32::from(level.is_high()), Ordering::Relaxed);
+        }
+    }
+
+    fn watch_irq(d: &Iwdg) -> Arc<Level1> {
+        let ids = WireIdAllocator::new();
+        let id = ids.alloc();
+        let probe = Arc::new(Level1::default());
+        let wire = Wire::builder()
+            .source(id)
+            .sink(Arc::clone(&probe) as Arc<dyn WireSink>, 0)
+            .build_shared();
+        Device::connect(d, IRQ_PIN, WireSource::new(wire, id)).expect("a u5 has irq");
+        probe
+    }
+
+    #[test]
+    fn the_u5_hal_init_sequence_completes() {
+        // `HAL_IWDG_Init`: start, unlock, PR, RLR, EWCR, poll SR for all four
+        // update flags, then WINR (which reloads).
+        let d = Iwdg::u5();
+        assert_eq!(d.region.len(), REGISTER_BYTES_U5);
+        poke(&d, 0x00, KEY_START);
+        poke(&d, 0x00, KEY_UNLOCK);
+        poke(&d, 0x04, 0x8); // /1024
+        poke(&d, 0x08, 0xfff);
+        poke(&d, 0x14, EWCR_EWIE | EWCR_EWIC | 0x100);
+        assert_eq!(peek(&d, 0x0c), SR_PVU | SR_RVU | SR_EWU);
+        d.advance_to(d.tick() + UPDATE_CYCLES);
+        assert_eq!(peek(&d, 0x0c), 0, "the poll ends");
+        assert_eq!(peek(&d, 0x04), 0x8, "four bits of PR");
+        assert_eq!(peek(&d, 0x14), EWCR_EWIE | 0x100, "EWIC reads zero");
+        poke(&d, 0x10, 0xfff);
+        assert_eq!(d.counter(), 0xfff);
+        // /1024 per decrement.
+        d.advance_to(d.tick() + 1024);
+        assert_eq!(d.counter(), 0xffe);
+    }
+
+    #[test]
+    fn the_u5_early_wakeup_fires_at_ewit_and_ewic_clears_it() {
+        let d = Iwdg::u5();
+        let irq = watch_irq(&d);
+        let reset = watch(&d);
+        poke(&d, 0x00, KEY_UNLOCK);
+        poke(&d, 0x14, EWCR_EWIE | 0x10);
+        poke(&d, 0x08, 0x20);
+        poke(&d, 0x00, KEY_START);
+        // From 0x20 to 0x10 is sixteen decrements of four cycles; the event
+        // is published, so a scheduler lands on it exactly.
+        let start = d.tick();
+        // `EWU` clears first.
+        assert_eq!(Device::next_event_tick(&d), Some(start + UPDATE_CYCLES));
+        d.advance_to(start + UPDATE_CYCLES);
+        assert_eq!(Device::next_event_tick(&d), Some(start + 16 * 4));
+        d.advance_to(start + 16 * 4 - 1);
+        assert!(!d.early_wakeup());
+        d.advance_to(start + 16 * 4);
+        assert!(d.early_wakeup());
+        assert_eq!(peek(&d, 0x0c) & SR_EWIF, SR_EWIF);
+        assert_eq!(irq.high.load(Ordering::Relaxed), 1);
+        // The handler acknowledges with the registers locked.
+        poke(&d, 0x14, EWCR_EWIC);
+        assert!(!d.early_wakeup());
+        assert_eq!(irq.high.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            peek(&d, 0x14),
+            EWCR_EWIE | 0x10,
+            "the lock kept EWIT and EWIE"
+        );
+        // And the reset still comes when nobody kicks.
+        d.advance_to(start + 0x21 * 4);
+        assert_eq!(resets(&reset), 1);
+
+        // Without EWIE, no flag.
+        let quiet = Iwdg::u5();
+        poke(&quiet, 0x00, KEY_UNLOCK);
+        poke(&quiet, 0x14, 0x10);
+        poke(&quiet, 0x08, 0x20);
+        poke(&quiet, 0x00, KEY_START);
+        quiet.advance_to(quiet.tick() + 20 * 4);
+        assert!(!quiet.early_wakeup());
+
+        // An F4 has neither the register nor the pin.
+        assert_eq!(peek(&iwdg(), 0x14), 0);
+        assert!(Device::connect(&iwdg(), IRQ_PIN, watch_source()).is_err());
+    }
+
+    #[test]
+    fn a_u5_snapshot_round_trips_to_identical_state() {
+        let saved = Iwdg::u5();
+        poke(&saved, 0x00, KEY_UNLOCK);
+        poke(&saved, 0x04, 0xa);
+        poke(&saved, 0x14, EWCR_EWIE | 0xff0);
+        poke(&saved, 0x00, KEY_START);
+        saved.advance_to(saved.tick() + 20_000);
+        assert!(saved.early_wakeup());
+
+        let mut shape = MachineShape::new();
+        shape.add_device("iwdg", CLASS_NAME).unwrap();
+        let mut w = StateWriter::new(shape);
+        {
+            let mut chunk = w.chunk("iwdg", CLASS_NAME, STATE_VERSION).unwrap();
+            Device::save(&saved, &mut chunk).unwrap();
+        }
+        let bytes = w.to_vec().unwrap();
+        let restored = Iwdg::u5();
+        let reader = StateReader::new(&bytes).unwrap();
+        let chunk = reader
+            .load("iwdg", CLASS_NAME, STATE_VERSION, &Migrations::new())
+            .unwrap();
+        Device::load(&restored, &mut chunk.reader()).unwrap();
+        let before = *saved.regs.state.lock();
+        let after = *restored.regs.state.lock();
+        assert_eq!(after, before);
+        assert_eq!(
+            Iwdg::new(&Props::new().with("variant", Value::from("u5")))
+                .unwrap()
+                .variant(),
+            Variant::U5
+        );
+    }
+
+    fn watch_source() -> WireSource {
+        let id = WireId::new(3);
+        WireSource::new(Wire::builder().source(id).build_shared(), id)
     }
 
     #[test]
@@ -1261,7 +1639,8 @@ mod tests {
         let schema = schema();
         assert!(schema.port_named("reset").is_some());
         assert!(schema.port_named("freeze").is_some());
-        assert!(schema.port_named("irq").is_none());
+        // The schema has the `u5`'s early wakeup pin; an F4 refuses it.
+        assert!(schema.port_named("irq").is_some());
         assert!(Device::sink(&d, "freeze", &[WireId::new(1)]).is_some());
         assert!(Device::connect(&d, "irq", dummy_source()).is_err());
         assert!(Device::region(&d, "").is_some());
