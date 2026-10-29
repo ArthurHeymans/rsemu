@@ -118,8 +118,10 @@ impl ExitReason {
     /// The core has nothing to do until something outside it happens — `wfi`,
     /// `hlt`.
     ///
-    /// Reserved for §10's accel backends; no interpreter in this crate raises
-    /// it yet, and a level-3 guest has no interrupt that could end the wait.
+    /// Raised by §10's accel backends and by the x86 interpreter, which both
+    /// leave the program counter *past* the `hlt` with [`Exit::len`] zero —
+    /// the halt is the host's to wait out, since a level-3 guest has no
+    /// interrupt that could end it.
     pub const HALT: ExitReason = ExitReason(4);
 
     /// An access the execution engine cannot perform itself and wants the

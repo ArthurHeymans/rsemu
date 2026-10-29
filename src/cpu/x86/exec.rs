@@ -93,11 +93,13 @@
 
 use alloc::vec::Vec;
 
+use crate::core::exec::{Access as ExitAccess, Exit, ExitReason};
 use crate::core::sched::TickCursor;
 use crate::core::space::{AddressSpace, MemAttrs};
 use crate::core::value::Width;
 
 use super::fpu::{Sse, X87};
+use super::hostexit::{FaultDetail, HostExits};
 use super::isa::{self, Arg, Bits, Fields, Op, Rep, seg};
 use super::paging::{self, Tlb};
 use super::prot::{self, Sys, cr0};
@@ -365,6 +367,13 @@ pub(super) struct State {
     /// charged against the next budget instead. Architectural, because a
     /// restored machine that forgot its debt runs one instruction free.
     pub debt: u64,
+    /// The linear address of the host breakpoint this core last stopped at,
+    /// which the next instruction to start executes through rather than
+    /// stopping on again. See `Exec::host_breakpoint`.
+    ///
+    /// Not architectural and not in the snapshot: it belongs to the host's
+    /// breakpoints, which are configuration rather than state.
+    pub break_resume: Option<u64>,
 }
 
 impl State {
@@ -440,6 +449,7 @@ impl State {
             faults: 0,
             last_fault: 0,
             debt: 0,
+            break_resume: None,
         }
     }
 }
@@ -506,6 +516,20 @@ pub(super) struct Exec<'a> {
     /// instruction** under the interpreter, so every field it carries is copied
     /// on every one of them, and a niche-optimised reference is one word.
     pub(super) position: Option<&'a Position>,
+    /// What the host asked to see, or `None` when it asked nothing — which is
+    /// the common case and the reason this is an `Option`: every check below
+    /// is one predictable branch on it. See [`Exec::with_host`].
+    pub(super) host: Option<&'a HostExits>,
+    /// The exit this borrow produced, for the run loop to collect.
+    pub(super) exit: Option<Exit>,
+    /// The decoded length of the instruction in flight, prefixes included, or
+    /// zero while it is still being fetched — which is how a fault exit tells
+    /// a fetch fault from a data one.
+    pub(super) insn_len: u8,
+    /// `CR2` as it stood when this borrow began, put back by a `#PF` that
+    /// leaves the core: latching it is part of *delivering* a page fault, and
+    /// a fault the host takes is not delivered.
+    pub(super) cr2_entry: u64,
 }
 
 /// Where this core publishes its position (`core::sched::TickCursor`), and
@@ -604,6 +628,7 @@ impl<'a> Exec<'a> {
     ) -> Exec<'a> {
         let attrs = MemAttrs::DEFAULT.with_requester(cfg.requester);
         let entry = state.regs;
+        let cr2_entry = state.sys.cr2;
         Exec {
             state,
             mem,
@@ -620,7 +645,153 @@ impl<'a> Exec<'a> {
             wrote_n: 0,
             wrote_over: false,
             position: None,
+            host: None,
+            exit: None,
+            insn_len: 0,
+            cr2_entry,
         }
+    }
+
+    /// Lend this borrow what the host has armed (`core::exec`, issue #35).
+    ///
+    /// Attached only when something *is* armed, so that a core nobody asked
+    /// anything of runs exactly the code it ran before this existed, plus one
+    /// test of a `None` per instruction.
+    pub(super) fn with_host(mut self, host: &'a HostExits) -> Exec<'a> {
+        if host.active() {
+            self.host = Some(host);
+        }
+        self
+    }
+
+    /// Whether `reason` leaves the core rather than being taken by the guest.
+    #[inline]
+    pub(super) fn exits(&self, reason: ExitReason) -> bool {
+        self.host.is_some_and(|host| host.exits(reason))
+    }
+
+    /// The linear address the next instruction will be fetched from.
+    ///
+    /// The address [`Exec::fetch_at`] reaches for its first byte, computed
+    /// without fetching, checking a limit or translating anything — so asking
+    /// it has no effect a guest could see.
+    pub(super) fn fetch_linear(&self) -> u64 {
+        let rip = self.state.regs.rip;
+        if self.legacy() {
+            return linear(self.state.regs.cs, rip as u16);
+        }
+        if self.sixty_four() {
+            return rip;
+        }
+        self.state.sys.seg(seg::CS).base.wrapping_add(rip) & 0xffff_ffff
+    }
+
+    /// Stop at a host-armed breakpoint, if the next instruction starts on one
+    /// (issue #36).
+    ///
+    /// Checked where `Exec::step` is about to begin an instruction — after the
+    /// interrupt check, so an interrupt pending at a breakpoint is taken first
+    /// and the breakpoint fires when the handler returns to it, which is the
+    /// ordering the hardware's own instruction breakpoints have: reported
+    /// before the instruction executes (*Intel SDM* volume 3 §17.3.1.1).
+    ///
+    /// # Resuming
+    ///
+    /// The core stops *at* the instruction, with nothing fetched and nothing
+    /// charged. Resuming executes it: the stop records its address in
+    /// `State::break_resume`, and the next instruction to **start** consumes
+    /// that record — executing through the breakpoint if it is at the recorded
+    /// address, checking normally if it is anywhere else. It is gdb's
+    /// step-over-breakpoint, without the disarm and re-arm. So a consumer that
+    /// resumes runs the instruction once and stops on the next visit; one that
+    /// moved the program counter first is not exempted anywhere; and an
+    /// interrupt taken before the instruction does not use the exemption up,
+    /// because delivering one starts no instruction.
+    fn host_breakpoint(&mut self) -> bool {
+        let Some(host) = self.host else {
+            return false;
+        };
+        if !host.has_breaks() {
+            return false;
+        }
+        let at = self.fetch_linear();
+        if self.state.break_resume.take() == Some(at) || !host.breaks_at(at) {
+            return false;
+        }
+        self.state.break_resume = Some(at);
+        self.exit = Some(
+            Exit::new(ExitReason::BREAKPOINT, self.state.regs.rip, 0)
+                .with_access(at, ExitAccess::Execute),
+        );
+        true
+    }
+
+    /// Leave the core *past* the instruction just decoded, with none of its
+    /// architectural effect: `SYSCALL`, `SYSENTER`, and `INT n` for a vector
+    /// the host selected.
+    ///
+    /// The fetch has already moved `RIP` past it, which is the resume point
+    /// `core::exec` asks for. The prefetch queue is flushed because the host
+    /// is about to read and write the state it stopped in, memory included,
+    /// and an 8086's queue would otherwise hold bytes fetched before it did.
+    pub(super) fn syscall_exit(&mut self, f: &Fields) {
+        self.state.queue.flush();
+        self.exit = Some(Exit::new(ExitReason::SYSCALL, self.start_ip, f.len));
+    }
+
+    /// Leave the core *at* `INT3` or `ICEBP`, as `core::exec` has a
+    /// breakpoint instruction do.
+    ///
+    /// The resume point is the instruction itself, so resuming without
+    /// stepping over it — `set_pc(exit.pc + exit.len)` — stops again. That is
+    /// the contract the other cores' `BRK` and `ebreak` keep, and the opposite
+    /// of what the architecture pushes for a delivered `INT3`, which is the
+    /// address *after* it.
+    pub(super) fn breakpoint_exit(&mut self, f: &Fields) {
+        self.state.regs.rip = self.start_ip;
+        self.state.queue.flush();
+        self.exit = Some(Exit::new(ExitReason::BREAKPOINT, self.start_ip, f.len));
+    }
+
+    /// Hand `fault` to the host instead of the guest's interrupt table.
+    ///
+    /// The state is the one a delivered fault would have *pushed*: the
+    /// register file as the instruction found it, so `RIP` names the
+    /// instruction and resuming re-executes it. A `REP` string instruction
+    /// keeps the iterations it completed (`Exec::string`), exactly as the
+    /// architecture restarts one. **On every part**, the 8086 included: its
+    /// divide error pushes the address after the divide, but an exit reports
+    /// where the instruction is, which is what a consumer needs to decode or
+    /// skip it.
+    ///
+    /// Nothing about delivery happens — no frame, no `CR2`. The faulting
+    /// address of a `#PF` goes to [`Exit::address`] instead, and the access to
+    /// [`Exit::access`]: `Execute` when the instruction had not finished
+    /// decoding, otherwise the error code's write bit decides. `len` is the
+    /// instruction's length where it is known and zero where the fault came
+    /// before decoding finished.
+    pub(super) fn fault_exit(&mut self, fault: Fault, len: u8) {
+        self.state.regs = self.entry;
+        self.state.queue.flush();
+        let detail = FaultDetail {
+            vector: fault.vector,
+            error: fault.error,
+        };
+        let mut exit =
+            Exit::new(ExitReason::FAULT, self.state.regs.rip, len).with_detail(detail.to_detail());
+        if fault.vector == VEC_PF {
+            let address = self.state.sys.cr2;
+            self.state.sys.cr2 = self.cr2_entry;
+            let access = if len == 0 {
+                ExitAccess::Execute
+            } else if fault.error.unwrap_or(0) & paging::pf::WRITE != 0 {
+                ExitAccess::Write
+            } else {
+                ExitAccess::Read
+            };
+            exit = exit.with_access(address, access);
+        }
+        self.exit = Some(exit);
     }
 
     /// Lend this borrow the cursor the scheduler wired into this core, so that
@@ -900,11 +1071,19 @@ impl<'a> Exec<'a> {
             return 0;
         }
 
+        if self.host.is_some() && self.host_breakpoint() {
+            return self.used;
+        }
+
         // `TF` is sampled before the instruction runs, which is why a `POPF`
         // that sets it does not trap on itself.
         let trap = self.flag(flags::TF) && !shadow;
         self.state.int_shadow = false;
         if let Err(fault) = self.instruction() {
+            if self.exits(ExitReason::FAULT) {
+                self.fault_exit(fault, self.insn_len);
+                return self.used;
+            }
             // The register file is rolled back first: `CS:EIP` must name the
             // faulting instruction, not the point inside it where the fault
             // was noticed. That is what makes a page fault restartable.
@@ -924,7 +1103,9 @@ impl<'a> Exec<'a> {
             self.deliver(fault);
             return self.used;
         }
-        if trap && !self.state.int_shadow {
+        // An instruction that left the core is the host's to finish, single
+        // step included.
+        if trap && !self.state.int_shadow && self.exit.is_none() {
             self.charge(Op::INT.clocks());
             // A single-step trap fires *after* the instruction, so the state
             // it saves is the state the instruction produced.
@@ -1800,6 +1981,7 @@ impl<'a> Exec<'a> {
     fn instruction(&mut self) -> Ex<()> {
         self.entry = self.state.regs;
         self.start_ip = self.state.regs.rip;
+        self.insn_len = 0;
         self.fill_queue()?;
         let map = self.variant().map();
         let bits = self.code_bits();
@@ -1825,6 +2007,7 @@ impl<'a> Exec<'a> {
         if let Some(fault) = fetch_fault {
             return Err(fault);
         }
+        self.insn_len = fields.len;
         // An instruction longer than fifteen bytes is not an instruction: the
         // 386 raises #GP rather than executing an arbitrarily long prefix run.
         if !self.legacy() && fields.len > 15 {
@@ -2239,7 +2422,20 @@ impl<'a> Exec<'a> {
             Op::RDMSR => self.rdmsr()?,
             Op::RDTSC => self.rdtsc()?,
             Op::WRMSR => self.wrmsr()?,
+            // With the host taking system calls, `SYSCALL` is the host's
+            // entry point rather than the kernel's: none of `LSTAR`, `STAR`,
+            // `RCX`, `R11`, `RFLAGS`, `CS` or `SS` is touched — and nor is the
+            // `EFER.SCE` check, which asks whether a *guest* kernel has set up
+            // the entry point the host is replacing. The decode still decides:
+            // outside 64-bit mode this encoding is `#UD` and never gets here.
+            Op::SYSCALL if self.exits(ExitReason::SYSCALL) => self.syscall_exit(f),
             Op::SYSCALL => self.syscall()?,
+            // `SYSENTER` exists only as an exit. The instruction itself — its
+            // three model-specific registers and `CPUID`'s `SEP` bit — is not
+            // modelled, so a guest that executes it architecturally gets the
+            // `#UD` of a part without it (*Intel SDM* volume 2, `SYSENTER`).
+            Op::SYSENTER if self.exits(ExitReason::SYSCALL) => self.syscall_exit(f),
+            Op::SYSENTER => return Err(Fault::bare(VEC_UD)),
             Op::SYSRET => self.sysret(f.opsize)?,
             Op::SWAPGS => self.swapgs()?,
             // A non-temporal store of a general register: `MOV m, r` at four
@@ -2513,6 +2709,16 @@ impl<'a> Exec<'a> {
                 if self.protected() && self.cpl() != 0 {
                     return Err(Fault::gp(0));
                 }
+                // A halt the host takes is the host's to wait out: the core
+                // stands past the `HLT` and is not left halted, so resuming
+                // runs the next instruction. That is what a KVM vCPU does on
+                // `KVM_EXIT_HLT`, and `accel::kvm` reports it the same way —
+                // `pc` the resume point, `len` zero.
+                if self.exits(ExitReason::HALT) {
+                    self.state.queue.flush();
+                    self.exit = Some(Exit::new(ExitReason::HALT, self.state.regs.rip, 0));
+                    return Ok(());
+                }
                 self.state.halted = true;
             }
             Op::ESC => self.escape(f)?,
@@ -2589,6 +2795,16 @@ impl<'a> Exec<'a> {
                 self.return_far(f.opsize, extra)?;
             }
             Op::IRET => self.iret(f.opsize)?,
+            Op::INT
+                if self.exits(ExitReason::SYSCALL)
+                    && self.host.is_some_and(|h| h.vectors.contains(f.imm as u8)) =>
+            {
+                // A vector the host selected bypasses the guest's table
+                // entirely — the gate's privilege check and virtual-8086
+                // mode's `IOPL` check below included, because both decide
+                // whether the *guest's* handler may be reached.
+                self.syscall_exit(f);
+            }
             Op::INT => {
                 // `INT n` is one of the six instructions virtual-8086 mode
                 // makes `IOPL`-sensitive (*Intel SDM* Vol 3A §20.2.7). Below
@@ -2603,6 +2819,9 @@ impl<'a> Exec<'a> {
                 let vector = f.imm as u8;
                 self.software_interrupt(vector)?;
             }
+            Op::INT3 | Op::ICEBP if self.exits(ExitReason::BREAKPOINT) => {
+                self.breakpoint_exit(f);
+            }
             Op::INT3 => self.software_interrupt(VEC_BREAKPOINT)?,
             Op::ICEBP => {
                 // The undocumented one-byte `INT 1`. It is a *trap*, not a
@@ -2611,7 +2830,14 @@ impl<'a> Exec<'a> {
                 self.take_interrupt(VEC_DEBUG, None)?;
             }
             Op::INTO => {
-                if self.flag(flags::OF) {
+                // A taken `INTO` is `INT 4` as far as the host's vector set is
+                // concerned; an untaken one does nothing either way.
+                if self.flag(flags::OF)
+                    && self.exits(ExitReason::SYSCALL)
+                    && self.host.is_some_and(|h| h.vectors.contains(VEC_OVERFLOW))
+                {
+                    self.syscall_exit(f);
+                } else if self.flag(flags::OF) {
                     self.software_interrupt(VEC_OVERFLOW)?;
                 }
             }

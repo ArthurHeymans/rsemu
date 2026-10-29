@@ -5132,6 +5132,547 @@ mod long_mode {
         };
         assert!(impossible.validate().is_err(), "long mode needs PAE");
     }
+
+    /// Exits to the host (issues #35 and #36): the level-3 seam on this core,
+    /// on every engine it has.
+    ///
+    /// Inside `long_mode` because half of these need its bring-up and its
+    /// identity map; the flat 32-bit half uses `Pc::start_protected` like the
+    /// rest of the file.
+    mod host_exits {
+        use super::*;
+        use crate::core::exec::{Access as ExitAccess, Exit, ExitMask, ExitReason, ExitingCore};
+        use crate::core::sched::Budget;
+        use crate::cpu::x86::{Engine, FaultDetail, VectorSet};
+
+        /// Every engine this build has. The interpreter is the oracle; the
+        /// translating engines must stop on the same instruction with the same
+        /// state, which is the property `Engine` promises.
+        fn engines() -> Vec<Engine> {
+            #[allow(unused_mut)]
+            let mut all = alloc::vec![Engine::Interp];
+            #[cfg(all(feature = "cpu-x86-lift", feature = "jit"))]
+            all.extend([Engine::Jit, Engine::JitHost]);
+            all
+        }
+
+        impl Pc {
+            /// [`Pc::new`] on a chosen engine.
+            fn on(variant: Variant, engine: Engine) -> Pc {
+                let pc = Pc::new(variant);
+                let cpu = X86::new(
+                    Config::default()
+                        .with_variant(variant)
+                        .with_features(variant.features()),
+                )
+                .with_engine(engine);
+                cpu.attach_space(pc.cpu.space().expect("a memory space"));
+                cpu.attach_io_space(pc.cpu.io_space().expect("an I/O space"));
+                Pc {
+                    cpu: Arc::new(cpu),
+                    ..pc
+                }
+            }
+
+            /// Flat 32-bit protected mode at `at::CODE0`, running `code`.
+            fn flat32(engine: Engine, code: &[u8]) -> Pc {
+                let pc = Pc::on(Variant::X86_64, engine);
+                pc.start_protected();
+                pc.write(at::CODE0, code);
+                pc
+            }
+
+            /// 64-bit mode reached by the guest's own bring-up, then `code` at
+            /// `la::CODE64`. The bring-up raises nothing, so a mask armed
+            /// before it changes nothing about it.
+            fn long64(engine: Engine, code: &[u8]) -> Pc {
+                let pc = Pc::on(Variant::X86_64, engine);
+                pc.start_protected();
+                pc.prepare_long();
+                pc.write(at::CODE0, &enter_long_mode_code(la::CODE64));
+                pc.write(la::CODE64, code);
+                pc
+            }
+
+            fn exit(&self, budget: u64) -> Option<Exit> {
+                self.cpu.run_to_exit(Budget::of(budget)).exit
+            }
+        }
+
+        // ---- SYSCALL -----------------------------------------------------
+
+        #[test]
+        fn syscall_exits_to_the_host_with_rip_past_the_instruction() {
+            for engine in engines() {
+                // mov eax, 60 ; syscall ; hlt
+                let pc = Pc::long64(engine, &[0xb8, 60, 0, 0, 0, 0x0f, 0x05, 0xf4]);
+                pc.cpu
+                    .set_exit_mask(ExitMask::NONE.with(ExitReason::SYSCALL));
+                // A guest kernel's entry point, armed, so that a delivered
+                // `SYSCALL` would have somewhere to go and visibly go there.
+                let mut sys = pc.cpu.sys();
+                sys.efer |= efer::SCE;
+                sys.star = 0x0028u64 << 32;
+                sys.lstar = la::HANDLER;
+                pc.cpu.set_sys(sys);
+                let exit = pc.exit(100_000).expect("an exit");
+                assert_eq!(exit.reason, ExitReason::SYSCALL, "{engine:?}");
+                assert_eq!(exit.pc, la::CODE64 + 5, "the syscall's own address");
+                assert_eq!(exit.len, 2);
+                assert_eq!(exit.resume_pc(), la::CODE64 + 7);
+                let regs = pc.cpu.regs();
+                assert_eq!(regs.rax, 60, "the ABI registers are the host's to read");
+                assert_eq!(regs.rip, la::CODE64 + 7, "and the core is past it");
+                // The bring-up left `ECX` naming `IA32_EFER` for its
+                // `RDMSR`/`WRMSR` pair; a real `SYSCALL` would overwrite it with
+                // the return address and `R11` with the flags.
+                assert_eq!(regs.rcx, u64::from(msr::EFER), "RCX untouched");
+                assert_eq!(regs.r[3], 0, "R11 untouched");
+                assert_eq!((regs.cs, regs.ss), (0x18, 0x10), "no STAR selectors");
+                let after = pc.cpu.sys();
+                assert_eq!(after.seg(isa::seg::CS).selector, 0x18);
+                assert!(after.sixty_four(), "still in the same code segment");
+
+                // The host writes a result and resumes; the guest carries on.
+                pc.cpu.set_reg(Reg::Rax, 7);
+                assert!(pc.exit(1_000).is_none(), "the hlt is not an exit");
+                assert!(pc.cpu.is_halted());
+                assert_eq!(pc.cpu.reg(Reg::Rax), 7);
+            }
+        }
+
+        #[test]
+        fn sysenter_is_a_system_call_exit_and_otherwise_undefined() {
+            for engine in engines() {
+                // sysenter ; hlt
+                let pc = Pc::flat32(engine, &[0x0f, 0x34, 0xf4]);
+                pc.cpu.set_exit_mask(ExitMask::USER);
+                let exit = pc.exit(1_000).expect("an exit");
+                assert_eq!(exit.reason, ExitReason::SYSCALL, "{engine:?}");
+                assert_eq!((exit.pc, exit.len), (at::CODE0, 2));
+                assert_eq!(pc.cpu.regs().rip, at::CODE0 + 2);
+
+                // With only faults asked for, it is the `#UD` of a part that
+                // does not implement it.
+                let pc = Pc::flat32(engine, &[0x0f, 0x34, 0xf4]);
+                pc.cpu.set_exit_mask(ExitMask::NONE.with(ExitReason::FAULT));
+                let exit = pc.exit(1_000).expect("an exit");
+                assert_eq!(exit.reason, ExitReason::FAULT);
+                assert_eq!(FaultDetail::from_detail(exit.detail).vector, 6);
+            }
+        }
+
+        /// An `IDT` gate for `vector` at `handler`, which stores `0xAA` at
+        /// `at::MARK` and halts.
+        fn mark_handler(pc: &Pc, vector: u8, handler: u64) {
+            pc.idt(
+                u64::from(vector),
+                gate(0x08, handler as u32, sys_type::INT_GATE32, 3),
+            );
+            // mov byte [MARK], 0xaa ; hlt
+            let mut code = alloc::vec![0xc6, 0x05];
+            code.extend_from_slice(&(at::MARK as u32).to_le_bytes());
+            code.extend_from_slice(&[0xaa, 0xf4]);
+            pc.write(handler, &code);
+        }
+
+        #[test]
+        fn a_selected_int_vector_exits_and_an_unselected_one_takes_the_idt() {
+            for engine in engines() {
+                // mov eax, 4 ; int 0x80 ; int 0x81 ; hlt
+                let code = [0xb8, 4, 0, 0, 0, 0xcd, 0x80, 0xcd, 0x81, 0xf4];
+                let pc = Pc::flat32(engine, &code);
+                mark_handler(&pc, 0x80, at::CODE0 + 0x100);
+                mark_handler(&pc, 0x81, at::CODE0 + 0x200);
+                pc.cpu.set_exit_mask(ExitMask::USER);
+                pc.cpu
+                    .set_syscall_vectors(VectorSet::NONE.with(0x80).with(0x21));
+                assert_eq!(
+                    pc.cpu.syscall_vectors(),
+                    VectorSet::NONE.with(0x80).with(0x21)
+                );
+                let sp = pc.cpu.regs().rsp;
+
+                let exit = pc.exit(1_000).expect("int 0x80 exits");
+                assert_eq!(exit.reason, ExitReason::SYSCALL, "{engine:?}");
+                assert_eq!((exit.pc, exit.len), (at::CODE0 + 5, 2));
+                assert_eq!(pc.cpu.regs().rip, at::CODE0 + 7);
+                assert_eq!(pc.cpu.regs().rsp, sp, "no frame was pushed");
+                assert_eq!(pc.ram.read_u8(at::MARK).unwrap(), 0, "no handler ran");
+
+                // `INT 0x81` is not in the set: through the guest's table.
+                assert!(pc.exit(1_000).is_none());
+                assert_eq!(pc.ram.read_u8(at::MARK).unwrap(), 0xaa, "the handler ran");
+                assert_eq!(pc.cpu.regs().rsp, sp - 12, "on an interrupt frame");
+            }
+        }
+
+        #[test]
+        fn an_empty_mask_keeps_architectural_delivery() {
+            for engine in engines() {
+                // int 0x80 ; hlt — with the vector selected but no mask.
+                let pc = Pc::flat32(engine, &[0xcd, 0x80, 0xf4]);
+                mark_handler(&pc, 0x80, at::CODE0 + 0x100);
+                pc.cpu.set_syscall_vectors(VectorSet::ALL);
+                assert!(pc.exit(1_000).is_none(), "{engine:?}");
+                assert_eq!(pc.ram.read_u8(at::MARK).unwrap(), 0xaa);
+                assert_eq!(pc.cpu.exit_mask(), ExitMask::NONE);
+            }
+        }
+
+        // ---- FAULT -------------------------------------------------------
+
+        #[test]
+        fn ud_exits_as_a_fault_at_the_instruction_when_masked_in() {
+            for engine in engines() {
+                // nop ; ud2
+                let pc = Pc::flat32(engine, &[0x90, 0x0f, 0x0b]);
+                pc.cpu.set_exit_mask(ExitMask::NONE.with(ExitReason::FAULT));
+                let exit = pc.exit(1_000).expect("an exit");
+                assert_eq!(exit.reason, ExitReason::FAULT, "{engine:?}");
+                assert_eq!((exit.pc, exit.len), (at::CODE0 + 1, 2));
+                assert_eq!(
+                    FaultDetail::from_detail(exit.detail),
+                    FaultDetail {
+                        vector: 6,
+                        error: None
+                    }
+                );
+                assert_eq!(exit.access, ExitAccess::None);
+                assert_eq!(pc.cpu.regs().rip, at::CODE0 + 1, "at the instruction");
+                // Resuming re-executes it, so it faults again.
+                assert_eq!(pc.exit(1_000).map(|e| e.pc), Some(at::CODE0 + 1));
+            }
+        }
+
+        #[test]
+        fn gp_exits_with_its_error_code_and_de_with_none() {
+            for engine in engines() {
+                // mov ax, 0x108 ; mov ds, ax — a selector past the GDT limit.
+                let pc = Pc::flat32(engine, &[0x66, 0xb8, 0x08, 0x01, 0x8e, 0xd8]);
+                pc.cpu.set_exit_mask(ExitMask::USER);
+                let exit = pc.exit(1_000).expect("an exit");
+                assert_eq!(exit.pc, at::CODE0 + 4, "{engine:?}");
+                assert_eq!(
+                    FaultDetail::from_detail(exit.detail),
+                    FaultDetail {
+                        vector: 13,
+                        error: Some(0x108)
+                    }
+                );
+                assert_eq!(pc.cpu.regs().ds, 0x10, "DS was not loaded");
+
+                // mov ecx, 0 ; div ecx
+                let pc = Pc::flat32(engine, &[0xb9, 0, 0, 0, 0, 0xf7, 0xf1]);
+                pc.cpu.set_exit_mask(ExitMask::USER);
+                let exit = pc.exit(1_000).expect("an exit");
+                assert_eq!((exit.pc, exit.len), (at::CODE0 + 5, 2));
+                assert_eq!(exit.detail, 0, "#DE, no error code");
+            }
+        }
+
+        #[test]
+        fn a_page_fault_exits_with_the_address_and_leaves_cr2_alone() {
+            for engine in engines() {
+                // mov rbx, 0x800000 ; mov rax, [rbx] ; mov [rbx], rax ; hlt
+                let code = [
+                    0x48, 0xc7, 0xc3, 0x00, 0x00, 0x80, 0x00, // mov rbx, 0x800000
+                    0x48, 0x8b, 0x03, // mov rax, [rbx]
+                    0x48, 0x89, 0x03, // mov [rbx], rax
+                    0xf4,
+                ];
+                let pc = Pc::long64(engine, &code);
+                pc.cpu.set_exit_mask(ExitMask::USER);
+                let mut sys = pc.cpu.sys();
+                sys.cr2 = 0x1234;
+                pc.cpu.set_sys(sys);
+
+                let exit = pc.exit(100_000).expect("a read fault");
+                assert_eq!(exit.reason, ExitReason::FAULT, "{engine:?}");
+                assert_eq!((exit.pc, exit.len), (la::CODE64 + 7, 3));
+                assert_eq!(
+                    FaultDetail::from_detail(exit.detail),
+                    FaultDetail {
+                        vector: 14,
+                        error: Some(0)
+                    }
+                );
+                assert_eq!(exit.address, 0x80_0000);
+                assert_eq!(exit.access, ExitAccess::Read);
+                assert_eq!(pc.cpu.sys().cr2, 0x1234, "CR2 is part of delivery");
+                assert_eq!(pc.cpu.regs().rip, la::CODE64 + 7);
+
+                // The host skips the read, as an emulating consumer would,
+                // and the write faults as a write.
+                pc.cpu.set_pc(exit.pc + u64::from(exit.len));
+                let exit = pc.exit(100_000).expect("a write fault");
+                assert_eq!((exit.pc, exit.address), (la::CODE64 + 10, 0x80_0000));
+                assert_eq!(exit.access, ExitAccess::Write);
+                assert_eq!(
+                    FaultDetail::from_detail(exit.detail).error,
+                    Some(paging::pf::WRITE)
+                );
+            }
+        }
+
+        #[test]
+        fn a_fault_inside_a_translated_block_exits_where_the_interpreter_does() {
+            // A loop hot enough to be translated, walking a pointer off the
+            // end of the identity map: the fault happens *inside* a block, and
+            // must leave the core exactly where the oracle leaves it.
+            let mut seen = Vec::new();
+            for engine in engines() {
+                let code = [
+                    0x48, 0xc7, 0xc3, 0x00, 0x00, 0x20, 0x00, // mov rbx, 0x200000
+                    0x48, 0x8b, 0x03, // L: mov rax, [rbx]
+                    0x48, 0x81, 0xc3, 0x00, 0x10, 0x00, 0x00, // add rbx, 0x1000
+                    0xeb, 0xf4, // jmp L
+                ];
+                let pc = Pc::long64(engine, &code);
+                pc.cpu.set_exit_mask(ExitMask::USER);
+                let exit = pc.exit(10_000_000).expect("a fault");
+                assert_eq!((exit.pc, exit.len), (la::CODE64 + 7, 3), "{engine:?}");
+                assert_eq!((exit.address, exit.access), (0x40_0000, ExitAccess::Read));
+                let regs = pc.cpu.regs();
+                assert_eq!(regs.rbx, 0x40_0000);
+                seen.push((exit, regs, pc.cpu.cycles()));
+            }
+            assert!(
+                seen.windows(2).all(|w| w[0] == w[1]),
+                "every engine agrees on the exit, the registers and the clock"
+            );
+        }
+
+        #[test]
+        fn a_fetch_fault_reports_an_execute_access() {
+            for engine in engines() {
+                // mov rax, 0x800000 ; jmp rax
+                let code = [0x48, 0xc7, 0xc0, 0x00, 0x00, 0x80, 0x00, 0xff, 0xe0];
+                let pc = Pc::long64(engine, &code);
+                pc.cpu.set_exit_mask(ExitMask::USER);
+                let exit = pc.exit(100_000).expect("a fetch fault");
+                assert_eq!((exit.pc, exit.len), (0x80_0000, 0), "{engine:?}");
+                assert_eq!(exit.access, ExitAccess::Execute);
+                assert_eq!(exit.address, 0x80_0000);
+            }
+        }
+
+        #[test]
+        fn a_repeat_that_faults_keeps_the_iterations_it_completed() {
+            // *Intel SDM* volume 2, `REP`: a fault restarts the instruction
+            // with the count and the index reflecting what was done.
+            for engine in engines() {
+                // mov rdi, 0x3ffffc ; mov rcx, 8 ; mov al, 0x5a ; rep stosb
+                let code = [
+                    0x48, 0xc7, 0xc7, 0xfc, 0xff, 0x3f, 0x00, // mov rdi
+                    0x48, 0xc7, 0xc1, 0x08, 0x00, 0x00, 0x00, // mov rcx, 8
+                    0xb0, 0x5a, // mov al, 0x5a
+                    0xf3, 0xaa, // rep stosb
+                    0xf4,
+                ];
+                let pc = Pc::long64(engine, &code);
+                pc.cpu.set_exit_mask(ExitMask::USER);
+                let exit = pc.exit(100_000).expect("a fault");
+                assert_eq!((exit.pc, exit.address), (la::CODE64 + 16, 0x40_0000));
+                let regs = pc.cpu.regs();
+                assert_eq!(regs.rcx, 4, "{engine:?}: four iterations done");
+                assert_eq!(regs.rdi, 0x40_0000, "and the index where it stopped");
+                assert_eq!(pc.ram.read_u8(0x3f_ffff).unwrap(), 0x5a);
+
+                // And the same restart point when the fault is *delivered*:
+                // the handler sees the completed iterations, and the frame
+                // returns to the prefix.
+                let pc = Pc::long64(engine, &code);
+                pc.idt64(14, 0x20, la::HANDLER);
+                pc.write(la::HANDLER, &[0xf4]);
+                pc.run(400);
+                let regs = pc.cpu.regs();
+                assert_eq!(regs.rip, la::HANDLER + 1, "{engine:?}: in the handler");
+                assert_eq!((regs.rcx, regs.rdi), (4, 0x40_0000));
+                // Error code, then the return RIP.
+                assert_eq!(pc.read64(regs.rsp + 8), la::CODE64 + 16);
+            }
+        }
+
+        // ---- HALT --------------------------------------------------------
+
+        #[test]
+        fn hlt_is_a_halt_exit_and_resuming_runs_the_next_instruction() {
+            for engine in engines() {
+                // hlt ; mov eax, 5 ; hlt
+                let pc = Pc::flat32(engine, &[0xf4, 0xb8, 5, 0, 0, 0, 0xf4]);
+                pc.cpu.set_exit_mask(ExitMask::NONE.with(ExitReason::HALT));
+                let exit = pc.exit(1_000).expect("an exit");
+                assert_eq!(exit.reason, ExitReason::HALT, "{engine:?}");
+                assert_eq!((exit.pc, exit.len), (at::CODE0 + 1, 0), "KVM's shape");
+                assert!(!pc.cpu.is_halted(), "the halt is the host's");
+                let exit = pc.exit(1_000).expect("the second hlt");
+                assert_eq!(exit.pc, at::CODE0 + 7);
+                assert_eq!(pc.cpu.reg(Reg::Eax), 5);
+
+                // A core already halted when the mask arrives reports it too.
+                let pc = Pc::flat32(engine, &[0xf4]);
+                pc.run(10);
+                assert!(pc.cpu.is_halted());
+                let run = pc.cpu.run_to_exit(Budget::of(500));
+                assert!(run.exit.is_none(), "no mask: an idle core, not an exit");
+                assert!(run.consumed.ticks < 500, "returned early");
+                pc.cpu.set_exit_mask(ExitMask::NONE.with(ExitReason::HALT));
+                assert_eq!(pc.exit(500).map(|e| e.reason), Some(ExitReason::HALT));
+                assert!(!pc.cpu.is_halted());
+            }
+        }
+
+        // ---- BREAKPOINT --------------------------------------------------
+
+        #[test]
+        fn int3_and_icebp_stop_at_themselves() {
+            for engine in engines() {
+                // nop ; int3 ; icebp ; hlt
+                let pc = Pc::flat32(engine, &[0x90, 0xcc, 0xf1, 0xf4]);
+                pc.cpu
+                    .set_exit_mask(ExitMask::NONE.with(ExitReason::BREAKPOINT));
+                let exit = pc.exit(1_000).expect("int3");
+                assert_eq!(exit.reason, ExitReason::BREAKPOINT, "{engine:?}");
+                assert_eq!((exit.pc, exit.len), (at::CODE0 + 1, 1));
+                assert_eq!(pc.cpu.pc(), at::CODE0 + 1, "at the instruction");
+                // Stepping over is the host's: past it, the next one stops.
+                pc.cpu.set_pc(exit.pc + u64::from(exit.len));
+                let exit = pc.exit(1_000).expect("icebp");
+                assert_eq!((exit.pc, exit.len), (at::CODE0 + 2, 1));
+            }
+        }
+
+        #[test]
+        fn a_host_breakpoint_stops_before_the_instruction_executes() {
+            for engine in engines() {
+                // nop ; nop ; mov eax, 1 ; hlt — breakpoint on the mov.
+                let pc = Pc::flat32(engine, &[0x90, 0x90, 0xb8, 1, 0, 0, 0, 0xf4]);
+                pc.cpu.add_breakpoint(at::CODE0 + 2);
+                let exit = pc.exit(1_000).expect("a breakpoint");
+                assert_eq!(exit.reason, ExitReason::BREAKPOINT, "{engine:?}");
+                assert_eq!((exit.pc, exit.len), (at::CODE0 + 2, 0));
+                assert_eq!(exit.address, at::CODE0 + 2);
+                assert_eq!(pc.cpu.regs().rip, at::CODE0 + 2);
+                assert_eq!(pc.cpu.reg(Reg::Eax), 0, "the mov has not run");
+
+                // Resuming executes the instruction rather than re-trapping.
+                assert!(pc.exit(1_000).is_none());
+                assert_eq!(pc.cpu.reg(Reg::Eax), 1);
+                assert!(pc.cpu.is_halted());
+            }
+        }
+
+        #[test]
+        fn a_breakpoint_range_catches_a_call_into_the_window() {
+            // The thunk window: nothing is mapped there, and nothing needs to
+            // be, because the core stops before it fetches.
+            for engine in engines() {
+                // call 0xfffe0010 ; mov ebx, eax ; hlt
+                let target: u32 = 0xfffe_0010;
+                let rel = target.wrapping_sub(at::CODE0 as u32 + 5);
+                let mut code = alloc::vec![0xe8];
+                code.extend_from_slice(&rel.to_le_bytes());
+                code.extend_from_slice(&[0x89, 0xc3, 0xf4]);
+                let pc = Pc::flat32(engine, &code);
+                pc.cpu.add_breakpoint_range(0xfffe_0000..0xffff_0000);
+                assert_eq!(
+                    pc.cpu.breakpoints(),
+                    alloc::vec![0xfffe_0000u64..0xffff_0000]
+                );
+                let exit = pc.exit(1_000).expect("a breakpoint");
+                assert_eq!(exit.reason, ExitReason::BREAKPOINT, "{engine:?}");
+                assert_eq!(exit.pc, u64::from(target));
+
+                // The host runs its stub — returns 42 — and pops the return
+                // address, as a `RET` would.
+                let sp = pc.cpu.sp();
+                let ret = pc.read32(sp);
+                assert_eq!(ret, at::CODE0 + 5);
+                pc.cpu.set_reg(Reg::Eax, 42);
+                pc.cpu.set_sp(sp + 4);
+                pc.cpu.set_pc(ret);
+                assert!(pc.exit(1_000).is_none());
+                assert_eq!(pc.cpu.reg(Reg::Ebx), 42);
+            }
+        }
+
+        #[test]
+        fn a_breakpoint_inside_a_hot_loop_stops_on_every_visit() {
+            // The block-cache case: the loop runs translated first, and
+            // arming a breakpoint in the *middle* of its block must still
+            // stop on exactly that instruction every time round.
+            for engine in engines() {
+                // mov edx, 100 ; L: inc eax ; inc ebx ; inc ecx ; dec edx ;
+                // jnz L ; hlt
+                let code = [
+                    0xba, 100, 0, 0, 0,    // mov edx, 100
+                    0x40, // inc eax       (L = CODE0 + 5)
+                    0x43, // inc ebx
+                    0x41, // inc ecx       (CODE0 + 7)
+                    0x4a, // dec edx
+                    0x75, 0xfa, // jnz L
+                    0xf4,
+                ];
+                let pc = Pc::flat32(engine, &code);
+                // Partway, with nothing armed.
+                assert!(pc.cpu.run_to_exit(Budget::of(400)).exit.is_none());
+                let done = pc.cpu.reg(Reg::Ecx);
+                assert!(done > 2 && done < 100, "{engine:?}: ran {done}");
+                #[cfg(all(feature = "cpu-x86-lift", feature = "jit"))]
+                if engine != Engine::Interp {
+                    let stats = pc.cpu.jit_stats().expect("a translating engine");
+                    assert!(stats.retired > 0, "{engine:?}: the loop ran as blocks");
+                }
+
+                pc.cpu.add_breakpoint(at::CODE0 + 7);
+                let mut hits = 0;
+                while let Some(exit) = pc.exit(10_000) {
+                    assert_eq!(exit.pc, at::CODE0 + 7, "{engine:?}");
+                    let regs = pc.cpu.regs();
+                    assert_eq!(
+                        regs.rbx,
+                        regs.rcx + 1,
+                        "{engine:?}: between inc ebx and inc ecx"
+                    );
+                    hits += 1;
+                }
+                assert_eq!(hits, 100 - done, "{engine:?}");
+                assert_eq!(pc.cpu.reg(Reg::Ecx), 100);
+            }
+        }
+
+        #[test]
+        fn removing_a_breakpoint_disarms_it() {
+            for engine in engines() {
+                let pc = Pc::flat32(engine, &[0x90, 0x90, 0xb8, 1, 0, 0, 0, 0xf4]);
+                pc.cpu.add_breakpoint(at::CODE0 + 2);
+                pc.cpu.add_breakpoint(at::CODE0 + 1);
+                assert!(pc.cpu.remove_breakpoint(at::CODE0 + 2));
+                assert!(!pc.cpu.remove_breakpoint(at::CODE0 + 2), "already gone");
+                assert!(!pc.cpu.remove_breakpoint_range(5..5));
+                assert_eq!(pc.exit(1_000).map(|e| e.pc), Some(at::CODE0 + 1));
+                pc.cpu.clear_breakpoints();
+                assert!(pc.cpu.breakpoints().is_empty());
+                assert!(pc.exit(1_000).is_none(), "{engine:?}");
+                assert_eq!(pc.cpu.reg(Reg::Eax), 1);
+            }
+        }
+
+        #[test]
+        fn a_host_breakpoint_fires_without_a_mask_and_int3_stays_the_guests() {
+            for engine in engines() {
+                // int3 ; mov eax, 1 ; hlt — the guest owns vector 3.
+                let pc = Pc::flat32(engine, &[0xcc, 0xb8, 1, 0, 0, 0, 0xf4]);
+                mark_handler(&pc, 3, at::CODE0 + 0x100);
+                pc.cpu.add_breakpoint(at::CODE0 + 0x100);
+                let exit = pc.exit(1_000).expect("the host's breakpoint");
+                assert_eq!(exit.pc, at::CODE0 + 0x100, "{engine:?}: in the handler");
+                assert!(pc.exit(1_000).is_none());
+                assert_eq!(pc.ram.read_u8(at::MARK).unwrap(), 0xaa);
+            }
+        }
+    }
 }
 
 /// The x87 unit and the SSE registers, executed as a guest sees them.

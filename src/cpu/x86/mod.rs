@@ -116,6 +116,15 @@
 //! from; and the double-fault table decides whether a second exception is
 //! taken on its own or escalates, with a third shutting the processor down.
 //!
+//! **Exits to the host** ([`ExitingCore`], `core::exec`): `SYSCALL`,
+//! `SYSENTER` and a host-selected set of `INT n` vectors
+//! ([`X86::set_syscall_vectors`]), every exception an instruction raises,
+//! `HLT`, `INT3`/`ICEBP`, and host-armed execution breakpoints on linear
+//! addresses ([`X86::add_breakpoint`], [`X86::add_breakpoint_range`]) can each
+//! leave the core instead of reaching the guest, on every engine. That is what
+//! a user-mode personality runs a guest on. `docs/cpu/x86.md` ("Exits to the
+//! host") has where each one leaves `RIP` and what [`FaultDetail`] carries.
+//!
 //! A separate I/O address space for `IN`/`OUT`, supplied by the machine as a
 //! second [`AddressSpace`] — not a corner of memory, which is what the
 //! architecture says and what a PC's chipset relies on.
@@ -150,8 +159,10 @@
 //!   Vol 3A §20.2, §20.3). `CR4.VME`, `CR4.PVI` and the interrupt-redirection
 //!   bitmap are **not**, so `EFLAGS.VIF` and `VIP` still have no storage; a
 //!   monitor that wanted them would be told a mechanism exists behind them.
-//! - **No debug breakpoints.** `DR0`-`DR7` round-trip; arming one fires
-//!   nothing. `TR6`/`TR7` likewise store and do nothing.
+//! - **No architectural debug breakpoints.** `DR0`-`DR7` round-trip; arming
+//!   one fires nothing. `TR6`/`TR7` likewise store and do nothing. The
+//!   *host's* execution breakpoints ([`X86::add_breakpoint`]) are a separate
+//!   mechanism and do fire — as an exit, not as a `#DB`.
 //! - **No alignment check.** `CR0.AM` and `EFLAGS.AC` have storage; no `#AC`
 //!   is ever raised.
 //! - **`LOCK` holds a bus lock, and against a *plain* store it still does
@@ -317,6 +328,7 @@ pub use engine::Stats as JitStats;
 
 mod fpexec;
 pub mod fpu;
+mod hostexit;
 pub mod isa;
 pub mod paging;
 pub mod prot;
@@ -340,11 +352,13 @@ use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::fmt;
+use core::ops::Range;
 
 use crate::core::device::{
     DebugTranslation, Device, DeviceClass, Initiator, PropertySpec, RealizeCtx, ResetKind, SinkPin,
 };
 use crate::core::error::{Error, Result};
+use crate::core::exec::{Exit, ExitMask, ExitReason, ExitingCore, Run};
 use crate::core::props::{Props, ValueKind};
 use crate::core::registry::Registry;
 use crate::core::sched::{Budget, Consumed, TickCursor};
@@ -358,6 +372,9 @@ use crate::core::wire::{
 };
 
 use exec::{Exec, Position, State};
+use hostexit::HostExits;
+
+pub use hostexit::{FaultDetail, VectorSet};
 
 /// The flags register.
 ///
@@ -2243,6 +2260,13 @@ struct Session {
     /// makes one interchangeable between engines and with `accel::state`.
     #[cfg(all(feature = "cpu-x86-lift", feature = "jit"))]
     jit: Option<Box<engine::Jit>>,
+    /// What the host has armed: the exit mask, the system-call vectors and
+    /// the execution breakpoints (`core::exec`, [`ExitingCore`]).
+    ///
+    /// Configuration rather than state — not in the snapshot, untouched by a
+    /// reset — and in the session rather than beside it so that the step,
+    /// which holds this lock already, reads it for nothing.
+    host: HostExits,
 }
 
 /// An Intel 8086 or 8088 core.
@@ -2321,6 +2345,7 @@ impl X86 {
                     position: None,
                     #[cfg(all(feature = "cpu-x86-lift", feature = "jit"))]
                     jit: None,
+                    host: HostExits::default(),
                 },
             ),
             pins: sync::Mutex::new(Vec::new()),
@@ -2959,7 +2984,21 @@ impl X86 {
     /// Returns the clock cycles charged: zero if the core is halted with no
     /// interrupt pending, or has no address space, which the caller must treat
     /// as "stop", not "retry".
+    ///
+    /// An [exit](ExitingCore) this step produced is dropped, with the core
+    /// left at its resume point; [`step_to_exit`](X86::step_to_exit) is the
+    /// same step that reports it.
     pub fn step(&self) -> u64 {
+        self.step_to_exit().0
+    }
+
+    /// Execute one reset sequence, interrupt sequence, or instruction, and
+    /// report the [`Exit`] it produced, if the host's mask asked for one.
+    ///
+    /// A host breakpoint stops *before* its instruction, so that step charges
+    /// nothing: `(0, Some(exit))` is a stop, where `(0, None)` is a core with
+    /// nothing to do.
+    pub fn step_to_exit(&self) -> (u64, Option<Exit>) {
         // Ask this core's own interrupt controller what it has, **before** the
         // execution lock is taken: it takes its own, and it may drive this
         // core's `INTR` pin back while it is answering (§4.7). One relaxed load
@@ -2976,39 +3015,34 @@ impl X86 {
             position,
             #[cfg(all(feature = "cpu-x86-lift", feature = "jit"))]
             jit,
-            ..
+            host,
         } = &mut *session;
         // The `reset` pin latches outside the lock; this is where the latch
         // becomes execution state, and it happens before the step so a pulse is
         // honoured at the very next instruction boundary.
         state.reset_pending |= reset;
         let Some(memory) = memory.clone() else {
-            return 0;
+            return (0, None);
         };
         let io = io.clone();
-        #[cfg(all(feature = "cpu-x86-lift", feature = "jit"))]
-        let used = {
-            // One instruction, interpreted, and whatever it wrote handed to
-            // the block cache. A core whose blocks were invalidated only by
-            // `advance` would serve a stale one to anything that mixes this
-            // entry point with the run loop -- a monitor stepping, a test
-            // driving the core by hand.
-            let mut exec = Exec::new(state, &memory, io.as_deref(), &cfg, &self.lines)
-                .with_position(position.as_ref());
-            let used = exec.step();
-            if let Some(jit) = jit.as_mut() {
-                jit.note_writes(&mut exec);
-            }
-            used
-        };
-        #[cfg(not(all(feature = "cpu-x86-lift", feature = "jit")))]
-        let used = Exec::new(state, &memory, io.as_deref(), &cfg, &self.lines)
+        let mut exec = Exec::new(state, &memory, io.as_deref(), &cfg, &self.lines)
             .with_position(position.as_ref())
-            .step();
+            .with_host(host);
+        let used = exec.step();
+        // One instruction, interpreted, and whatever it wrote handed to the
+        // block cache. A core whose blocks were invalidated only by `advance`
+        // would serve a stale one to anything that mixes this entry point
+        // with the run loop -- a monitor stepping, a test driving the core by
+        // hand.
+        #[cfg(all(feature = "cpu-x86-lift", feature = "jit"))]
+        if let Some(jit) = jit.as_mut() {
+            jit.note_writes(&mut exec);
+        }
+        let exit = exec.exit.take();
         if let Some(position) = position {
             position.origin = position.origin.wrapping_add(used);
         }
-        used
+        (used, exit)
     }
 
     /// Advance the core by one *unit of the configured engine*: one
@@ -3022,7 +3056,7 @@ impl X86 {
     /// carries the same `State::debt`. See `engine`'s module documentation for
     /// why that matters as far as the machine's state hash.
     #[allow(unused_variables)]
-    fn advance(&self, remaining: u64) -> u64 {
+    fn advance(&self, remaining: u64) -> (u64, Option<Exit>) {
         #[cfg(all(feature = "cpu-x86-lift", feature = "jit"))]
         if self.engine.translates() {
             self.lines.poll_intc();
@@ -3051,13 +3085,14 @@ impl X86 {
                 io,
                 position,
                 jit,
+                host,
             } = &mut *session;
             let Some(memory) = memory.clone() else {
-                return 0;
+                return (0, None);
             };
             let io = io.clone();
             let jit = jit.as_mut().expect("just installed");
-            let used = engine::advance(
+            let (used, exit) = engine::advance(
                 jit,
                 state,
                 &memory,
@@ -3065,14 +3100,15 @@ impl X86 {
                 &cfg,
                 &self.lines,
                 position.as_ref(),
+                host,
                 remaining,
             );
             if let Some(position) = position {
                 position.origin = position.origin.wrapping_add(used);
             }
-            return used;
+            return (used, exit);
         }
-        self.step()
+        self.step_to_exit()
     }
 
     /// Execute until at least `budget` cycles have been charged.
@@ -3093,7 +3129,7 @@ impl X86 {
         }
         let mut used = 0;
         while used < budget {
-            let n = self.advance(budget - used);
+            let n = self.advance(budget - used).0;
             if n == 0 {
                 break;
             }
@@ -3148,7 +3184,7 @@ impl X86 {
         let allowance = ticks - owed;
         let mut used = 0u64;
         while used < allowance {
-            let n = self.advance(allowance - used);
+            let n = self.advance(allowance - used).0;
             if n == 0 {
                 // Halted with nothing pending, waiting for a Start-Up, held in
                 // INIT, shut down, or no address space. Either way retrying
@@ -3199,6 +3235,186 @@ impl X86 {
     #[must_use]
     pub fn cycle_debt(&self) -> u64 {
         self.session.lock().state.debt
+    }
+
+    /// Run until `ticks` are consumed or something in the
+    /// [exit mask](ExitingCore::set_exit_mask) happens —
+    /// [`ExitingCore::run_to_exit`] in this core's own currency.
+    ///
+    /// The same accounting as [`run_budget`](X86::run_budget): the
+    /// instruction that overruns the budget carries its overshoot into the
+    /// next call as debt, so a sequence of these calls charges exactly what
+    /// one long one would. An exit returns at once with what was consumed up
+    /// to and including the instruction that exited.
+    ///
+    /// A core with nothing to do — halted with no interrupt pending, held in
+    /// INIT, shut down — returns early **without** consuming the rest, which
+    /// [`ExitingCore::run_to_exit`] allows and a host stepping a thread wants:
+    /// it is not waiting for a timer that only the scheduler would reach. With
+    /// [`ExitReason::HALT`] in the mask a halted core is an exit instead, and
+    /// with [`ExitReason::SHUTDOWN`] so is a triple-faulted one.
+    pub fn run_to_exit_ticks(&self, ticks: u64) -> Run {
+        let owed = {
+            let mut session = self.session.lock();
+            // No scheduler grant is in force here, for the reason `run` gives.
+            if let Some(position) = session.position.as_mut() {
+                position.ceiling = u64::MAX;
+            }
+            session.state.debt
+        };
+        if owed >= ticks {
+            self.session.lock().state.debt = owed - ticks;
+            return Run::completed(Consumed::new(ticks));
+        }
+        let allowance = ticks - owed;
+        let mut used = 0u64;
+        while used < allowance {
+            let (n, exit) = self.advance(allowance - used);
+            used += n;
+            let exit = match exit {
+                Some(exit) => Some(exit),
+                None if n == 0 => self.idle_exit(),
+                None => None,
+            };
+            if let Some(exit) = exit {
+                let total = owed + used;
+                self.session.lock().state.debt = total.saturating_sub(ticks);
+                return Run::exited(Consumed::new(total.min(ticks)), exit);
+            }
+            if n == 0 {
+                self.session.lock().state.debt = 0;
+                return Run::completed(Consumed::new(owed + used));
+            }
+        }
+        self.session.lock().state.debt = used - allowance;
+        Run::completed(Consumed::new(ticks))
+    }
+
+    /// The exit a core with nothing to do reports, if the mask asks for one.
+    ///
+    /// A halt handed to the host is the host's to wait out, so reporting one
+    /// takes the core out of it — exactly as a `HLT` executed under the mask
+    /// never enters it — and resuming runs the instruction after the `HLT`.
+    fn idle_exit(&self) -> Option<Exit> {
+        let mut session = self.session.lock();
+        let mask = session.host.mask;
+        let state = &mut session.state;
+        let rip = state.regs.rip;
+        if state.shutdown {
+            return mask
+                .contains(ExitReason::SHUTDOWN)
+                .then(|| Exit::new(ExitReason::SHUTDOWN, rip, 0));
+        }
+        if state.halted && !state.wait_for_sipi && mask.contains(ExitReason::HALT) {
+            state.halted = false;
+            return Some(Exit::new(ExitReason::HALT, rip, 0));
+        }
+        None
+    }
+
+    /// Which `INT n` vectors leave the core as [`ExitReason::SYSCALL`] when
+    /// the mask has it.
+    #[must_use]
+    pub fn syscall_vectors(&self) -> VectorSet {
+        self.session.lock().host.vectors
+    }
+
+    /// Choose which `INT n` vectors leave the core as
+    /// [`ExitReason::SYSCALL`] — `0x80` for a Linux guest, `0x21` for DOS,
+    /// `0x2E` for NT.
+    ///
+    /// A method rather than a [`Config`] field, because it is the same kind of
+    /// thing as the exit mask: host configuration that a consumer changes
+    /// while the core lives — a DOS extender's guest switches personalities —
+    /// and that a snapshot does not carry. It does nothing until
+    /// [`ExitReason::SYSCALL`] is in the mask; a vector outside the set goes
+    /// through the guest's interrupt table as before. `SYSCALL` and `SYSENTER`
+    /// need no entry here: with the reason in the mask they always exit.
+    pub fn set_syscall_vectors(&self, vectors: VectorSet) {
+        self.session.lock().host.vectors = vectors;
+    }
+
+    /// Arm an execution breakpoint on one **linear** address (issue #36).
+    ///
+    /// An instruction that *starts* there stops the core before it executes,
+    /// as [`ExitReason::BREAKPOINT`] with [`Exit::pc`] its `RIP`, `len` zero
+    /// (nothing was decoded) and [`Exit::address`] the linear address — the
+    /// one that differs from `RIP` when `CS` has a base, as a Win16 segment
+    /// does. Nothing is written to guest memory and nothing about the guest
+    /// changes: no fetch, no cycles, no `DR6`.
+    ///
+    /// A host breakpoint fires **whatever the exit mask says**: arming one is
+    /// the request. The mask's [`ExitReason::BREAKPOINT`] governs the guest's
+    /// own `INT3` and `ICEBP`, which are a different question — a debugger can
+    /// leave those to the guest and still stop at its own addresses.
+    ///
+    /// Resuming executes the instruction once and stops on the next visit;
+    /// `Exec::host_breakpoint` documents that rule. Under a translating engine
+    /// the core still stops on exactly this instruction: arming flushes the
+    /// translation cache, and no block is lifted across an armed address.
+    ///
+    /// Breakpoints are consulted by [`step_to_exit`](X86::step_to_exit),
+    /// [`run_to_exit_ticks`](X86::run_to_exit_ticks) and
+    /// [`ExitingCore::run_to_exit`]. Driven by the machine scheduler instead,
+    /// a core standing on one simply makes no progress until it is disarmed.
+    pub fn add_breakpoint(&self, linear: u64) {
+        self.arm(|host| host.add((linear, linear)));
+    }
+
+    /// Arm every linear address in `range` — an instruction starting anywhere
+    /// in it stops the core, which is how a host intercepts calls into a
+    /// window of thunks. An empty range arms nothing.
+    pub fn add_breakpoint_range(&self, range: Range<u64>) {
+        if let Some(pair) = HostExits::pair(range) {
+            self.arm(|host| host.add(pair));
+        }
+    }
+
+    /// Disarm a breakpoint armed by [`add_breakpoint`](X86::add_breakpoint).
+    /// Returns whether one was armed there.
+    pub fn remove_breakpoint(&self, linear: u64) -> bool {
+        self.arm(|host| host.remove((linear, linear)))
+    }
+
+    /// Disarm a range armed by [`add_breakpoint_range`](X86::add_breakpoint_range),
+    /// named exactly as it was armed. Returns whether one was.
+    pub fn remove_breakpoint_range(&self, range: Range<u64>) -> bool {
+        match HostExits::pair(range) {
+            Some(pair) => self.arm(|host| host.remove(pair)),
+            None => false,
+        }
+    }
+
+    /// Disarm every breakpoint.
+    pub fn clear_breakpoints(&self) {
+        self.arm(HostExits::clear);
+    }
+
+    /// The armed breakpoints, as ranges of linear addresses, in address order.
+    #[must_use]
+    pub fn breakpoints(&self) -> Vec<Range<u64>> {
+        self.session.lock().host.list()
+    }
+
+    /// Change the breakpoint list, and throw away every translation that could
+    /// run across the change.
+    ///
+    /// A block lifted before a breakpoint was armed may cover its address, and
+    /// one lifted while it was armed stops short of it; both are wrong after
+    /// the change, so the cache goes. Arming is rare beside executing, and a
+    /// flush is the answer that cannot be subtly wrong.
+    fn arm<T>(&self, change: impl FnOnce(&mut HostExits) -> T) -> T {
+        let mut session = self.session.lock();
+        let out = change(&mut session.host);
+        if !session.host.has_breaks() {
+            // Nothing left to resume through.
+            session.state.break_resume = None;
+        }
+        #[cfg(all(feature = "cpu-x86-lift", feature = "jit"))]
+        if let Some(jit) = session.jit.as_mut() {
+            jit.flush();
+        }
+        out
     }
 
     /// Publish this core's position into `cursor` as it runs.
@@ -3996,6 +4212,47 @@ impl Device for X86 {
         self.lines
             .restore_startup(init_pin, init_peer, init_latch, startup);
         Ok(())
+    }
+}
+
+/// The level-3 seam (`ROADMAP.md` §2.1, issue #35): a core that hands
+/// `SYSCALL`, `SYSENTER`, a selected `INT n`, a fault, a halt or a breakpoint
+/// to its host rather than to the guest.
+///
+/// The program counter is `RIP` — the offset in `CS`, which is the linear
+/// address wherever `CS` has no base, and the stack pointer is `RSP`.
+/// `docs/cpu/x86.md` ("Exits to the host") lists where each reason leaves it.
+/// With an empty mask, no syscall vectors and no breakpoints the core runs
+/// exactly as it did before any of this existed.
+impl ExitingCore for X86 {
+    fn exit_mask(&self) -> ExitMask {
+        self.session.lock().host.mask
+    }
+
+    fn set_exit_mask(&self, mask: ExitMask) {
+        self.session.lock().host.mask = mask;
+    }
+
+    fn run_to_exit(&self, budget: Budget) -> Run {
+        self.run_to_exit_ticks(budget.ticks)
+    }
+
+    fn pc(&self) -> u64 {
+        self.session.lock().state.regs.rip
+    }
+
+    fn set_pc(&self, pc: u64) {
+        let mut session = self.session.lock();
+        session.state.regs.rip = pc;
+        session.state.queue.flush();
+    }
+
+    fn sp(&self) -> u64 {
+        self.session.lock().state.regs.rsp
+    }
+
+    fn set_sp(&self, sp: u64) {
+        self.session.lock().state.regs.rsp = sp;
     }
 }
 

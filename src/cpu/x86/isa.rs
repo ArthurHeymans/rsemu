@@ -873,6 +873,7 @@ const LOWERCASE: &[(&str, &str)] = &[
     ("SWAPGS", "swapgs"),
     ("SYSCALL", "syscall"),
     ("SYSRET", "sysret"),
+    ("SYSENTER", "sysenter"),
     ("WRMSR", "wrmsr"),
     ("CMPXCHG8B", "cmpxchg8b"),
     // The x87 unit.
@@ -1324,6 +1325,7 @@ define_ops! {
     SWAPGS = "exchange the GS base with IA32_KERNEL_GS_BASE",
     SYSCALL = "fast call to the kernel entry point in LSTAR",
     SYSRET = "fast return from SYSCALL",
+    SYSENTER = "fast call to the kernel entry point in IA32_SYSENTER_EIP",
 
     // ---- Pentium: the 64-bit compare and exchange ------------------------
     CMPXCHG8B = "compare EDX:EAX with a 64-bit memory operand and exchange (CMPXCHG16B with REX.W)",
@@ -2926,6 +2928,11 @@ const SECONDARY: ([Insn; 256], [bool; 256]) = opmap! {
     // execution for the same reason its neighbours are.
     0x31 RDTSC None None None   Documented;
     0x32 RDMSR None None None   Documented;
+    // `SYSENTER` is decoded so that it can leave the core as a system call
+    // (`ExitReason::SYSCALL`); executed architecturally it is the `#UD` of a
+    // part without `SEP`, because its model-specific registers are not
+    // modelled. *Intel SDM* volume 2, `SYSENTER`.
+    0x34 SYSENTER None None None Documented;
 
     // `CMOVcc`, from the Pentium Pro; gated by `Features::cmov`.
     0x40 CMOVO  Gv  Ev   None   Documented;

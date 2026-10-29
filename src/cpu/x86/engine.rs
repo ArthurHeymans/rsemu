@@ -346,6 +346,7 @@ use alloc::sync::Arc;
 use alloc::vec;
 
 use crate::core::error::{BusError, Result};
+use crate::core::exec::{Exit, ExitReason};
 use crate::core::space::{AddressSpace, MemAttrs, MemResult};
 use crate::core::value::Width;
 use crate::ir::{InsnStart, IrHost, MemOp, RegSlot, verify};
@@ -355,6 +356,7 @@ use crate::jit::{
 };
 
 use super::exec::{Ex, Exec, Fault, Position, State, VEC_SS};
+use super::hostexit::HostExits;
 #[cfg(test)]
 use super::isa::seg;
 use super::lift::{
@@ -949,6 +951,15 @@ fn admit(at: &mut Boundary, exec: &mut Exec<'_>, pc: u64) -> Admit {
     if world.long() && !canonical(linear) {
         return Admit::Interpret;
     }
+    // A host breakpoint is the interpreter's to report, before anything is
+    // fetched or charged — and so is resuming through one, which
+    // `Exec::host_breakpoint` keeps the record for. Asked here, it covers the
+    // first block of a run and every chained successor alike; inside a block
+    // [`Lifter::translate`] has already made sure no instruction starts on
+    // an armed address.
+    if exec.host.is_some_and(|host| host.breaks_at(linear)) {
+        return Admit::Interpret;
+    }
 
     let mut leave = false;
     let frame = if paged {
@@ -1018,6 +1029,12 @@ fn admit(at: &mut Boundary, exec: &mut Exec<'_>, pc: u64) -> Admit {
 /// that keeps the engines agreeing. The caller advances its origin by what
 /// this returns.
 ///
+/// `host` is what the host has armed (`core::exec`), and the [`Exit`] this
+/// returns beside the clocks is the one the run produced. Every exit but a
+/// fault is raised by an instruction outside the lifted subset or at an
+/// address no block covers, so the interpreter raises it; a fault inside a
+/// block leaves through the same `Exec::fault_exit` the interpreter's does.
+///
 /// # Panics
 ///
 /// If a lifted block reaches an op the IR backend does not implement. That is
@@ -1032,10 +1049,13 @@ pub(super) fn advance(
     cfg: &Config,
     lines: &Lines,
     position: Option<&Position>,
+    host: &HostExits,
     remaining: u64,
-) -> u64 {
+) -> (u64, Option<Exit>) {
     let Jit { disp, at: bound } = jit;
-    let mut exec = Exec::new(state, mem, io, cfg, lines).with_position(position);
+    let mut exec = Exec::new(state, mem, io, cfg, lines)
+        .with_position(position)
+        .with_host(host);
     let pc = exec.state.regs.rip;
 
     // The entry work for the *first* block, done here rather than through
@@ -1047,10 +1067,15 @@ pub(super) fn advance(
         Admit::Ready(at) => *at,
         Admit::Interpret => return interpret(disp, bound, exec),
     };
+    // A block is about to start an instruction, and `admit` has just said it
+    // is not on a breakpoint — so a resume-through record is used up, exactly
+    // as the interpreter's own next instruction would use it up.
+    exec.state.break_resume = None;
 
     let mut front = Lifter {
         at: admitted,
         space: mem,
+        breaks: exec.host.filter(|host| host.has_breaks()),
         // Lifting reads *ahead* of the guest: up to sixteen instructions it
         // has not asked for. A fetch is an ordinary access and a read-ahead is
         // not, so this is the one place in the core that reads guest memory
@@ -1136,10 +1161,18 @@ pub(super) fn advance(
             let fault = fault.unwrap_or_else(|| Fault::gp(0));
             exec.entry = exec.state.regs;
             exec.state.queue.flush();
-            exec.deliver(fault);
+            if exec.exits(ExitReason::FAULT) {
+                // The length the interpreter would report is the encoding's,
+                // and the open boundary's last byte is where that encoding
+                // ends (`Host::insn_start`).
+                let len = cur_end.map_or(0, |end| end.wrapping_sub(f.pc).wrapping_add(1) as u8);
+                exec.fault_exit(fault, len);
+            } else {
+                exec.deliver(fault);
+            }
             let used = exec.used;
             drain(disp, bound, &mut exec);
-            used.max(1)
+            (used.max(1), exec.exit.take())
         }
         Stop::Unsupported { op, at } => panic!(
             "the x86 frontend emitted {op} at index {at}, which the IR backend cannot execute"
@@ -1190,7 +1223,8 @@ pub(super) fn advance(
             // chain of charges behind it that `X86::run_budget` must be told
             // about. It loops until the allowance is spent and asks again, so
             // a zero is never lost — reporting one here would be.
-            interpret(disp, bound, exec).max(1)
+            let (used, exit) = interpret(disp, bound, exec);
+            (used.max(1), exit)
         }
         // `Budget` ends a full chain and `Spent` a block that left part-way
         // through because the caller's ticks ran out; both leave the guest at
@@ -1207,13 +1241,17 @@ pub(super) fn advance(
             close_bus(&mut exec, &world, frame, end, end_access);
             let used = exec.used;
             drain(disp, bound, &mut exec);
-            used.max(1)
+            (used.max(1), None)
         }
     }
 }
 
 /// Interpret one instruction, and tell the block cache what it wrote.
-fn interpret(disp: &mut Dispatcher, bound: &mut Boundary, mut exec: Exec<'_>) -> u64 {
+fn interpret(
+    disp: &mut Dispatcher,
+    bound: &mut Boundary,
+    mut exec: Exec<'_>,
+) -> (u64, Option<Exit>) {
     exec.step();
     bound.interpreted = bound.interpreted.wrapping_add(1);
     // `Exec::used` rather than `Exec::step`'s answer, which differ in exactly
@@ -1234,7 +1272,7 @@ fn interpret(disp: &mut Dispatcher, bound: &mut Boundary, mut exec: Exec<'_>) ->
     // ran has charged, so the answer is never zero in the first place.
     let used = exec.used;
     drain(disp, bound, &mut exec);
-    used
+    (used, exec.exit.take())
 }
 
 /// Write the slot file back into the architectural register file.
@@ -1332,6 +1370,11 @@ struct Lifter<'a> {
     at: Admitted,
     space: &'a AddressSpace,
     attrs: MemAttrs,
+    /// The host's breakpoints, where any are armed. [`Lifter::translate`]
+    /// reads no byte at an armed address, which ends a block before any
+    /// instruction that starts — or merely extends — onto one: the
+    /// interpreter takes it from there, and is the one that stops.
+    breaks: Option<&'a HostExits>,
     /// The unliftable-PC table and the world counter, which a chained boundary
     /// consults through [`admit`] exactly as [`advance`]'s prologue does.
     bound: &'a mut Boundary,
@@ -1421,8 +1464,14 @@ impl<'h, 'e> Frontend<Host<'h, 'e>> for Lifter<'_> {
         let page = self.at.linear_page;
         let frame = self.at.frame;
         let paged = self.at.world.origin.paged();
+        let breaks = self.breaks;
         let mut src = |addr: u64| {
             if addr & !PAGE_MASK != page {
+                return None;
+            }
+            // Linear, like the breakpoints: the lifter reads at the linear
+            // address and the frame is applied below.
+            if breaks.is_some_and(|host| host.breaks_at(addr)) {
                 return None;
             }
             let at = if paged {
