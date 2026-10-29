@@ -33,7 +33,7 @@ use crate::core::error::{Error, Result};
 /// codec variant yet and `core/` is not this module's to change; when it grows
 /// one, this is the line that changes.
 pub fn encode(surface: &Surface) -> Result<Vec<u8>> {
-    let image = to_image(surface);
+    let image = to_image(surface)?;
     oxideav_png::encode(&image, &EncodeOptions::default()).map_err(|e| failed(&format!("{e}")))
 }
 
@@ -62,13 +62,16 @@ pub fn encode_animation(frames: &[Surface], delay_centiseconds: u16) -> Result<V
             )));
         }
     }
-    let images: Vec<PngImage> = frames.iter().map(to_image).collect();
+    let images: Vec<PngImage> = frames.iter().map(to_image).collect::<Result<_>>()?;
     encode_apng(&images, delay_centiseconds, 0).map_err(|e| failed(&format!("{e}")))
 }
 
 /// Build the encoder's view of a surface, repacking only when the byte order
 /// is not one PNG has a colour type for.
-fn to_image(surface: &Surface) -> PngImage {
+///
+/// Fallible because the codec's constructor is (since 0.1.12): it refuses a
+/// zero-sized image, which a surface can be.
+fn to_image(surface: &Surface) -> Result<PngImage> {
     let (pixel_format, data) = match surface.format() {
         PixelFormat::RGB888 => (PngPixelFormat::Rgb24, surface.pixels().to_vec()),
         PixelFormat::RGBA8888 => (PngPixelFormat::Rgba, surface.pixels().to_vec()),
@@ -97,6 +100,7 @@ fn to_image(surface: &Surface) -> PngImage {
         pixel_format,
         alloc::vec![Plane::new(stride, data)],
     )
+    .map_err(|e| failed(&format!("{e}")))
 }
 
 /// One place the codec's complaint becomes the crate's error.
