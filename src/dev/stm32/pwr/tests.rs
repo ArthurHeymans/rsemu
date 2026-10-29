@@ -474,3 +474,169 @@ fn a_reset_level_that_did_not_move_is_not_an_edge() {
     reset.sink.set_level(id, 0, Level::Low);
     assert!(pwr.dbp(), "a low that was already low resets nothing");
 }
+
+// ---------------------------------------------------------------------------
+// The U5 (RM0456 §10; ST CMSIS `stm32u585xx.h`, `PWR_TypeDef`)
+// ---------------------------------------------------------------------------
+
+/// `HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1)`, as the
+/// device sees it: `VOS = 11` with `BOOSTEN`, then a spin on `VOSRDY` and
+/// another on `ACTVOSRDY`. Returns how many ticks the two spins took.
+fn u5_scale1(pwr: &Pwr) -> u64 {
+    let vosr = peek(pwr, U5_VOSR);
+    poke(
+        pwr,
+        U5_VOSR,
+        (vosr & !(U5_VOS | U5_VOSR_BOOSTEN)) | U5_VOS | U5_VOSR_BOOSTEN,
+    );
+    let mut ticks = 0;
+    while peek(pwr, U5_VOSR) & U5_VOSR_VOSRDY == 0 {
+        tick(pwr, 1);
+        ticks += 1;
+        assert!(ticks < 1000, "VOSRDY never came");
+    }
+    while peek(pwr, U5_SVMSR) & U5_SVMSR_ACTVOSRDY == 0 {
+        tick(pwr, 1);
+        ticks += 1;
+        assert!(ticks < 1000, "ACTVOSRDY never came");
+    }
+    ticks
+}
+
+#[test]
+fn a_u5_comes_out_of_reset_in_range_4_on_the_ldo() {
+    let pwr = pwr(Variant::U5);
+    assert_eq!(peek(&pwr, U5_VOSR), 0x0000_8000, "VOS = 00, VOSRDY");
+    assert_eq!(
+        peek(&pwr, U5_SVMSR),
+        0x0000_8000,
+        "ACTVOS = 00, ACTVOSRDY, LDO"
+    );
+    assert!(!pwr.dbp());
+}
+
+#[test]
+fn the_u5_voltage_scaling_sequence_terminates() {
+    let pwr = pwr(Variant::U5);
+    let ticks = u5_scale1(&pwr);
+    assert_eq!(ticks, DELAY, "both flags arrive together after the delay");
+    assert_eq!(peek(&pwr, U5_SVMSR) & U5_VOS, U5_VOS, "ACTVOS = range 1");
+    // `HAL_RCC_ClockConfig` then waits for the booster.
+    assert_ne!(peek(&pwr, U5_VOSR) & U5_VOSR_BOOSTRDY, 0);
+
+    // `HAL_RCC_OscConfig` drops `BOOSTEN` around a PLL1 reprogram: BOOSTRDY
+    // goes with it at once, and comes back after the delay.
+    poke(&pwr, U5_VOSR, peek(&pwr, U5_VOSR) & !U5_VOSR_BOOSTEN);
+    assert_eq!(peek(&pwr, U5_VOSR) & U5_VOSR_BOOSTRDY, 0);
+    poke(&pwr, U5_VOSR, peek(&pwr, U5_VOSR) | U5_VOSR_BOOSTEN);
+    assert_eq!(peek(&pwr, U5_VOSR) & U5_VOSR_BOOSTRDY, 0);
+    tick(&pwr, DELAY);
+    assert_ne!(peek(&pwr, U5_VOSR) & U5_VOSR_BOOSTRDY, 0);
+
+    // The guest cannot write the ready bits itself.
+    poke(&pwr, U5_VOSR, U5_VOS);
+    assert_eq!(peek(&pwr, U5_VOSR), U5_VOS | U5_VOSR_VOSRDY);
+    poke(&pwr, U5_SVMSR, 0);
+    assert_ne!(peek(&pwr, U5_SVMSR) & U5_SVMSR_ACTVOSRDY, 0);
+}
+
+#[test]
+fn the_u5_smps_switch_is_reported_by_regs() {
+    let pwr = pwr(Variant::U5);
+    poke(&pwr, U5_CR3, U5_CR3_REGSEL);
+    assert_eq!(peek(&pwr, U5_SVMSR) & U5_SVMSR_REGS, 0, "not yet");
+    tick(&pwr, DELAY);
+    assert_ne!(peek(&pwr, U5_SVMSR) & U5_SVMSR_REGS, 0, "on the SMPS");
+    poke(&pwr, U5_CR3, 0);
+    tick(&pwr, DELAY);
+    assert_eq!(peek(&pwr, U5_SVMSR) & U5_SVMSR_REGS, 0, "back on the LDO");
+}
+
+#[test]
+fn the_u5_dbp_is_its_own_register_and_drives_the_same_wire() {
+    let pwr = pwr(Variant::U5);
+    let probe = watch_dbp(&pwr);
+    poke(&pwr, CR, 1 << 8);
+    assert!(!probe.is_high(), "CR1 bit 8 is SRAM1PD on a U5, not DBP");
+    poke(&pwr, U5_DBPR, 1);
+    assert_eq!(peek(&pwr, U5_DBPR), 1, "the HAL's read-back spin ends");
+    assert!(probe.is_high());
+    pwr.set_dbp(false);
+    assert!(!probe.is_high());
+}
+
+#[test]
+fn the_u5_status_and_clear_registers() {
+    let pwr = pwr(Variant::U5);
+    // A supply monitor answers with its supply present.
+    poke(&pwr, U5_SVMCR, (1 << 24) | (1 << 28));
+    assert_eq!(peek(&pwr, U5_SVMSR) & U5_MONITORS, 1 << 24, "VDDUSBRDY");
+    // `UCPD_DBDIS` and the pulls are storage.
+    poke(&pwr, 0x2c, 1);
+    assert_eq!(peek(&pwr, 0x2c), 1);
+    poke(&pwr, 0x94, 0xffff);
+    assert_eq!(peek(&pwr, 0x94), 0xffff);
+    // `SR.CSSF` clears STOPF/SBF, `WUSCR` clears WUSR and reads zero.
+    pwr.regs.state.lock().words[(U5_SR / 4) as usize] = 0b110;
+    pwr.regs.state.lock().words[(U5_WUSR / 4) as usize] = 0b101;
+    poke(&pwr, U5_SR, 1);
+    assert_eq!(peek(&pwr, U5_SR), 0);
+    poke(&pwr, U5_WUSCR, 0b001);
+    assert_eq!(peek(&pwr, U5_WUSR), 0b100);
+    assert_eq!(peek(&pwr, U5_WUSCR), 0);
+}
+
+#[test]
+fn a_gated_u5_regulator_waits_for_ahb3en_pwren() {
+    let pwr = pwr(Variant::U5);
+    let (enable, id) = gate_pin(&pwr, gate::ENABLE_PIN);
+    // Gated: the write does not take.
+    poke(&pwr, U5_VOSR, U5_VOS);
+    assert_eq!(peek(&pwr, U5_VOSR), 0);
+    enable.sink.set_level(id, enable.line, Level::High);
+    assert_eq!(peek(&pwr, U5_VOSR) & U5_VOS, 0, "the write was dropped");
+    assert_eq!(u5_scale1(&pwr), DELAY);
+}
+
+#[test]
+fn a_u5_snapshot_round_trips_to_identical_state() {
+    let saved = pwr(Variant::U5);
+    poke(&saved, U5_DBPR, 1);
+    poke(&saved, U5_CR3, U5_CR3_REGSEL);
+    poke(&saved, U5_VOSR, U5_VOS | U5_VOSR_BOOSTEN);
+    tick(&saved, DELAY / 2);
+    assert_eq!(peek(&saved, U5_VOSR) & U5_VOSR_VOSRDY, 0);
+
+    let mut shape = MachineShape::new();
+    shape.add_device("pwr", CLASS_NAME).unwrap();
+    let mut w = StateWriter::new(shape);
+    {
+        let mut chunk = w.chunk("pwr", CLASS_NAME, STATE_VERSION).unwrap();
+        Device::save(&saved, &mut chunk).unwrap();
+    }
+    let bytes = w.to_vec().unwrap();
+    let restored = pwr(Variant::U5);
+    let reader = StateReader::new(&bytes).unwrap();
+    let chunk = reader
+        .load("pwr", CLASS_NAME, STATE_VERSION, &Migrations::new())
+        .unwrap();
+    Device::load(&restored, &mut chunk.reader()).unwrap();
+
+    let words = Variant::U5.register_bytes() / 4;
+    let before: Vec<u32> = (0..words).map(|i| peek_debug(&saved, i * 4)).collect();
+    let after: Vec<u32> = (0..words).map(|i| peek_debug(&restored, i * 4)).collect();
+    assert_eq!(before, after);
+    assert_eq!(
+        Device::next_event_tick(&saved),
+        Device::next_event_tick(&restored)
+    );
+    assert!(restored.dbp());
+    tick(&restored, DELAY);
+    assert_eq!(
+        peek(&restored, U5_VOSR) & (U5_VOSR_VOSRDY | U5_VOSR_BOOSTRDY),
+        U5_VOSR_VOSRDY | U5_VOSR_BOOSTRDY
+    );
+    assert_ne!(peek(&restored, U5_SVMSR) & U5_SVMSR_REGS, 0);
+    let props = Props::new().with("variant", Value::from("u5"));
+    assert_eq!(Pwr::new(&props).unwrap().variant(), Variant::U5);
+}

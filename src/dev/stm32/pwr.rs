@@ -82,6 +82,33 @@
 //! | `f42x` | F427/437, F429/439 | `VOS` is `[15:14]`, and `ODEN`/`ODSWEN` answer with `ODRDY`/`ODSWRDY` |
 //! | `l4` | L4x5, L4x6 | `CR1`…`CR4`, `SR1`/`SR2`, `SCR`, the `PUCRx`/`PDCRx` pull registers |
 //! | `l4plus` | L4+ | as `l4`, plus `CR5` and its `R1MODE` |
+//! | `u5` | U575/U585 | RM0456's map: `VOSR`, `SVMSR`, `DBPR`, `CR3.REGSEL` — see below |
+//!
+//! # The U5 variant
+//!
+//! A U5 rearranged every register the startup path touches (ST CMSIS
+//! `stm32u585xx.h`, `PWR_TypeDef`), and ST's U5 HAL spins on four of them:
+//!
+//! | firmware writes | and waits for | model |
+//! | --- | --- | --- |
+//! | `VOSR.VOS[17:16]` (`HAL_PWREx_ControlVoltageScaling`) | `VOSR.VOSRDY` (15), then `SVMSR.ACTVOSRDY` (15) | a `VOS` change clears both, and `ready-delay` ticks later sets both and copies `VOS` into `SVMSR.ACTVOS[17:16]` |
+//! | `VOSR.BOOSTEN` (18), by the same call and by `HAL_RCC_ClockConfig` | `VOSR.BOOSTRDY` (14) | set `ready-delay` ticks after `BOOSTEN` rises, cleared the moment it falls |
+//! | `CR3.REGSEL` (1) (`HAL_PWREx_ConfigSupply`) | `SVMSR.REGS` (1) to match | follows `REGSEL` after `ready-delay` ticks |
+//! | `DBPR.DBP` (0) (`HAL_PWR_EnableBkUpAccess`) | `DBPR.DBP` reading back | storage, and it drives the `dbp` output exactly as `CR.DBP` does on an F4 or an L4 |
+//!
+//! Out of reset the regulator is the LDO in range 4 with `VOSRDY` and
+//! `ACTVOSRDY` set (`VOSR` = `SVMSR` = `0x0000_8000`), so a firmware that
+//! reads `SVMSR.ACTVOS` first sees the range it is in. `SVMCR`'s monitor
+//! enables (`UVMEN`, `IO2VMEN`, `AVM1EN`, `AVM2EN`, bits 24–27) answer at once
+//! with the matching `SVMSR.VDDxRDY` bit: the supplies are present, and there
+//! is no analogue level to compare. `SR.CSSF` clears `STOPF`/`SBF`, `WUSCR`
+//! clears `WUSR`, and `UCPDR` (`HAL_PWREx_DisableUCPDDeadBattery` writes
+//! `UCPD_DBDIS`), `SECCFGR`, `PRIVCFGR`, `APCR` and the pull registers are
+//! storage.
+//!
+//! The gate on a U5 is **`RCC_AHB3ENR.PWREN`, bit 2** — `wire rcc.ahb3en2 ->
+//! pwr.enable` — and there is no `PWRRST`: `AHB3RSTR` has no bit for the PWR,
+//! so a U5 board draws no `reset` wire.
 //!
 //! # Sources
 //!
@@ -90,6 +117,10 @@
 //!   regulator and the over-drive.
 //! * ST **RM0351** rev 9, §5 "Power control (PWR)" — §5.4 for the register map
 //!   and §5.1.5 for the dynamic voltage scaling `VOSF` reports.
+//! * ST **RM0456**, §10 "Power control (PWR)", for the U5; offsets and bits
+//!   from ST's CMSIS `stm32u585xx.h` (`PWR_TypeDef`, `PWR_*_Pos`; Apache-2.0),
+//!   and the flags that must move from the polling loops of ST's U5 HAL
+//!   (`stm32u5xx_hal_pwr_ex.c`, BSD-3-Clause), whose code is not reproduced.
 //!
 //! No emulator source of any licence was consulted (`ROADMAP.md` §1).
 //!
@@ -127,12 +158,14 @@ use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
 const CLASS_NAME: &str = "st.pwr";
 
 /// The snapshot chunk version. Bump it with the encoding, never on its own.
-const STATE_VERSION: u32 = 1;
+///
+/// Version 2 widened the register file to the U5's thirty-eight words.
+const STATE_VERSION: u32 = 2;
 
-/// How many 32-bit words the widest layout occupies: the L4+ map ends at `CR5`
-/// (`+0x80`), so thirty-three words covers every variant and the snapshot
-/// encoding is one shape.
-const WORDS: usize = 0x21;
+/// How many 32-bit words the widest layout occupies: the U5 map ends at
+/// `PDCRI` (`+0x94`), so thirty-eight words covers every variant and the
+/// snapshot encoding is one shape.
+const WORDS: usize = 0x26;
 
 /// "No deadline": nothing is in transition.
 const NO_DEADLINE: u64 = u64::MAX;
@@ -164,6 +197,9 @@ pub enum Variant {
     L4,
     /// As [`Variant::L4`], plus `CR5` at `+0x80`.
     L4Plus,
+    /// RM0456's U5 map: `VOSR`, `SVMSR`, `DBPR` and the rest of
+    /// `PWR_TypeDef`.
+    U5,
 }
 
 impl Variant {
@@ -175,6 +211,7 @@ impl Variant {
             Variant::F42x => "f42x",
             Variant::L4 => "l4",
             Variant::L4Plus => "l4plus",
+            Variant::U5 => "u5",
         }
     }
 
@@ -193,6 +230,8 @@ impl Variant {
             Variant::L4 => 0x60,
             // Through `CR5` at `+0x80`.
             Variant::L4Plus => 0x84,
+            // Through `PDCRI` at `+0x94`.
+            Variant::U5 => 0x98,
         }
     }
 
@@ -207,12 +246,19 @@ impl Variant {
             Variant::F42x => 0x0000_c000,
             // `VOS` = 01, range 1 (RM0351 §5.4.1, "Reset value: 0x0000 0200").
             Variant::L4 | Variant::L4Plus => 0x0000_0200,
+            // Low-power mode bits all clear; `VOS` is not in `CR1` on a U5.
+            Variant::U5 => 0,
         }
     }
 
-    /// `DBP`'s bit. Bit 8 in both families (RM0090 §5.5.1, RM0351 §5.4.1).
-    fn dbp_bit(self) -> u32 {
-        8
+    /// Where `DBP` lives, as `(register, bit)`: `CR` bit 8 in both older
+    /// families (RM0090 §5.5.1, RM0351 §5.4.1), a register of its own on a U5
+    /// (`DBPR` bit 0).
+    fn dbp(self) -> (u64, u32) {
+        match self {
+            Variant::U5 => (U5_DBPR, 0),
+            _ => (CR, 8),
+        }
     }
 
     /// The `VOS` field, as `(shift, width)`.
@@ -221,6 +267,8 @@ impl Variant {
             Variant::F4 => (14, 1),
             Variant::F42x => (14, 2),
             Variant::L4 | Variant::L4Plus => (9, 2),
+            // `VOSR.VOS[17:16]`.
+            Variant::U5 => (16, 2),
         }
     }
 }
@@ -243,6 +291,44 @@ const L4_SR2: u64 = 0x14;
 const L4_SCR: u64 = 0x18;
 /// L4+: `PWR_CR5`.
 const L4_CR5: u64 = 0x80;
+/// U5: `PWR_CR3`, with `REGSEL` at bit 1.
+const U5_CR3: u64 = 0x08;
+/// U5: `PWR_VOSR`.
+const U5_VOSR: u64 = 0x0c;
+/// U5: `PWR_SVMCR`, the supply monitor enables.
+const U5_SVMCR: u64 = 0x10;
+/// U5: `PWR_DBPR`.
+const U5_DBPR: u64 = 0x28;
+/// U5: `PWR_SR` — `CSSF` (write 1) at 0, `STOPF` at 1, `SBF` at 2.
+const U5_SR: u64 = 0x38;
+/// U5: `PWR_SVMSR`, every bit hardware-owned.
+const U5_SVMSR: u64 = 0x3c;
+/// U5: `PWR_BDSR`, read-only.
+const U5_BDSR: u64 = 0x40;
+/// U5: `PWR_WUSR`, the wake-up flags, read-only.
+const U5_WUSR: u64 = 0x44;
+/// U5: `PWR_WUSCR`, write-1-to-clear for `WUSR`; reads as zero.
+const U5_WUSCR: u64 = 0x48;
+
+// -- U5 bits (ST CMSIS `stm32u585xx.h`, `PWR_*_Pos`) -------------------------
+
+/// `VOSR.BOOSTRDY` — the EPOD booster is ready.
+const U5_VOSR_BOOSTRDY: u32 = 1 << 14;
+/// `VOSR.VOSRDY` — the regulator has reached the selected range.
+const U5_VOSR_VOSRDY: u32 = 1 << 15;
+/// `VOSR.VOS[17:16]`.
+const U5_VOS: u32 = 0b11 << 16;
+/// `VOSR.BOOSTEN`.
+const U5_VOSR_BOOSTEN: u32 = 1 << 18;
+/// `CR3.REGSEL` — 0 LDO, 1 SMPS.
+const U5_CR3_REGSEL: u32 = 1 << 1;
+/// `SVMSR.REGS` — which regulator is actually supplying the core.
+const U5_SVMSR_REGS: u32 = 1 << 1;
+/// `SVMSR.ACTVOSRDY`.
+const U5_SVMSR_ACTVOSRDY: u32 = 1 << 15;
+/// `SVMSR.VDDUSBRDY`…`VDDA2RDY`, bits 24–27, which sit at the same positions
+/// as their monitor enables `SVMCR.UVMEN`…`AVM2EN`.
+const U5_MONITORS: u32 = 0xf << 24;
 
 // -- F4 `CR` and `CSR` bits (RM0090 §5.5.1, §5.5.2) --------------------------
 
@@ -283,7 +369,9 @@ struct State {
     words: [u32; WORDS],
     /// When the regulator finishes its current transition.
     vos_at: u64,
-    /// When the over-drive comes up, and when it switches in (F42x only).
+    /// When the over-drive comes up, and when it switches in (F42x). On a U5
+    /// the same two deadlines are the EPOD booster's `BOOSTRDY` and the
+    /// regulator switch that `SVMSR.REGS` reports.
     od_at: u64,
     odsw_at: u64,
     /// The tick this device has been advanced to.
@@ -297,6 +385,12 @@ impl State {
         if variant.is_f4() {
             // The regulator is already at the scale `CR` selects out of reset.
             words[(F4_CSR / 4) as usize] = F4_CSR_VOSRDY;
+        } else if variant == Variant::U5 {
+            // Range 4 (`VOS` = 00), reached: `VOSRDY` and `ACTVOSRDY` set,
+            // the LDO supplying the core (RM0456 §10, `PWR_VOSR` and
+            // `PWR_SVMSR`, "Reset value: 0x0000 8000").
+            words[(U5_VOSR / 4) as usize] = U5_VOSR_VOSRDY;
+            words[(U5_SVMSR / 4) as usize] = U5_SVMSR_ACTVOSRDY;
         } else {
             // `CR3.EIWUL` comes up set (RM0351 §5.4.3, "Reset value:
             // 0x0000 8000").
@@ -407,7 +501,8 @@ impl Registers {
 
     /// Whether `DBP` is set.
     fn dbp_high(&self, state: &State) -> bool {
-        state.word(CR) & (1 << self.variant.dbp_bit()) != 0
+        let (reg, bit) = self.variant.dbp();
+        state.word(reg) & (1 << bit) != 0
     }
 
     /// Drive the `DBP` output to whatever `CR` now says.
@@ -451,6 +546,11 @@ impl Registers {
             return;
         }
         state.tick = tick;
+        if self.variant == Variant::U5 {
+            Self::advance_u5(&mut state, tick);
+            self.republish(&state);
+            return;
+        }
         if state.vos_at <= tick {
             state.vos_at = NO_DEADLINE;
             if self.variant.is_f4() {
@@ -471,9 +571,40 @@ impl Registers {
         self.republish(&state);
     }
 
+    /// The U5's three transitions finishing.
+    fn advance_u5(state: &mut State, tick: u64) {
+        if state.vos_at <= tick {
+            state.vos_at = NO_DEADLINE;
+            // The new range is reached: `VOSRDY`, and the range the
+            // regulator is *actually* applying catches up with the request.
+            let vos = state.word(U5_VOSR) & U5_VOS;
+            *state.word_mut(U5_VOSR) |= U5_VOSR_VOSRDY;
+            let svmsr = state.word_mut(U5_SVMSR);
+            *svmsr = (*svmsr & !U5_VOS) | vos | U5_SVMSR_ACTVOSRDY;
+        }
+        if state.od_at <= tick {
+            state.od_at = NO_DEADLINE;
+            *state.word_mut(U5_VOSR) |= U5_VOSR_BOOSTRDY;
+        }
+        if state.odsw_at <= tick {
+            state.odsw_at = NO_DEADLINE;
+            let smps = state.word(U5_CR3) & U5_CR3_REGSEL != 0;
+            let svmsr = state.word_mut(U5_SVMSR);
+            *svmsr = if smps {
+                *svmsr | U5_SVMSR_REGS
+            } else {
+                *svmsr & !U5_SVMSR_REGS
+            };
+        }
+    }
+
     fn read_register(&self, offset: u64) -> u32 {
         let state = self.state.lock();
-        if !self.variant.is_f4() && offset == L4_SCR {
+        if self.variant == Variant::U5 && offset == U5_WUSCR {
+            // A clear register, which holds nothing of its own.
+            return 0;
+        }
+        if !self.variant.is_f4() && self.variant != Variant::U5 && offset == L4_SCR {
             // "This register is write-only": the clear register reads as zero.
             return 0;
         }
@@ -487,6 +618,8 @@ impl Registers {
             let before = state.word(offset);
             if self.variant.is_f4() {
                 self.write_f4(&mut state, offset, value, before);
+            } else if self.variant == Variant::U5 {
+                self.write_u5(&mut state, offset, value, before);
             } else {
                 self.write_l4(&mut state, offset, value, before);
             }
@@ -544,6 +677,65 @@ impl Registers {
                 *state.word_mut(F4_CSR) = (before & keep) | (value & !keep);
             }
             _ => {}
+        }
+    }
+
+    fn write_u5(&self, state: &mut State, offset: u64, value: u32, before: u32) {
+        let deadline = state.tick.saturating_add(self.ready_delay);
+        match offset {
+            U5_VOSR => {
+                // `VOSRDY` and `BOOSTRDY` are the hardware's; `VOS` and
+                // `BOOSTEN` are the guest's.
+                let keep = U5_VOSR_VOSRDY | U5_VOSR_BOOSTRDY;
+                let next = (before & keep) | (value & (U5_VOS | U5_VOSR_BOOSTEN));
+                *state.word_mut(U5_VOSR) = next;
+                if next & U5_VOS != before & U5_VOS {
+                    // The regulator has to move: it is not ready in the new
+                    // range until it gets there, and neither is the range it
+                    // reports applying.
+                    *state.word_mut(U5_VOSR) &= !U5_VOSR_VOSRDY;
+                    *state.word_mut(U5_SVMSR) &= !U5_SVMSR_ACTVOSRDY;
+                    state.vos_at = deadline;
+                }
+                let was = before & U5_VOSR_BOOSTEN != 0;
+                let is = next & U5_VOSR_BOOSTEN != 0;
+                if is && !was {
+                    state.od_at = deadline;
+                } else if !is && was {
+                    *state.word_mut(U5_VOSR) &= !U5_VOSR_BOOSTRDY;
+                    state.od_at = NO_DEADLINE;
+                }
+            }
+            U5_CR3 => {
+                *state.word_mut(U5_CR3) = value;
+                if (value ^ before) & U5_CR3_REGSEL != 0 {
+                    state.odsw_at = deadline;
+                }
+            }
+            U5_SVMCR => {
+                *state.word_mut(U5_SVMCR) = value;
+                // A monitor reports its supply present the moment it is
+                // enabled: the supplies are there, and there is no analogue
+                // level to watch fall.
+                let svmsr = state.word_mut(U5_SVMSR);
+                *svmsr = (*svmsr & !U5_MONITORS) | (value & U5_MONITORS);
+            }
+            U5_SR => {
+                // "CSSF: clear Stop and Standby flags" — write 1; the flags
+                // themselves are read-only.
+                if value & 1 != 0 {
+                    *state.word_mut(U5_SR) &= !0b110;
+                }
+            }
+            U5_WUSCR => {
+                *state.word_mut(U5_WUSR) &= !(value & 0xff);
+            }
+            U5_SVMSR | U5_BDSR | U5_WUSR => {
+                // Hardware-owned through and through.
+            }
+            _ => {
+                *state.word_mut(offset) = value;
+            }
         }
     }
 
@@ -651,8 +843,9 @@ impl Pwr {
     /// one this class does not know was given.
     pub fn new(props: &Props) -> Result<Pwr> {
         let mut r = props.reader();
-        let variant = match r.or_enum("variant", "f4", &["f4", "f42x", "l4", "l4plus"])? {
+        let variant = match r.or_enum("variant", "f4", &["f4", "f42x", "l4", "l4plus", "u5"])? {
             "f42x" => Variant::F42x,
+            "u5" => Variant::U5,
             "l4" => Variant::L4,
             "l4plus" => Variant::L4Plus,
             _ => Variant::F4,
@@ -702,10 +895,14 @@ impl Pwr {
     /// no guest to run: it goes through the same write path, so the `dbp`
     /// output moves exactly as it would for firmware.
     pub fn set_dbp(&self, high: bool) {
-        let bit = 1 << self.regs.variant.dbp_bit();
-        let cr = self.regs.state.lock().word(CR);
-        let next = if high { cr | bit } else { cr & !bit };
-        self.regs.write_register(CR, next);
+        let (reg, bit) = self.regs.variant.dbp();
+        let word = self.regs.state.lock().word(reg);
+        let next = if high {
+            word | (1 << bit)
+        } else {
+            word & !(1 << bit)
+        };
+        self.regs.write_register(reg, next);
     }
 
     /// Connect the `DBP` output.
@@ -824,13 +1021,15 @@ impl Instance for Pwr {}
 pub static CLASS: DeviceClass = DeviceClass {
     name: CLASS_NAME,
     version: STATE_VERSION,
-    summary: "STM32 power control: DBP, the voltage-scaling ready flag and the F42x over-drive",
+    summary: "STM32 power control: DBP, the voltage-scaling ready flags, the F42x over-drive and \
+              the U5's EPOD booster and SMPS/LDO switch",
     properties: &[
         PropertySpec {
             name: "variant",
             kind: ValueKind::Str,
             required: false,
-            summary: "which register layout: \"f4\", \"f42x\" (over-drive), \"l4\" or \"l4plus\"",
+            summary: "which register layout: \"f4\", \"f42x\" (over-drive), \"l4\", \"l4plus\" or \
+                      \"u5\"",
         },
         PropertySpec {
             name: "ready-delay",
@@ -865,7 +1064,10 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
 #[must_use]
 pub fn schema() -> ClassSchema {
     let schema = ClassSchema::new(CLASS_NAME)
-        .prop(PropSchema::new("variant", ValueKind::Str).values(&["f4", "f42x", "l4", "l4plus"]))
+        .prop(
+            PropSchema::new("variant", ValueKind::Str)
+                .values(&["f4", "f42x", "l4", "l4plus", "u5"]),
+        )
         .prop(PropSchema::new("ready-delay", ValueKind::Uint))
         .region("")
         .region("regs")

@@ -2205,7 +2205,9 @@ dev-stm32-rcc = []
 # reports as CSR.VOSRDY going *set* and an L4 as SR2.VOSF going *clear*; and the
 # F42x/F43x over-drive's ODEN/ODSWEN with their ODRDY/ODSWRDY. Lazily advanced
 # like the RCC, so a regulator transition costs virtual time and no host time.
-# Four layouts -- f4, f42x, l4, l4plus -- from RM0090 §5 and RM0351 §5.
+# Five layouts -- f4, f42x, l4, l4plus from RM0090 §5 and RM0351 §5, and u5
+# from RM0456 §10, whose VOSR.VOSRDY/SVMSR.ACTVOSRDY, EPOD BOOSTRDY, SMPS/LDO
+# SVMSR.REGS and DBPR.DBP are what ST's U5 HAL spins on.
 # `no_std + alloc`, no `unsafe`, no dependencies.
 dev-stm32-pwr = []
 
