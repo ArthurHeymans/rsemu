@@ -109,12 +109,12 @@ pktkit = { version = "0.1.3", default-features = false, optional = true }
 # comes from `core::rand::Stream`, because a machine that asked the host for
 # entropy would not replay.
 #
-# **`0.7`, and the bound is this crate's MSRV.** `purecrypto` 0.8 raised its
-# `rust-version` to 1.89 while rsemu holds 1.88 (the note at the top of this
-# file, and the `msrv` CI job that builds `--all-features` on exactly that
-# toolchain). 0.7 is the newest series that compiles there. Lift it the day the
-# floor moves, not before.
-purecrypto = { version = "0.7", default-features = false, features = [
+# **The bound is this crate's MSRV.** `purecrypto` declares its own
+# `rust-version` (1.89 for 0.8 through 0.10), and a series that raised it above
+# rsemu's floor (the note at the top of this file, and the `msrv` CI job that
+# builds `--all-features` on exactly that toolchain) would break that job. It
+# was held at 0.7 while the floor was 1.88.
+purecrypto = { version = "0.10", default-features = false, features = [
   "hash",
   "ec",
   "cipher",
