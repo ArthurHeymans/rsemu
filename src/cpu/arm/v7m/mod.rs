@@ -237,7 +237,12 @@ pub mod xpsr {
 /// An instruction the configured part does not have must trap as UNDEFINED —
 /// that is how guests probe for a feature, so "we decoded it anyway" is a
 /// conformance failure.
+///
+/// `#[non_exhaustive]`, like [`Config`]: copy a named set
+/// ([`Extensions::CORTEX_M4`]) and change a field, so a new optional
+/// extension is not a breaking change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct Extensions {
     /// The DSP (E) extension: the SIMD add/sub family, saturating
     /// arithmetic, the half-word and dual multiplies, `SEL`, `USAD8`, `PKH`
@@ -374,7 +379,13 @@ impl FpUnit {
 /// to run a Cortex-M3 and a Cortex-M7 in the same process. The public surface
 /// is a *named part* — [`Config::CORTEX_M4`] — rather than a hand-assembled
 /// set of flags, which is the rule §6.1.1 sets for the whole ARM family.
+///
+/// `#[non_exhaustive]` for the same reason: start from a named part and
+/// adjust it — the `with_*` builders, or a field assignment — so a field added
+/// for the next architecture revision (as `arch` and `reset_vtor` were for
+/// Armv8-M) is not a breaking change to every caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Config {
     /// This core's identity in `MemAttrs::requester`, for an IOMMU or a
     /// per-master filter.
