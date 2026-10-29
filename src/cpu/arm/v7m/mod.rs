@@ -176,7 +176,7 @@ use crate::core::device::{
 use crate::core::error::{Error, Result};
 use crate::core::props::{Props, ValueKind};
 use crate::core::registry::Registry;
-use crate::core::sched::{Budget, Consumed};
+use crate::core::sched::{Budget, Consumed, TickCursor};
 use crate::core::space::{AddressSpace, MemAttrs, RequesterId};
 use crate::core::spin;
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
@@ -847,6 +847,19 @@ struct Session {
     /// until [`ArmV7m::set_vtor`] says otherwise. Configuration rather than
     /// architectural state, so beside [`State`] and not in the snapshot.
     reset_vtor: u32,
+    /// The cursor the machine layer hands every runnable device, to publish
+    /// this core's position into as it runs (`core::sched::TickCursor`).
+    /// Wiring, not architectural state, so it survives a snapshot restore.
+    cursor: Option<TickCursor>,
+    /// For the length of one [`ArmV7m::run_budget`] call, what to add to
+    /// [`State::cycles`] to get this core's position in its own domain:
+    /// the forest's anchor plus the debt carried in, minus the cycle count at
+    /// entry. `None` outside a scheduled run, which publishes nothing.
+    ///
+    /// Re-anchored every call rather than publishing `cycles` raw: a reset
+    /// or a snapshot load replaces `State` and with it the count, and the
+    /// scheduler's anchor is the one number nothing in the guest can move.
+    live_offset: Option<u64>,
 }
 
 impl fmt::Debug for Session {
@@ -911,6 +924,8 @@ impl ArmV7m {
                     space: None,
                     spin: spin::Watch::new(cfg.requester),
                     reset_vtor: cfg.reset_vtor,
+                    cursor: None,
+                    live_offset: None,
                 },
             ),
         }
@@ -1051,6 +1066,17 @@ impl ArmV7m {
             s.msplim = msplim & !7;
             s.psplim = psplim & !7;
         }
+    }
+
+    /// Keep the cursor the machine layer hands every runnable device, and
+    /// publish this core's position into it on every data access while a
+    /// scheduled budget runs.
+    ///
+    /// What makes a lazily advanced peripheral answer a poll at the cycle the
+    /// load happens on: without it, a quantum's every access sees the device
+    /// as it was when the quantum began.
+    pub fn attach_cursor(&self, cursor: &TickCursor) {
+        self.session.lock().cursor = Some(cursor.clone());
     }
 
     /// Give the core the address space it executes from.
@@ -1338,6 +1364,8 @@ impl ArmV7m {
             space,
             spin,
             reset_vtor,
+            cursor,
+            live_offset,
         } = &mut *session;
         if reset {
             state.reset_pending = true;
@@ -1351,7 +1379,10 @@ impl ArmV7m {
         let Some(space) = space.clone() else {
             return 0;
         };
-        Exec::new(state, &space, &self.cfg, spin).step(&external, nmi)
+        let live = cursor.as_ref().zip(*live_offset);
+        Exec::new(state, &space, &self.cfg, spin)
+            .with_live(live)
+            .step(&external, nmi)
     }
 
     /// Execute until at least `budget` cycles have been charged.
@@ -1391,10 +1422,21 @@ impl ArmV7m {
             // arming takes effect at — the per-load path holds a copy and
             // touches no atomic (`core::spin`).
             session.spin.refresh();
-            session.state.debt
+            let owed = session.state.debt;
+            // Where this core stands in its own domain is where the forest
+            // says the call began, plus the cycles it has already run that
+            // this budget still owes.
+            session.live_offset = session.cursor.as_ref().map(|c| {
+                c.anchor()
+                    .wrapping_add(owed)
+                    .wrapping_sub(session.state.cycles)
+            });
+            owed
         };
         if owed >= ticks {
-            self.session.lock().state.debt = owed - ticks;
+            let mut session = self.session.lock();
+            session.state.debt = owed - ticks;
+            session.live_offset = None;
             return ticks;
         }
         let allowance = ticks - owed;
@@ -1407,6 +1449,7 @@ impl ArmV7m {
             used += n;
         }
         let mut session = self.session.lock();
+        session.live_offset = None;
         if used >= allowance {
             session.state.debt = used - allowance;
             ticks
@@ -1584,6 +1627,10 @@ impl Device for ArmV7m {
     fn set_spin_detector(&self, cpu: u32, detector: Option<Arc<spin::Detector>>) -> bool {
         self.session.lock().spin.attach(cpu, detector);
         true
+    }
+
+    fn attach_cursor(&self, cursor: TickCursor) {
+        ArmV7m::attach_cursor(self, &cursor);
     }
 
     fn realize(&self, _ctx: &mut RealizeCtx<'_>) -> Result<()> {

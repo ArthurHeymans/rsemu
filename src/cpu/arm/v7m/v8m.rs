@@ -345,7 +345,13 @@ impl Sys {
     /// `S`, `IRVALID`, `IREGION` — is zero, there being no Security
     /// Extension.
     #[must_use]
-    pub fn tt_response(&self, addr: u32, running_privileged: bool, unpriv: bool, priority: i32) -> u32 {
+    pub fn tt_response(
+        &self,
+        addr: u32,
+        running_privileged: bool,
+        unpriv: bool,
+        priority: i32,
+    ) -> u32 {
         let mut resp = 0u32;
         if running_privileged
             && self.mpu_regions != 0

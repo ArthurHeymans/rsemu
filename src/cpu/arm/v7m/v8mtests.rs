@@ -45,7 +45,8 @@ impl Harness {
         let ram = Arc::new(RamStore::new(RAM));
         ram.write_at(0, &STACK.to_le_bytes()).unwrap();
         ram.write_at(4, &(ENTRY | 1).to_le_bytes()).unwrap();
-        ram.write_at(u64::from(HANDLER), &PARK.to_le_bytes()).unwrap();
+        ram.write_at(u64::from(HANDLER), &PARK.to_le_bytes())
+            .unwrap();
         for n in 2..48u64 {
             ram.write_at(n * 4, &(HANDLER | 1).to_le_bytes()).unwrap();
         }
@@ -583,7 +584,11 @@ fn the_pmsav8_registers_and_their_aliases() {
     });
     assert_eq!(h.ppb_read(0xe000_eda4), 0x2000_0000);
     h.ppb_write(0xe000_ed98, 6);
-    assert_eq!(h.ppb_read(0xe000_eda0), 0x3000_0fe1, "RLAR reads region RNR");
+    assert_eq!(
+        h.ppb_read(0xe000_eda0),
+        0x3000_0fe1,
+        "RLAR reads region RNR"
+    );
     assert_eq!(h.ppb_read(0xe000_edac), 0x0000_0000, "RBAR_A2 -> region 6");
     assert_eq!(h.ppb_read(0xe000_edc4), 0x1122_3344);
 }
@@ -621,7 +626,10 @@ fn the_pmsav8_permission_matrix() {
         s.mpu_rbar[3] = 0x1800 | (0b01 << 1);
         s.mpu_rasr[3] = 0x27e0 | 1;
         assert!(!s.mpu_permits(0x1800, Access::Read, true, 0));
-        assert!(s.mpu_permits(0x2000, Access::Read, false, 0), "region 3 alone");
+        assert!(
+            s.mpu_permits(0x2000, Access::Read, false, 0),
+            "region 3 alone"
+        );
         // HFNMIENA clear: off at negative priority.
         assert!(s.mpu_permits(0x1800, Access::Read, true, -1));
     });
@@ -736,7 +744,10 @@ fn the_v8m_state_round_trips_through_a_snapshot() {
     let fresh = Harness::m33(&[PARK]);
     restore(&fresh.cpu, &bytes);
     assert_eq!(fresh.cpu.stack_limits(), (0x400, 0x808));
-    assert_eq!(fresh.cpu.with_sys(|s| s.mpu_mair), [0xdead_beef, 0x0bad_f00d]);
+    assert_eq!(
+        fresh.cpu.with_sys(|s| s.mpu_mair),
+        [0xdead_beef, 0x0bad_f00d]
+    );
     assert_eq!(snapshot(&fresh.cpu), bytes, "an identical state hash");
 }
 

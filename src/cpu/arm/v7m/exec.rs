@@ -42,6 +42,7 @@
 //! timing tables. No emulator source of any licence was consulted
 //! (`ROADMAP.md` §1).
 
+use crate::core::sched::TickCursor;
 use crate::core::space::{AccessPurpose, AddressSpace, MemAttrs};
 use crate::core::spin::Watch;
 use crate::core::value::{Endian, Width};
@@ -366,6 +367,13 @@ pub(super) struct Exec<'a> {
     /// and not architectural state: a snapshot restore replaces the whole
     /// `State` and must not take the detector with it.
     spin: &'a mut Watch,
+    /// The scheduler's cursor and the offset that turns [`State::cycles`]
+    /// into this core's live position, while a scheduled `run` is under way.
+    live: Option<(&'a TickCursor, u64)>,
+    /// The external interrupt levels sampled for this step, one bit per
+    /// input. Kept so an exception return can re-pend a level-sensitive
+    /// input that is still asserted (see [`Exec::merge_external`]).
+    levels: &'a [u32],
     attrs: MemAttrs,
     /// Address of the instruction being executed.
     insn_addr: u32,
@@ -399,6 +407,8 @@ impl<'a> Exec<'a> {
             space,
             cfg,
             spin,
+            live: None,
+            levels: &[],
             attrs,
             insn_addr: 0,
             branched: false,
@@ -410,6 +420,33 @@ impl<'a> Exec<'a> {
         }
     }
 
+    /// Lend this step the scheduler's cursor, so the accesses it makes are
+    /// answered at the cycle they happen on rather than at the start of the
+    /// quantum.
+    pub(super) fn with_live(mut self, live: Option<(&'a TickCursor, u64)>) -> Exec<'a> {
+        self.live = live;
+        self
+    }
+
+    /// Tell the cursor where this core has got to, immediately before a data
+    /// access leaves for the address space.
+    ///
+    /// Without it a lazily advanced device answers every access of a quantum
+    /// as of the quantum's first cycle, so a flag it raises a few ticks after
+    /// a write never appears to a loop polling it — and the STM32U5 HAL waits
+    /// for `PWR_VOSR.VOSRDY` with a loop that counts iterations, not time
+    /// (`HAL_PWREx_ControlVoltageScaling`), and gave up. Publishing also
+    /// lets a device's own event land at its tick rather than at the next
+    /// quantum: crossing the cursor's deadline catches every such device up
+    /// (`TickCursor::set`). Instruction fetches do not publish; a loop that
+    /// touches no data cannot observe the difference.
+    #[inline]
+    fn publish_position(&self) {
+        if let Some((cursor, offset)) = self.live {
+            cursor.set(offset.wrapping_add(self.state.cycles));
+        }
+    }
+
     /// Run one reset sequence, one exception entry, or one instruction.
     ///
     /// `external` is the level of each external interrupt input and `nmi` the
@@ -417,7 +454,8 @@ impl<'a> Exec<'a> {
     /// Level-sensitive inputs re-pend for as long as they are asserted, which
     /// is what a peripheral that has not been serviced does; an edge-triggered
     /// source pends itself through `NVIC_ISPR` or `STIR` instead.
-    pub(super) fn step(&mut self, external: &[u32], nmi: bool) -> u64 {
+    pub(super) fn step(&mut self, external: &'a [u32], nmi: bool) -> u64 {
+        self.levels = external;
         if self.state.reset_pending {
             self.reset_sequence();
             return self.used;
@@ -465,6 +503,16 @@ impl<'a> Exec<'a> {
 
     /// Fold the external interrupt levels into the NVIC's pending bits, and
     /// the NMI input into its own.
+    /// Latch every asserted external input whose exception is not already
+    /// active.
+    ///
+    /// A level-sensitive interrupt pends while its line is high **and the
+    /// interrupt is not active**; one still asserted when its handler returns
+    /// pends again then (DDI 0403E B3.4.1, and the Cortex-M4 Devices Generic
+    /// User Guide §4.2.9, "Level-sensitive interrupts"). Latching it while
+    /// the handler runs as well would run every handler that clears its own
+    /// source a second, spurious time — which is what happened before, and
+    /// what sent the STM32U5 HAL's EXTI handler into a tail-chain.
     fn merge_external(&mut self, external: &[u32], nmi: bool) {
         if nmi {
             self.state.sys.set_pending(Exception::NMI, true);
@@ -478,7 +526,7 @@ impl<'a> Exec<'a> {
                 let bit = bits.trailing_zeros();
                 bits &= bits - 1;
                 let n = i * 32 + bit as usize + 16;
-                if n < Exception::COUNT {
+                if n < Exception::COUNT && !self.state.sys.is_active(Exception(n as u16)) {
                     self.state.sys.set_pending(Exception(n as u16), true);
                 }
             }
@@ -769,6 +817,7 @@ impl<'a> Exec<'a> {
             }
         }
         let attrs = self.attrs.with_privileged(privileged);
+        self.publish_position();
         if addr.is_multiple_of(bytes) {
             let width = width_of(bytes);
             return match self.space.read(u64::from(addr), width, attrs) {
@@ -815,6 +864,7 @@ impl<'a> Exec<'a> {
             }
         }
         let attrs = self.attrs.with_privileged(privileged);
+        self.publish_position();
         if addr.is_multiple_of(bytes) {
             let width = width_of(bytes);
             let value = self.to_cpu_order(addr, width, value);
@@ -891,6 +941,7 @@ impl<'a> Exec<'a> {
     /// would point at an address the program never wrote down.
     fn bit_band_word(&mut self, alias: u32, word: u32, privileged: bool) -> Ex<u32> {
         let attrs = self.attrs.with_privileged(privileged);
+        self.publish_position();
         match self.space.read(u64::from(word), Width::U32, attrs) {
             Ok(v) => Ok(self.to_cpu_order(word, Width::U32, v as u32)),
             Err(_) => Err(self.bus_fault(alias, Access::Read)),
@@ -1226,6 +1277,16 @@ impl<'a> Exec<'a> {
         }
 
         self.state.sys.set_active(returning, false);
+        // An external input still asserted as its handler returns pends again
+        // now — in time to be tail-chained, which is what the hardware does.
+        if let Some(n) = (returning.0 as usize).checked_sub(16)
+            && self
+                .levels
+                .get(n / 32)
+                .is_some_and(|w| w & (1 << (n % 32)) != 0)
+        {
+            self.state.sys.set_pending(returning, true);
+        }
         // `FAULTMASK` is released by any return except one from NMI.
         if returning != Exception::NMI {
             self.state.faultmask = false;
@@ -1233,13 +1294,17 @@ impl<'a> Exec<'a> {
 
         // Tail-chaining: if something is already waiting that the processor
         // can now take, go straight to it rather than unstacking a frame the
-        // next entry would only push again. `LR` keeps the same `EXC_RETURN`,
-        // because it still describes the same interrupted context.
+        // next entry would only push again. The new handler gets the same
+        // `EXC_RETURN` in `LR`, because it still describes the same
+        // interrupted context — and it has to be written back: the handler
+        // that just returned consumed it (`BX LR`, `POP {PC}`), and `LR`
+        // now holds whatever that handler last left there.
         if let Some((next, prio)) = self.state.sys.highest_pending()
             && prio < self.state.execution_priority()
         {
             self.state.sys.set_pending(next, false);
             self.state.sys.set_active(next, true);
+            self.state.r[14] = magic;
             self.state.xpsr = (self.state.xpsr & !(xpsr::EXCEPTION | xpsr::IT_MASK))
                 | u32::from(next.0) & xpsr::EXCEPTION;
             self.state.sync_stack();

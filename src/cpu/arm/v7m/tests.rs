@@ -960,6 +960,88 @@ fn an_exception_return_tail_chains_rather_than_unstacking_twice() {
 }
 
 #[test]
+fn a_tail_chained_handler_gets_exc_return_in_lr_even_after_the_last_one_clobbered_it() {
+    // IRQ0's handler saves `LR`, overwrites it, and returns with `POP {PC}` —
+    // which is what any handler that calls a function looks like. The
+    // tail-chained IRQ1 must still start with `EXC_RETURN` in `LR`: before
+    // this was fixed it inherited the clobbered value, and its own
+    // `POP {PC}` jumped there. ST's HAL EXTI handler hit exactly that.
+    let h = Harness::m4(&[0xbf00]);
+    h.set_word(16 * 4, 0x301);
+    h.set_word(0x300, 0x4686_b500); // PUSH {lr} ; MOV lr, r0
+    h.set_word(0x304, 0x0000_bd00); // POP {pc}
+    h.set_word(17 * 4, 0x401);
+    h.set_word(0x400, 0xe7fe);
+    h.cpu.with_sys(|s| {
+        s.set_enable(Exception::IRQ0, true);
+        s.set_enable(Exception(17), true);
+    });
+    h.cpu.set_reg(0, 0x1234_5678);
+    h.cpu.pend_irq(0);
+    h.cpu.step(); // entry
+    h.cpu.step(); // PUSH {lr}
+    h.cpu.step(); // MOV lr, r0
+    assert_eq!(h.cpu.reg(14), 0x1234_5678);
+    h.cpu.pend_irq(1);
+    h.cpu.step(); // POP {pc}: exception return, tail-chained into IRQ1
+    assert_eq!(h.cpu.current_exception(), Exception(17));
+    assert_eq!(h.cpu.reg(14), exc_return::THREAD_MSP);
+}
+
+#[test]
+fn a_level_input_does_not_pend_while_its_handler_is_active() {
+    // The line is high on entry and the handler releases it before
+    // returning, the way a driver clears its peripheral's flag. The NVIC
+    // latches a level only while the interrupt is not active (DDI 0403E
+    // B3.4.1), so the return goes back to Thread mode: no second, spurious
+    // run of the handler.
+    let h = Harness::m4(&[0xbf00, 0xbf00, 0xbf00, 0xbf00]);
+    h.set_word(16 * 4, 0x301);
+    h.set_word(0x300, 0xbf00_bf00); // NOP ; NOP
+    h.set_word(0x304, 0x0000_4770); // BX lr
+    h.cpu.with_sys(|s| s.set_enable(Exception::IRQ0, true));
+    h.cpu.set_irq(0, true);
+    h.cpu.step(); // entry
+    assert_eq!(h.cpu.current_exception(), Exception::IRQ0);
+    h.cpu.step(); // NOP, the line still high
+    assert!(
+        !h.cpu.with_sys(|s| s.is_pending(Exception::IRQ0)),
+        "an active interrupt does not latch its own level"
+    );
+    h.cpu.set_irq(0, false); // the handler cleared its source
+    h.cpu.step(); // NOP
+    h.cpu.step(); // BX lr
+    h.cpu.step();
+    assert_eq!(h.cpu.current_exception(), Exception::THREAD);
+}
+
+#[test]
+fn a_scheduled_budget_publishes_the_cores_position_on_each_data_access() {
+    use crate::core::sched::TickCursor;
+    // `LDR r1, [r0]` in a loop: every iteration is a data access, and each
+    // one tells the cursor where the core has got to. Without it, a lazily
+    // advanced peripheral answers a whole quantum's polls as of its first
+    // cycle, and a flag it raises a few ticks after a write never appears.
+    let h = Harness::m4(&[0x6801, 0xe7fd]); // LDR r1, [r0] ; B .-2
+    h.cpu.set_reg(0, SRAM);
+    let cursor = TickCursor::new();
+    h.cpu.attach_cursor(&cursor);
+    assert_eq!(cursor.get(), 0);
+    h.cpu.run_budget(100);
+    let published = cursor.get();
+    assert!(
+        published > 0 && published <= 100,
+        "published inside the budget: {published}"
+    );
+    // Outside a scheduled budget there is no position to publish: a bare
+    // `step` (a debugger, a test) leaves the cursor where it was.
+    for _ in 0..4 {
+        h.cpu.step();
+    }
+    assert_eq!(cursor.get(), published);
+}
+
+#[test]
 fn primask_and_basepri_hold_an_interrupt_off() {
     let h = Harness::m4(&[0xb672, 0xbf00, 0xb662, 0xbf00]); // CPSID i ; NOP ; CPSIE i ; NOP
     h.set_word(16 * 4, 0x301);
@@ -1423,7 +1505,10 @@ fn the_vtor_property_is_where_the_reset_sequence_reads_sp_and_pc() {
     let props = Props::new().with("vtor", Value::from(0x2010u64));
     assert!(ArmV7m::from_props(&props).is_err());
     assert_eq!(
-        ArmV7m::from_props(&Props::new()).unwrap().config().reset_vtor,
+        ArmV7m::from_props(&Props::new())
+            .unwrap()
+            .config()
+            .reset_vtor,
         0
     );
 }
