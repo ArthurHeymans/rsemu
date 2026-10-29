@@ -4146,6 +4146,9 @@ impl<'a> Exec<'a> {
         if features.sse2 {
             edx1 |= 1 << 26; // SSE2
         }
+        // `ECX.SSE3` (bit 0) stays clear even with `Features::sse3` set: only
+        // `FISTTP` of that extension is implemented, and the bit promises the
+        // rest. See the field's documentation.
         if features.mtrr {
             edx1 |= 1 << 12; // MTRR: the memory-type range registers
         }

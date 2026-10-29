@@ -6067,17 +6067,412 @@ mod fp {
         assert_ne!(x.status & sw::SF, 0);
     }
 
+    // -- The transcendentals, packed decimal and FISTTP ----------------------
+
+    /// `fninit`, then `fldcw` from `fpat::DATA + 0x80` holding `control`.
+    fn prologue(pc: &Pc, control: u16) -> Vec<u8> {
+        write64(pc, fpat::DATA + 0x80, u64::from(control));
+        let mut code = alloc::vec![0xdb, 0xe3, 0xd9];
+        code.extend_from_slice(&disp32(5, fpat::DATA + 0x80));
+        code
+    }
+
+    /// `fld qword [addr]` of a binary64 bit pattern, stored at `addr` first.
+    fn fld64(pc: &Pc, code: &mut Vec<u8>, addr: u64, bits: u64) {
+        write64(pc, addr, bits);
+        code.push(0xdd);
+        code.extend_from_slice(&disp32(0, addr));
+    }
+
+    /// `fstp tword [OUT]` and `hlt`, then the ten bytes as a value.
+    fn store_and_read(pc: &Pc, mut code: Vec<u8>) -> F80 {
+        code.push(0xdb);
+        code.extend_from_slice(&disp32(7, fpat::OUT));
+        code.push(0xf4);
+        run(pc, &code);
+        let mut b = [0u8; 10];
+        for (i, byte) in b.iter_mut().enumerate() {
+            *byte = pc.ram.read_u8(fpat::OUT + i as u64).unwrap();
+        }
+        F80::from_bytes(b)
+    }
+
     #[test]
-    fn the_transcendentals_are_absent_and_say_so() {
-        // `D9 F0` is `F2XM1` on hardware and unassigned here, so it raises
-        // `#UD`. Documented in `super`'s module docs: an approximation would
-        // be a silently wrong answer where a missing instruction is a loud
-        // one.
+    fn fsin_of_zero_and_the_out_of_range_case() {
+        // SDM volume 2, `FSIN`: sin(+0) is +0 exactly, and an operand of
+        // magnitude 2^63 or more sets C2 and is left where it was.
+        let pc = x87pc();
+        let mut code = prologue(&pc, cw::RESET);
+        code.extend_from_slice(&[0xd9, 0xee, 0xd9, 0xfe, 0xf4]); // fldz ; fsin
+        run(&pc, &code);
+        let x = pc.cpu.x87();
+        assert_eq!(x.raw(0), F80::ZERO);
+        assert_eq!(x.status & (sw::C2 | sw::EXCEPTIONS), 0);
+
+        let pc = x87pc();
+        let mut code = prologue(&pc, cw::RESET);
+        fld64(&pc, &mut code, fpat::DATA, 0x43f0_0000_0000_0000); // 2^64
+        code.extend_from_slice(&[0xd9, 0xfe]); // fsin
+        let v = store_and_read(&pc, code);
+        assert_eq!(v, F80::new(0x403f, 1 << 63), "2^64, untouched");
+        let x = pc.cpu.x87();
+        assert_ne!(x.status & sw::C2, 0, "C2: reduce the argument yourself");
+        assert_eq!(x.status & sw::EXCEPTIONS, 0);
+
+        // The same for FPTAN, which then pushes nothing.
+        let pc = x87pc();
+        let mut code = prologue(&pc, cw::RESET);
+        fld64(&pc, &mut code, fpat::DATA, 0xc3e0_0000_0000_0000); // -2^63
+        code.extend_from_slice(&[0xd9, 0xf2, 0xf4]); // fptan
+        run(&pc, &code);
+        let x = pc.cpu.x87();
+        assert_ne!(x.status & sw::C2, 0);
+        assert_eq!(x.top(), 7, "one value on the stack, not two");
+    }
+
+    #[test]
+    fn fyl2x_f2xm1_fscale_compute_pow_2_10() {
+        // MSVC's pow(x, y): y * log2(x) by FYL2X, split into integer and
+        // fraction, 2^fraction by F2XM1 plus one, and the integer applied by
+        // FSCALE. Both results are exact in binary64.
+        let pow = |x: u64, y: u64| {
+            let pc = x87pc();
+            let mut code = prologue(&pc, cw::RESET);
+            fld64(&pc, &mut code, fpat::DATA, y);
+            fld64(&pc, &mut code, fpat::DATA + 8, x);
+            code.extend_from_slice(&[
+                0xd9, 0xf1, // fyl2x
+                0xd9, 0xc0, // fld st(0)
+                0xd9, 0xfc, // frndint
+                0xdc, 0xe9, // fsub st(1), st(0)
+                0xd9, 0xc9, // fxch st(1)
+                0xd9, 0xf0, // f2xm1
+                0xd9, 0xe8, // fld1
+                0xde, 0xc1, // faddp st(1), st(0)
+                0xd9, 0xfd, // fscale
+                0xdd, 0xd9, // fstp st(1)
+                0xdd, // fstp qword
+            ]);
+            code.extend_from_slice(&disp32(3, fpat::OUT));
+            code.push(0xf4);
+            run(&pc, &code);
+            (read64(&pc, fpat::OUT), pc.cpu.x87())
+        };
+        // 2^10: log2 2 is exactly 1 and F2XM1(0) is exactly 0.
+        let (bits, x) = pow(0x4000_0000_0000_0000, 0x4024_0000_0000_0000);
+        assert_eq!(bits, 0x4090_0000_0000_0000, "1024.0");
+        assert_eq!(x.status & sw::PE, 0, "and every step was exact");
+        assert_eq!(x.top(), 0, "the stack is balanced");
+        // 10^3, which goes through an irrational logarithm and still lands on
+        // 1000 once rounded to binary64.
+        let (bits, _) = pow(0x4024_0000_0000_0000, 0x4008_0000_0000_0000);
+        assert_eq!(bits, 0x408f_4000_0000_0000, "1000.0");
+    }
+
+    #[test]
+    fn fptan_pushes_one() {
+        let pc = x87pc();
+        let mut code = prologue(&pc, cw::RESET);
+        code.extend_from_slice(&[0xd9, 0xe8, 0xd9, 0xf2, 0xf4]); // fld1 ; fptan
+        run(&pc, &code);
+        let x = pc.cpu.x87();
+        assert_eq!(x.top(), 6, "two values");
+        assert_eq!(x.raw(0), F80::new(0x3fff, 1 << 63), "1.0 on top");
+        // tan 1, correctly rounded to nearest (mpmath, see
+        // `float::elementary`'s tests), which is below the exact value.
+        assert_eq!(x.raw(1), F80::new(0x3fff, 0xc759_22e5_f71d_2dc5));
+        assert_eq!(x.status & (sw::C1 | sw::C2), 0, "rounded down, in range");
+        assert_ne!(x.status & sw::PE, 0);
+    }
+
+    #[test]
+    fn fsincos_leaves_the_cosine_on_top_and_c1_says_which_way_it_rounded() {
+        let pc = x87pc();
+        let mut code = prologue(&pc, cw::RESET);
+        code.extend_from_slice(&[0xd9, 0xe8, 0xd9, 0xfb, 0xf4]); // fld1 ; fsincos
+        run(&pc, &code);
+        let x = pc.cpu.x87();
+        assert_eq!(x.raw(0), F80::new(0x3ffe, 0x8a51_407d_a834_5c92), "cos 1");
+        assert_eq!(x.raw(1), F80::new(0x3ffe, 0xd76a_a478_4867_7021), "sin 1");
+        assert_ne!(x.status & sw::C1, 0, "cos 1 rounded up");
+    }
+
+    #[test]
+    fn the_rounding_control_reaches_the_transcendentals_and_precision_control_does_not() {
+        let sin_one = |control: u16| {
+            let pc = x87pc();
+            let mut code = prologue(&pc, control);
+            code.extend_from_slice(&[0xd9, 0xe8, 0xd9, 0xfe]); // fld1 ; fsin
+            let v = store_and_read(&pc, code);
+            (v.sig, pc.cpu.x87().status & sw::C1 != 0)
+        };
+        let down = cw::RESET & !cw::RC | (1 << cw::RC_SHIFT);
+        let up = cw::RESET & !cw::RC | (2 << cw::RC_SHIFT);
+        assert_eq!(sin_one(cw::RESET), (0xd76a_a478_4867_7021, true));
+        assert_eq!(sin_one(down), (0xd76a_a478_4867_7020, false));
+        assert_eq!(sin_one(up), (0xd76a_a478_4867_7021, true));
+        // SDM volume 1 §8.1.5.2: PC governs add, subtract, multiply, divide
+        // and square root only.
+        assert_eq!(sin_one(cw::RESET & !cw::PC), sin_one(cw::RESET));
+    }
+
+    #[test]
+    fn fpatan_and_fyl2x_pop_and_report_their_special_cases() {
+        // atan2(1, 1) = pi/4, rounded to nearest (up), with one pop.
+        let pc = x87pc();
+        let mut code = prologue(&pc, cw::RESET);
+        code.extend_from_slice(&[0xd9, 0xe8, 0xd9, 0xe8, 0xd9, 0xf3, 0xf4]);
+        run(&pc, &code);
+        let x = pc.cpu.x87();
+        assert_eq!(x.top(), 7);
+        assert_eq!(x.raw(0), F80::new(0x3ffe, 0xc90f_daa2_2168_c235));
+        assert_ne!(x.status & sw::C1, 0);
+
+        // FYL2X of a negative argument is invalid, delivering the indefinite.
+        let pc = x87pc();
+        let mut code = prologue(&pc, cw::RESET);
+        code.extend_from_slice(&[0xd9, 0xe8, 0xd9, 0xe8, 0xd9, 0xe0, 0xd9, 0xf1, 0xf4]);
+        run(&pc, &code);
+        let x = pc.cpu.x87();
+        assert_eq!(x.raw(0), F80::INDEFINITE);
+        assert_ne!(x.status & sw::IE, 0);
+        assert_eq!(
+            x.status & sw::SF,
+            0,
+            "an arithmetic invalid, not a stack fault"
+        );
+
+        // And of zero, a division by zero: 1 * log2(0) = -inf.
+        let pc = x87pc();
+        let mut code = prologue(&pc, cw::RESET);
+        code.extend_from_slice(&[0xd9, 0xe8, 0xd9, 0xee, 0xd9, 0xf1, 0xf4]);
+        run(&pc, &code);
+        let x = pc.cpu.x87();
+        assert_eq!(x.raw(0), F80::new(0xffff, 1 << 63), "-inf");
+        assert_ne!(x.status & sw::ZE, 0);
+    }
+
+    #[test]
+    fn the_transcendentals_fault_on_an_empty_or_a_full_stack() {
+        // FSIN of an empty register: underflow, C1 clear, the indefinite.
+        let pc = x87pc();
+        let mut code = prologue(&pc, cw::RESET);
+        code.extend_from_slice(&[0xd9, 0xfe, 0xf4]);
+        run(&pc, &code);
+        let x = pc.cpu.x87();
+        assert_ne!(x.status & sw::SF, 0);
+        assert_eq!(x.status & sw::C1, 0);
+        assert_eq!(x.raw(0), F80::INDEFINITE);
+
+        // FSINCOS with all eight full: overflow, C1 set, both results the
+        // indefinite.
+        let pc = x87pc();
+        let mut code = prologue(&pc, cw::RESET);
+        for _ in 0..8 {
+            code.extend_from_slice(&[0xd9, 0xe8]);
+        }
+        code.extend_from_slice(&[0xd9, 0xfb, 0xf4]);
+        run(&pc, &code);
+        let x = pc.cpu.x87();
+        assert_ne!(x.status & sw::SF, 0);
+        assert_ne!(x.status & sw::C1, 0);
+        assert_eq!(x.raw(0), F80::INDEFINITE);
+        assert_eq!(x.raw(1), F80::INDEFINITE);
+
+        // FPATAN with only one operand.
+        let pc = x87pc();
+        let mut code = prologue(&pc, cw::RESET);
+        code.extend_from_slice(&[0xd9, 0xe8, 0xd9, 0xf3, 0xf4]);
+        run(&pc, &code);
+        let x = pc.cpu.x87();
+        assert_ne!(x.status & sw::SF, 0);
+        assert_eq!(x.top(), 0, "popped");
+    }
+
+    #[test]
+    fn an_unmasked_precision_exception_leaves_the_operand_in_place() {
+        let pc = x87pc();
+        let mut code = prologue(&pc, cw::RESET & !cw::PM);
+        code.extend_from_slice(&[0xd9, 0xe8, 0xd9, 0xfe, 0xf4]); // fld1 ; fsin
+        run(&pc, &code);
+        let x = pc.cpu.x87();
+        assert_eq!(x.raw(0), F80::new(0x3fff, 1 << 63), "still 1.0");
+        assert_ne!(x.status & sw::PE, 0);
+        assert_ne!(x.status & sw::ES, 0, "pending for the next instruction");
+    }
+
+    /// Ten packed-decimal bytes at `addr`.
+    fn write_bcd(pc: &Pc, addr: u64, bytes: [u8; 10]) {
+        for (i, &b) in bytes.iter().enumerate() {
+            pc.ram.write_u8(addr + i as u64, b).unwrap();
+        }
+    }
+
+    fn read_bcd(pc: &Pc, addr: u64) -> [u8; 10] {
+        let mut b = [0u8; 10];
+        for (i, byte) in b.iter_mut().enumerate() {
+            *byte = pc.ram.read_u8(addr + i as u64).unwrap();
+        }
+        b
+    }
+
+    #[test]
+    fn fbld_fbstp_round_trip_and_fbstp_of_nan_stores_the_indefinite() {
+        // -123456789012345678: digits low byte first, sign in byte 9.
+        let bcd = [0x78, 0x56, 0x34, 0x12, 0x90, 0x78, 0x56, 0x34, 0x12, 0x80];
+        let pc = x87pc();
+        write_bcd(&pc, fpat::DATA, bcd);
+        let mut code = prologue(&pc, cw::RESET);
+        code.push(0xdf); // fbld
+        code.extend_from_slice(&disp32(4, fpat::DATA));
+        code.extend_from_slice(&[0xd9, 0xc0, 0xdf]); // fld st(0) ; fbstp
+        code.extend_from_slice(&disp32(6, fpat::OUT));
+        code.push(0xf4);
+        run(&pc, &code);
+        assert_eq!(read_bcd(&pc, fpat::OUT), bcd, "the digits come back");
+        let x = pc.cpu.x87();
+        assert_eq!(x.top(), 7, "fbstp popped its copy");
+        let (want, _) =
+            crate::float::x87::from_signed(-123_456_789_012_345_678, 64, crate::float::Env::X87);
+        assert_eq!(x.raw(0), want, "and the value in between was exact");
+        assert_eq!(x.status & sw::EXCEPTIONS, 0);
+
+        // 2.5 rounds to nearest even, inexactly.
+        let pc = x87pc();
+        let mut code = prologue(&pc, cw::RESET);
+        fld64(&pc, &mut code, fpat::DATA, 0x4004_0000_0000_0000);
+        code.push(0xdf);
+        code.extend_from_slice(&disp32(6, fpat::OUT));
+        code.push(0xf4);
+        run(&pc, &code);
+        assert_eq!(read_bcd(&pc, fpat::OUT), [2, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_ne!(pc.cpu.x87().status & sw::PE, 0);
+
+        // A NaN, and 10^18, are invalid: the decimal indefinite.
+        for bits in [0x7ff8_0000_0000_0000, 0x43ab_c16d_674e_c800] {
+            let pc = x87pc();
+            let mut code = prologue(&pc, cw::RESET);
+            fld64(&pc, &mut code, fpat::DATA, bits);
+            code.push(0xdf);
+            code.extend_from_slice(&disp32(6, fpat::OUT));
+            code.push(0xf4);
+            run(&pc, &code);
+            assert_eq!(
+                read_bcd(&pc, fpat::OUT),
+                crate::float::x87::BCD_INDEFINITE,
+                "{bits:#x}"
+            );
+            assert_ne!(pc.cpu.x87().status & sw::IE, 0);
+        }
+    }
+
+    /// A long-mode-class part with `Features::sse3` on, in protected mode.
+    fn sse3pc() -> Pc {
+        let pc = Pc::with_features(
+            Variant::X86_64,
+            Features {
+                sse3: true,
+                ..Features::X86_64
+            },
+        );
+        pc.start_protected();
+        pc
+    }
+
+    #[test]
+    fn fisttp_truncates_regardless_of_rounding_control() {
+        // -2.7 and 2.7 at all three widths, with RC set to round up: the
+        // store truncates anyway, and pops.
+        for (op, reg, width) in [(0xdfu8, 1u8, 2u64), (0xdb, 1, 4), (0xdd, 1, 8)] {
+            for (bits, want) in [
+                (0xc005_9999_9999_999au64, -2i64),
+                (0x4005_9999_9999_999a, 2),
+            ] {
+                let pc = sse3pc();
+                write64(&pc, fpat::OUT, 0x5555_5555_5555_5555);
+                let up = cw::RESET & !cw::RC | (2 << cw::RC_SHIFT);
+                let mut code = prologue(&pc, up);
+                fld64(&pc, &mut code, fpat::DATA, bits);
+                code.push(op);
+                code.extend_from_slice(&disp32(reg, fpat::OUT));
+                code.push(0xf4);
+                run(&pc, &code);
+                let mask = if width == 8 {
+                    u64::MAX
+                } else {
+                    (1 << (width * 8)) - 1
+                };
+                let got = read64(&pc, fpat::OUT);
+                assert_eq!(got & mask, want as u64 & mask, "{op:#x} of {bits:#x}");
+                assert_eq!(got & !mask, 0x5555_5555_5555_5555 & !mask, "no wider");
+                let x = pc.cpu.x87();
+                assert_eq!(x.top(), 0, "popped");
+                assert_ne!(x.status & sw::PE, 0);
+            }
+        }
+        // Out of range is the integer indefinite, as for FISTP.
+        let pc = sse3pc();
+        let mut code = prologue(&pc, cw::RESET);
+        fld64(&pc, &mut code, fpat::DATA, 0x40f0_0000_0000_0000); // 65536
+        code.push(0xdf);
+        code.extend_from_slice(&disp32(1, fpat::OUT));
+        code.push(0xf4);
+        run(&pc, &code);
+        assert_eq!(read64(&pc, fpat::OUT) as u16, 0x8000);
+        assert_ne!(pc.cpu.x87().status & sw::IE, 0);
+    }
+
+    #[test]
+    fn fisttp_is_undefined_without_sse3_and_sse3_is_not_advertised() {
+        // A 486 has no SSE3: `DB /1` raises #UD, and before `CR0.TS` or a
+        // pending exception would have been looked at.
         let pc = x87pc();
         pc.idt(6, gate(0x08, HANDLER as u32, sys_type::INT_GATE32, 0));
         pc.write(HANDLER, &[0xf4]);
-        run(&pc, &[0xdb, 0xe3, 0xd9, 0xe8, 0xd9, 0xf0, 0xf4]);
-        assert_eq!(pc.regs().rip, HANDLED, "#UD for F2XM1");
+        let mut code = alloc::vec![0xdb, 0xe3, 0xd9, 0xe8, 0xdb];
+        code.extend_from_slice(&disp32(1, fpat::OUT));
+        code.push(0xf4);
+        run(&pc, &code);
+        assert_eq!(pc.regs().rip, HANDLED, "#UD for FISTTP");
+
+        // With the flag on, CPUID still does not claim the extension, of
+        // which FISTTP is the only part implemented.
+        let pc = sse3pc();
+        run(&pc, &[0xb8, 0x01, 0x00, 0x00, 0x00, 0x0f, 0xa2, 0xf4]);
+        assert_eq!(pc.regs().rcx & 1, 0, "CPUID.1:ECX.SSE3 stays clear");
+
+        // An SSE3 flag needs SSE2 under it.
+        let impossible = Features {
+            sse3: true,
+            ..Features::I80486
+        };
+        assert!(impossible.validate().is_err());
+    }
+
+    #[test]
+    fn the_disassembler_names_the_new_escapes() {
+        let pc = sse3pc();
+        let listing = |bytes: &[u8]| {
+            pc.write(at::CODE0, bytes);
+            let out = pc.cpu.disassemble(0x08, at::CODE0, 1);
+            alloc::format!("{}", out[0])
+        };
+        for (bytes, name) in [
+            (&[0xd9u8, 0xf0][..], "f2xm1"),
+            (&[0xd9, 0xf1], "fyl2x"),
+            (&[0xd9, 0xf2], "fptan"),
+            (&[0xd9, 0xf3], "fpatan"),
+            (&[0xd9, 0xf9], "fyl2xp1"),
+            (&[0xd9, 0xfb], "fsincos"),
+            (&[0xd9, 0xfe], "fsin"),
+            (&[0xd9, 0xff], "fcos"),
+        ] {
+            assert!(listing(bytes).ends_with(name), "{name}");
+        }
+        let fbld = listing(&[0xdf, 0x25, 0x00, 0xb0, 0x00, 0x00]);
+        assert!(fbld.ends_with("fbld tbyte [ds:0xb000]"), "{fbld}");
+        let fisttp = listing(&[0xdb, 0x0d, 0x00, 0xb0, 0x00, 0x00]);
+        assert!(fisttp.ends_with("fisttp dword [ds:0xb000]"), "{fisttp}");
     }
 
     #[test]

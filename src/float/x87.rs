@@ -307,7 +307,7 @@ pub fn classify(v: F80) -> X87Class {
 ///
 /// The second element is `None` when the encoding is unsupported, which every
 /// caller turns into an invalid operation delivering the indefinite.
-fn unpack(v: F80, env: Env) -> (Option<Parts>, Flags) {
+pub(super) fn unpack(v: F80, env: Env) -> (Option<Parts>, Flags) {
     let Some(p) = decode(v) else {
         return (None, Flags::INVALID);
     };
@@ -328,7 +328,7 @@ fn unpack(v: F80, env: Env) -> (Option<Parts>, Flags) {
 }
 
 /// Assemble an outcome into an 80-bit encoding.
-fn encode(out: Outcome, env: Env) -> F80 {
+pub(super) fn encode(out: Outcome, env: Env) -> F80 {
     let sign_exp = |sign: bool, field: u16| if sign { 0x8000 | field } else { field };
     match out {
         Outcome::DefaultNan => F80 {
@@ -911,4 +911,75 @@ pub fn from_signed(value: i64, bits: u32, env: Env) -> (F80, Flags) {
     }
     let (out, f) = kernel::round_exact(v < 0, 0, u128::from(v.unsigned_abs()), F80::SPEC, env);
     (encode(out, env), f)
+}
+
+// ---------------------------------------------------------------------------
+// Packed BCD: `FBLD` and `FBSTP`
+// ---------------------------------------------------------------------------
+
+/// The packed BCD integer indefinite, as the ten bytes `FBSTP` stores for an
+/// invalid operation under a masked `IM`: `FFFF C000 0000 0000 0000h` (*Intel
+/// SDM* volume 1 §4.7 and Table 4-4), little-endian.
+pub const BCD_INDEFINITE: [u8; 10] = [0, 0, 0, 0, 0, 0, 0, 0xc0, 0xff, 0xff];
+
+/// The largest magnitude 18 decimal digits hold.
+const BCD_MAX: u128 = 999_999_999_999_999_999;
+
+/// Read an 80-bit packed BCD integer, as `FBLD` does.
+///
+/// Bytes 0-8 hold eighteen digits, two per byte with the less significant
+/// digit in the low nibble and byte 0 least significant; bit 7 of byte 9 is
+/// the sign and its other seven bits are ignored (*Intel SDM* volume 1 §4.7).
+/// Eighteen digits are under 2^60, so the conversion is exact and no flag
+/// can arise. A sign with no digits is a signed zero.
+///
+/// A nibble above 9 makes the operand invalid BCD, for which the manual
+/// leaves the result undefined; this weighs the nibble at face value, which
+/// is a deterministic answer and needs no further check.
+#[must_use]
+pub fn from_packed_bcd(bytes: [u8; 10]) -> F80 {
+    let mut magnitude: u64 = 0;
+    for &b in bytes[..9].iter().rev() {
+        magnitude = magnitude * 100 + u64::from(b >> 4) * 10 + u64::from(b & 0xf);
+    }
+    let sign = bytes[9] & 0x80 != 0;
+    if magnitude == 0 {
+        return encode(Outcome::Num(sign, Rounded::Zero), Env::X87);
+    }
+    let (out, _) = kernel::round_exact(sign, 0, u128::from(magnitude), F80::SPEC, Env::X87);
+    encode(out, Env::X87)
+}
+
+/// Convert to an 80-bit packed BCD integer, rounding in the environment's
+/// direction, as `FBSTP` does.
+///
+/// A NaN of either kind, an infinity, an unsupported encoding, and anything
+/// that rounds to more than eighteen digits is an invalid operation and
+/// produces [`BCD_INDEFINITE`] (*Intel SDM* volume 2, `FBSTP`). The sign of a
+/// value that rounds to zero is kept.
+pub fn to_packed_bcd(v: F80, env: Env) -> ([u8; 10], Flags) {
+    let (p, fin) = unpack(v, env);
+    let Some(p) = p else {
+        return (BCD_INDEFINITE, Flags::INVALID);
+    };
+    match kernel::to_integer(p, env) {
+        IntValue::Value {
+            sign,
+            magnitude,
+            inexact,
+        } if magnitude <= BCD_MAX => {
+            let mut out = [0u8; 10];
+            let mut m = magnitude as u64;
+            for byte in out.iter_mut().take(9) {
+                let lo = (m % 10) as u8;
+                let hi = ((m / 10) % 10) as u8;
+                *byte = (hi << 4) | lo;
+                m /= 100;
+            }
+            out[9] = if sign { 0x80 } else { 0 };
+            let f = if inexact { Flags::INEXACT } else { Flags::NONE };
+            (out, f | fin)
+        }
+        _ => (BCD_INDEFINITE, Flags::INVALID | fin),
+    }
 }

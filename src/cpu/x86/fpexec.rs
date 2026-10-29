@@ -30,21 +30,35 @@
 //! handler for it — otherwise it is `#UD`, which is Intel's way of making a
 //! kernel that forgot to set the bit fail loudly rather than at random.
 //!
+//! # The transcendentals
+//!
+//! `F2XM1`, `FYL2X`, `FYL2XP1`, `FPTAN`, `FPATAN`, `FSIN`, `FCOS` and
+//! `FSINCOS` deliver the **correctly rounded** result, from
+//! [`crate::float::elementary`]: within the architectural accuracy bound on
+//! every part, and the same bits on every host. Precision control does not
+//! apply to them — it governs a closed list of instructions (*Intel SDM*
+//! volume 1 §8.1.5.2) — so they always round to 64 bits, in the direction
+//! `RC` names. They are the one place `C1` reports "rounded up", because the
+//! elementary-function layer knows which way it rounded.
+//!
+//! Three choices the manual leaves open, made here and recorded:
+//!
+//! * `FPTAN` of a NaN or an infinity still pushes `1.0` over the (NaN or
+//!   indefinite) result, as its pseudo-code reads for any operand under
+//!   `2^63`; `FSINCOS` of one leaves the NaN or indefinite in both registers.
+//! * A stack overflow on `FPTAN` or `FSINCOS` — `ST(7)` occupied — under a
+//!   masked `IM` writes the indefinite to both result registers, each being a
+//!   destination the masked response fills.
+//! * `FSINCOS`'s `C1` is the cosine's rounding direction: the value left in
+//!   `ST(0)`, the last one written.
+//!
 //! # What is deliberately not here
 //!
-//! * **The transcendentals** — `F2XM1`, `FYL2X`, `FYL2XP1`, `FPTAN`, `FPATAN`,
-//!   `FSIN`, `FCOS`, `FSINCOS`. Computing them to the last bit of an 80-bit
-//!   significand without a host `f64` is a subproject, and an approximation
-//!   would be a silently wrong answer rather than a missing one. Their
-//!   encodings are unassigned in [`super::isa`], so they raise `#UD` and a
-//!   guest finds out immediately.
-//! * **`FBLD`/`FBSTP`**, the packed-decimal pair, and **`FISTTP`**, which
-//!   belongs to SSE3.
-//! * **`C1`'s "the result was rounded up" meaning.** `float`'s kernel rounds
-//!   once and reports the exceptions, not the direction it moved, so `C1` is
-//!   cleared after an arithmetic instruction rather than set from the
-//!   rounding. Its other meaning — the direction of a stack fault — *is*
-//!   modelled, because that one is load-bearing.
+//! * **`C1`'s "the result was rounded up" meaning for the basic arithmetic.**
+//!   `float`'s kernel rounds once and reports the exceptions, not the
+//!   direction it moved, so `C1` is cleared after an arithmetic instruction
+//!   rather than set from the rounding. Its other meaning — the direction of
+//!   a stack fault — *is* modelled, because that one is load-bearing.
 //! * **The real-address-mode `FNSTENV` image.** The four layouts differ only
 //!   in how the instruction and data pointers are packed; the control, status
 //!   and tag words are at the same offsets in all four, and those are what
@@ -58,6 +72,7 @@
 //! consulted (`CLAUDE.md`, provenance).
 
 use crate::core::sync;
+use crate::float::elementary::{self, Elementary};
 use crate::float::x87::{self as f80, F80, Precision};
 use crate::float::{B32, B64, Category, Env, Flags, Round, binary};
 
@@ -312,6 +327,11 @@ impl Exec<'_> {
     /// Execute one x87 instruction.
     pub(super) fn x87_instruction(&mut self, f: &Fields) -> Ex<()> {
         let op = f.insn.op;
+        // `FISTTP` is SSE3's, and an absent extension is `#UD` ahead of every
+        // other gate — the same order the SSE instructions apply.
+        if op == Op::FISTTP && !self.cfg.features.sse3 {
+            return Err(Fault::bare(VEC_UD));
+        }
         self.x87_gate(op)?;
         // The instruction pointer, data pointer and opcode the environment
         // reports. **All three** are frozen across the control instructions,
@@ -348,7 +368,24 @@ impl Exec<'_> {
             Op::FLDLG2 => self.x87_push_checked(konst::LG2),
             Op::FLDLN2 => self.x87_push_checked(konst::LN2),
             Op::FST | Op::FSTP => self.x87_store(f, op == Op::FSTP),
-            Op::FIST | Op::FISTP => self.x87_store_int(f, op == Op::FISTP),
+            Op::FIST | Op::FISTP => self.x87_store_int(f, op == Op::FISTP, false),
+            Op::FISTTP => self.x87_store_int(f, true, true),
+            Op::FBLD => self.x87_load_bcd(),
+            Op::FBSTP => self.x87_store_bcd(),
+            Op::FSIN | Op::FCOS | Op::FPTAN | Op::FSINCOS => self.x87_trig(op),
+            Op::F2XM1 => {
+                let (env, _) = self.x87_env();
+                let (a, may_write) = self.x87_st(0);
+                let Some(a) = a else {
+                    if may_write {
+                        self.state.x87.set(0, F80::INDEFINITE);
+                    }
+                    return Ok(());
+                };
+                let r = elementary::exp2m1(a, Precision::Extended, env);
+                self.x87_finish_rounded(0, r, false)
+            }
+            Op::FPATAN | Op::FYL2X | Op::FYL2XP1 => self.x87_dyadic(op),
             Op::FXCH => self.x87_exchange(f),
             Op::FFREE => {
                 self.state.x87.free(Self::sti(f));
@@ -658,9 +695,16 @@ impl Exec<'_> {
         Ok(())
     }
 
-    /// `FIST` and `FISTP`.
-    fn x87_store_int(&mut self, f: &Fields, pop: bool) -> Ex<()> {
+    /// `FIST`, `FISTP`, and with `truncate` `FISTTP`, which rounds toward
+    /// zero whatever `RC` says — the conversion C's casts need, without the
+    /// `FLDCW` pair around every one (*Intel SDM* volume 2, `FISTTP`).
+    fn x87_store_int(&mut self, f: &Fields, pop: bool, truncate: bool) -> Ex<()> {
         let (env, _) = self.x87_env();
+        let env = if truncate {
+            env.round(Round::TowardZero)
+        } else {
+            env
+        };
         let bits = Self::int_bits(f.insn.dst);
         let value = match self.x87_st(0) {
             (Some(value), _) => value,
@@ -675,6 +719,152 @@ impl Exec<'_> {
         }
         let (sr, off) = self.ea();
         self.write_mem(sr, off, bits / 8, int as u64)?;
+        if pop {
+            self.state.x87.pop();
+        }
+        Ok(())
+    }
+
+    /// `FBLD`: push an 18-digit packed decimal integer, converted exactly.
+    fn x87_load_bcd(&mut self) -> Ex<()> {
+        let (sr, off) = self.ea();
+        let bytes = self.read_f80(sr, off)?.to_bytes();
+        self.x87_push_checked(f80::from_packed_bcd(bytes))
+    }
+
+    /// `FBSTP`: round `ST(0)` to an integer under `RC`, store it as 18 packed
+    /// decimal digits, and pop. Out of range, a NaN or an infinity stores the
+    /// packed-decimal indefinite under a masked `IM`.
+    fn x87_store_bcd(&mut self) -> Ex<()> {
+        let (env, _) = self.x87_env();
+        let value = match self.x87_st(0) {
+            (Some(value), _) => value,
+            (None, false) => return Ok(()),
+            // The masked underflow response, converted: the indefinite is a
+            // NaN, so what reaches memory is the decimal indefinite.
+            (None, true) => F80::INDEFINITE,
+        };
+        let (bytes, fl) = f80::to_packed_bcd(value, env);
+        if self.state.x87.raise(fl) {
+            return Ok(());
+        }
+        let (sr, off) = self.ea();
+        self.write_f80(sr, off, F80::from_bytes(bytes))?;
+        self.state.x87.status &= !sw::C1;
+        self.state.x87.pop();
+        Ok(())
+    }
+
+    /// `FSIN`, `FCOS`, `FPTAN` and `FSINCOS`.
+    ///
+    /// The four share the range check: an operand of magnitude `2^63` or more
+    /// sets `C2` and is left exactly as it was, and nothing is pushed — the
+    /// instruction expects software to reduce the argument (with `FPREM1`
+    /// and a full-precision `pi`) and try again (*Intel SDM* volume 2, each
+    /// instruction's page). `C2` is cleared otherwise.
+    fn x87_trig(&mut self, op: Op) -> Ex<()> {
+        let (env, _) = self.x87_env();
+        let pushes = matches!(op, Op::FPTAN | Op::FSINCOS);
+        let (a, may_write) = self.x87_st(0);
+        let Some(a) = a else {
+            if may_write {
+                self.state.x87.set(0, F80::INDEFINITE);
+                if pushes {
+                    return self.x87_push_indefinite();
+                }
+            }
+            return Ok(());
+        };
+        // A finite, supported encoding whose exponent puts it at or above
+        // 2^63; NaNs, infinities and unsupported forms go on to the
+        // invalid-operand paths instead.
+        let field = a.exp_field();
+        if field >= 0x3fff + 63 && field != 0x7fff && a.sig & (1 << 63) != 0 {
+            // Nothing was rounded, so `C1`'s "rounded up" is clear.
+            self.state.x87.status |= sw::C2;
+            self.state.x87.status &= !sw::C1;
+            return Ok(());
+        }
+        self.state.x87.status &= !sw::C2;
+        if pushes && self.state.x87.occupied(7) {
+            if self.state.x87.stack_fault(true) {
+                return Ok(());
+            }
+            self.state.x87.set(0, F80::INDEFINITE);
+            self.state.x87.dec_top();
+            self.state.x87.set(0, F80::INDEFINITE);
+            return Ok(());
+        }
+        let pc = Precision::Extended;
+        match op {
+            Op::FSIN => self.x87_finish_rounded(0, elementary::sin(a, pc, env), false),
+            Op::FCOS => self.x87_finish_rounded(0, elementary::cos(a, pc, env), false),
+            Op::FPTAN => {
+                let t = elementary::tan(a, pc, env);
+                if self.state.x87.raise(t.flags) {
+                    return Ok(());
+                }
+                self.set_c1(t.rounded_up);
+                self.state.x87.set(0, t.value);
+                self.state.x87.dec_top();
+                self.state.x87.set(0, konst::ONE);
+                Ok(())
+            }
+            _ => {
+                // Both results are computed before either is written, so an
+                // unmasked exception from either leaves the operand in place.
+                let s = elementary::sin(a, pc, env);
+                let c = elementary::cos(a, pc, env);
+                if self.state.x87.raise(s.flags | c.flags) {
+                    return Ok(());
+                }
+                self.set_c1(c.rounded_up);
+                self.state.x87.set(0, s.value);
+                self.state.x87.dec_top();
+                self.state.x87.set(0, c.value);
+                Ok(())
+            }
+        }
+    }
+
+    /// `FPATAN`, `FYL2X` and `FYL2XP1`: `ST(1) <- f(ST(1), ST(0))`, then pop.
+    fn x87_dyadic(&mut self, op: Op) -> Ex<()> {
+        let (env, _) = self.x87_env();
+        let (x, xw) = self.x87_st(0);
+        let (y, yw) = self.x87_st(1);
+        let (Some(x), Some(y)) = (x, y) else {
+            if xw && yw {
+                self.state.x87.set(1, F80::INDEFINITE);
+                self.state.x87.pop();
+            }
+            return Ok(());
+        };
+        let pc = Precision::Extended;
+        let r = match op {
+            Op::FPATAN => elementary::atan2(y, x, pc, env),
+            Op::FYL2X => elementary::y_log2_x(y, x, pc, env),
+            _ => elementary::y_log2_1p_x(y, x, pc, env),
+        };
+        self.x87_finish_rounded(1, r, true)
+    }
+
+    /// Set or clear `C1`.
+    fn set_c1(&mut self, on: bool) {
+        if on {
+            self.state.x87.status |= sw::C1;
+        } else {
+            self.state.x87.status &= !sw::C1;
+        }
+    }
+
+    /// [`Self::x87_finish`] for a result that knows which way it was rounded,
+    /// which `C1` then reports.
+    fn x87_finish_rounded(&mut self, dest: u8, r: Elementary, pop: bool) -> Ex<()> {
+        if self.state.x87.raise(r.flags) {
+            return Ok(());
+        }
+        self.set_c1(r.rounded_up);
+        self.state.x87.set(dest, r.value);
         if pop {
             self.state.x87.pop();
         }

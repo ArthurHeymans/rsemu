@@ -141,18 +141,20 @@
 //!
 //! # What is not
 //!
-//! - **No x87 transcendentals.** `F2XM1`, `FYL2X`, `FYL2XP1`, `FPTAN`,
-//!   `FPATAN`, `FSIN`, `FCOS` and `FSINCOS` are unassigned in [`isa`] and
-//!   raise `#UD`. Computing them to the last bit of a 64-bit significand
-//!   without a host `f64` is a subproject of its own, and an approximation
-//!   would be a silently wrong answer where a missing instruction is a loud
-//!   one. `FBLD`/`FBSTP` (packed decimal) and `FISTTP` (SSE3) are absent for
-//!   the same reason of scope.
+//! - **The x87 transcendentals are correctly rounded, not reproduced.**
+//!   `F2XM1`, `FYL2X`, `FYL2XP1`, `FPTAN`, `FPATAN`, `FSIN`, `FCOS` and
+//!   `FSINCOS` return the exact result rounded once
+//!   ([`crate::float::elementary`]), which is inside the architectural bound
+//!   on every part but is not any one part's low bits — and for a huge
+//!   argument near a multiple of `pi` it is the true sine, where silicon
+//!   reduces against a 66-bit `pi`.
 //! - **No `FERR#` pin.** An unmasked x87 exception is delivered as `#MF` only
 //!   with `CR0.NE` set; with it clear a real PC routes the exception through
 //!   the chipset to IRQ 13, and no wire models that, so the exception stays
 //!   pending instead of being delivered down a path that does not exist.
-//! - **No SSE3 or later**, no AVX, and no `XSAVE`.
+//! - **No SSE3 beyond `FISTTP`**, which [`Features::sse3`] admits without
+//!   `CPUID` claiming the extension; no SSSE3 or later, no AVX, and no
+//!   `XSAVE`.
 //! - **No hardware task switching in long mode**, which is the architecture:
 //!   a far transfer to a task gate or a task state segment is `#GP` there, and
 //!   the 64-bit task state segment is read only for its stack pointers.
@@ -617,6 +619,18 @@ pub struct Features {
     /// SSE without MMX. A Pentium MMX, a Pentium II and everything later has
     /// it; a Pentium Pro and everything earlier does not.
     pub mmx: bool,
+    /// SSE3 — of which only `FISTTP`, the truncating x87 integer store, is
+    /// implemented. Requires [`sse2`](Features::sse2).
+    ///
+    /// Off in every preset, and **not** reported by `CPUID` even when on:
+    /// leaf 1's `ECX.SSE3` promises the whole extension — `HADDPS`,
+    /// `MOVDDUP`, `LDDQU`, `MONITOR`/`MWAIT` and the rest — and a guest that
+    /// read the bit would use them. The flag exists so a machine description
+    /// can admit `FISTTP` for software that executes it unconditionally (or
+    /// that probed a different part), and so a part without it raises `#UD`
+    /// as the architecture says rather than executing an instruction it never
+    /// had.
+    pub sse3: bool,
 }
 
 impl Features {
@@ -639,6 +653,7 @@ impl Features {
         sse: false,
         sse2: false,
         mmx: false,
+        sse3: false,
     };
 
     /// What an 80486DX has: the 486 additions and an on-die x87 unit.
@@ -686,6 +701,7 @@ impl Features {
         sse: true,
         sse2: true,
         mmx: true,
+        sse3: false,
     };
 
     /// Whether this combination describes a part that could exist.
@@ -730,6 +746,9 @@ impl Features {
         }
         if self.sse2 && !self.sse {
             return missing("sse", "sse2");
+        }
+        if self.sse3 && !self.sse2 {
+            return missing("sse2", "sse3");
         }
         if self.sse && !self.fxsr {
             // `CR4.OSFXSR` is how an operating system says it has somewhere to
@@ -2459,7 +2478,7 @@ impl X86 {
         let mut features = variant.features();
         for name in [
             "cpuid", "cr4", "msr", "mtrr", "pae", "long", "nx", "syscall", "cmov", "pse", "pge",
-            "fpu", "cx8", "fxsr", "sse", "sse2", "mmx",
+            "fpu", "cx8", "fxsr", "sse", "sse2", "mmx", "sse3",
         ] {
             let Some(on) = r.optional::<bool>(name)? else {
                 continue;
@@ -2481,7 +2500,8 @@ impl X86 {
                 "fxsr" => features.fxsr = on,
                 "sse" => features.sse = on,
                 "mmx" => features.mmx = on,
-                _ => features.sse2 = on,
+                "sse2" => features.sse2 = on,
+                _ => features.sse3 = on,
             }
         }
         features.validate()?;

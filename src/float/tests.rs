@@ -1240,6 +1240,8 @@ fn no_host_float_in_the_implementation() {
         ("kernel.rs", include_str!("kernel.rs")),
         ("binary.rs", include_str!("binary.rs")),
         ("x87.rs", include_str!("x87.rs")),
+        ("elementary.rs", include_str!("elementary.rs")),
+        ("mp.rs", include_str!("mp.rs")),
     ];
     for (name, src) in sources {
         for (n, line) in src.lines().enumerate() {
@@ -1646,5 +1648,46 @@ fn fixed_point_conversions_round_once() {
     assert_eq!(
         from_unsigned_fixed::<B64>(0, 32, 8, Env::ARM),
         (0, Flags::NONE)
+    );
+}
+
+#[test]
+fn packed_decimal_converts_exactly_and_out_of_range_is_the_indefinite() {
+    use super::x87::{BCD_INDEFINITE, from_packed_bcd, to_packed_bcd};
+    // The largest eighteen-digit magnitude, both signs, round-trips exactly.
+    let mut max = [0x99u8; 10];
+    max[9] = 0;
+    let v = from_packed_bcd(max);
+    assert_eq!(v, x87::from_signed(999_999_999_999_999_999, 64, Env::X87).0);
+    assert_eq!(to_packed_bcd(v, Env::X87), (max, Flags::NONE));
+    max[9] = 0x80;
+    assert_eq!(
+        to_packed_bcd(from_packed_bcd(max), Env::X87),
+        (max, Flags::NONE)
+    );
+    // A sign over no digits is a signed zero, and comes back as one; the
+    // seven bits beside the sign are ignored on the way in.
+    let neg_zero = from_packed_bcd([0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff]);
+    assert_eq!(neg_zero, F80::new(0x8000, 0));
+    let mut z = [0u8; 10];
+    z[9] = 0x80;
+    assert_eq!(to_packed_bcd(neg_zero, Env::X87), (z, Flags::NONE));
+    // One more than the maximum does not fit.
+    let over = x87::from_signed(1_000_000_000_000_000_000, 64, Env::X87).0;
+    assert_eq!(
+        to_packed_bcd(over, Env::X87),
+        (BCD_INDEFINITE, Flags::INVALID)
+    );
+    assert_eq!(
+        to_packed_bcd(F80::INFINITY, Env::X87),
+        (BCD_INDEFINITE, Flags::INVALID)
+    );
+    // Rounding follows the direction: 0.5 is 0 to nearest and 1 upward.
+    let half = F80::new(0x3ffe, 1 << 63);
+    assert_eq!(to_packed_bcd(half, Env::X87).0, [0; 10]);
+    let up = Env::X87.round(Round::TowardPositive);
+    assert_eq!(
+        to_packed_bcd(half, up),
+        ([1, 0, 0, 0, 0, 0, 0, 0, 0, 0], Flags::INEXACT)
     );
 }

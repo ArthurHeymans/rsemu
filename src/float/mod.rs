@@ -17,6 +17,12 @@
 //!   implementation over [`Format`], on raw bit patterns held in a `u64`.
 //! * [`x87`] — the 80-bit double extended format, with the explicit integer
 //!   bit, the unsupported encodings, and x87's precision control.
+//! * [`elementary`] — the x87 transcendentals (`sin`, `cos`, `tan`, `atan2`,
+//!   `2^x - 1`, `y log2 x`, `y log2(1 + x)`), **correctly rounded** by Ziv's
+//!   strategy over error-tracked multi-precision fixed point. They are the
+//!   one family here whose exact result is not finite, so they hand the
+//!   rounding step an enclosure that provably decides it rather than an exact
+//!   value.
 //! * `add`/`sub`/`mul`/`div`/`sqrt`/`fma`, comparisons, `min`/`max`,
 //!   classification, round-to-integral, format conversion and both directions
 //!   of integer conversion, at all five rounding modes, with exact subnormals
@@ -68,7 +74,9 @@
 //! (`CLAUDE.md`, provenance).
 
 pub mod binary;
+pub mod elementary;
 mod kernel;
+mod mp;
 pub mod x87;
 
 #[cfg(test)]

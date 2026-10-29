@@ -907,9 +907,12 @@ const LOWERCASE: &[(&str, &str)] = &[
     ("WRMSR", "wrmsr"),
     ("CMPXCHG8B", "cmpxchg8b"),
     // The x87 unit.
+    ("F2XM1", "f2xm1"),
     ("FABS", "fabs"),
     ("FADD", "fadd"),
     ("FADDP", "faddp"),
+    ("FBLD", "fbld"),
+    ("FBSTP", "fbstp"),
     ("FCHS", "fchs"),
     ("FCMOVB", "fcmovb"),
     ("FCMOVBE", "fcmovbe"),
@@ -924,6 +927,7 @@ const LOWERCASE: &[(&str, &str)] = &[
     ("FCOMIP", "fcomip"),
     ("FCOMP", "fcomp"),
     ("FCOMPP", "fcompp"),
+    ("FCOS", "fcos"),
     ("FDECSTP", "fdecstp"),
     ("FDIV", "fdiv"),
     ("FDIVP", "fdivp"),
@@ -940,6 +944,7 @@ const LOWERCASE: &[(&str, &str)] = &[
     ("FINCSTP", "fincstp"),
     ("FIST", "fist"),
     ("FISTP", "fistp"),
+    ("FISTTP", "fisttp"),
     ("FISUB", "fisub"),
     ("FISUBR", "fisubr"),
     ("FLD", "fld"),
@@ -961,11 +966,15 @@ const LOWERCASE: &[(&str, &str)] = &[
     ("FNSTCW", "fnstcw"),
     ("FNSTENV", "fnstenv"),
     ("FNSTSW", "fnstsw"),
+    ("FPATAN", "fpatan"),
     ("FPREM", "fprem"),
     ("FPREM1", "fprem1"),
+    ("FPTAN", "fptan"),
     ("FRNDINT", "frndint"),
     ("FRSTOR", "frstor"),
     ("FSCALE", "fscale"),
+    ("FSIN", "fsin"),
+    ("FSINCOS", "fsincos"),
     ("FSQRT", "fsqrt"),
     ("FST", "fst"),
     ("FSTP", "fstp"),
@@ -982,6 +991,8 @@ const LOWERCASE: &[(&str, &str)] = &[
     ("FXAM", "fxam"),
     ("FXCH", "fxch"),
     ("FXTRACT", "fxtract"),
+    ("FYL2X", "fyl2x"),
+    ("FYL2XP1", "fyl2xp1"),
     // SSE and SSE2.
     ("ADDPD", "addpd"),
     ("ADDPS", "addps"),
@@ -1374,9 +1385,12 @@ define_ops! {
     CMPXCHG8B = "compare EDX:EAX with a 64-bit memory operand and exchange (CMPXCHG16B with REX.W)",
 
     // ---- x87 -------------------------------------------------------------
+    F2XM1 = "replace ST(0) with 2 to the ST(0), minus one",
     FABS = "replace ST(0) with its magnitude",
     FADD = "floating-point add",
     FADDP = "floating-point add and pop",
+    FBLD = "push an 18-digit packed decimal integer, converted",
+    FBSTP = "store ST(0) as an 18-digit packed decimal integer and pop",
     FCHS = "invert the sign of ST(0)",
     FCMOVB = "move ST(i) to ST(0) if below (carry set)",
     FCMOVBE = "move ST(i) to ST(0) if below or equal",
@@ -1391,6 +1405,7 @@ define_ops! {
     FCOMIP = "compare ST(0) with ST(i) into the flags, then pop",
     FCOMP = "compare and pop",
     FCOMPP = "compare and pop twice",
+    FCOS = "replace ST(0) with its cosine",
     FDECSTP = "decrement the top-of-stack pointer, leaving the tags alone",
     FDIV = "floating-point divide",
     FDIVP = "floating-point divide and pop",
@@ -1407,6 +1422,7 @@ define_ops! {
     FINCSTP = "increment the top-of-stack pointer, leaving the tags alone",
     FIST = "store ST(0) as an integer",
     FISTP = "store ST(0) as an integer and pop",
+    FISTTP = "store ST(0) as an integer truncated toward zero, and pop (SSE3)",
     FISUB = "subtract an integer from memory from ST(0)",
     FISUBR = "subtract ST(0) from an integer from memory",
     FLD = "push a floating-point value",
@@ -1428,11 +1444,15 @@ define_ops! {
     FNSTCW = "store the control word",
     FNSTENV = "store the environment",
     FNSTSW = "store the status word",
+    FPATAN = "replace ST(1) with the arctangent of ST(1) / ST(0), then pop",
     FPREM = "the partial remainder of ST(0) / ST(1), truncated quotient",
     FPREM1 = "the IEEE partial remainder of ST(0) / ST(1)",
+    FPTAN = "replace ST(0) with its tangent, then push 1.0",
     FRNDINT = "round ST(0) to an integer in the current rounding mode",
     FRSTOR = "reload the environment and the eight registers",
     FSCALE = "multiply ST(0) by 2 to the truncated ST(1)",
+    FSIN = "replace ST(0) with its sine",
+    FSINCOS = "replace ST(0) with its sine, then push its cosine",
     FSQRT = "the square root of ST(0)",
     FST = "store ST(0)",
     FSTP = "store ST(0) and pop",
@@ -1449,6 +1469,8 @@ define_ops! {
     FXAM = "classify ST(0) into the condition codes",
     FXCH = "exchange ST(0) with ST(i)",
     FXTRACT = "split ST(0) into its exponent and its significand",
+    FYL2X = "replace ST(1) with ST(1) times log2 of ST(0), then pop",
+    FYL2XP1 = "replace ST(1) with ST(1) times log2 of ST(0) + 1, then pop",
 
     // ---- SSE and SSE2 -----------------------------------------------------
     ADDPD = "add two packed doubles",
@@ -1809,9 +1831,12 @@ impl Op {
     pub const fn is_x87(self) -> bool {
         matches!(
             self,
-            Op::FABS
+            Op::F2XM1
+                | Op::FABS
                 | Op::FADD
                 | Op::FADDP
+                | Op::FBLD
+                | Op::FBSTP
                 | Op::FCHS
                 | Op::FCMOVB
                 | Op::FCMOVBE
@@ -1826,6 +1851,7 @@ impl Op {
                 | Op::FCOMIP
                 | Op::FCOMP
                 | Op::FCOMPP
+                | Op::FCOS
                 | Op::FDECSTP
                 | Op::FDIV
                 | Op::FDIVP
@@ -1842,6 +1868,7 @@ impl Op {
                 | Op::FINCSTP
                 | Op::FIST
                 | Op::FISTP
+                | Op::FISTTP
                 | Op::FISUB
                 | Op::FISUBR
                 | Op::FLD
@@ -1863,11 +1890,15 @@ impl Op {
                 | Op::FNSTCW
                 | Op::FNSTENV
                 | Op::FNSTSW
+                | Op::FPATAN
                 | Op::FPREM
                 | Op::FPREM1
+                | Op::FPTAN
                 | Op::FRNDINT
                 | Op::FRSTOR
                 | Op::FSCALE
+                | Op::FSIN
+                | Op::FSINCOS
                 | Op::FSQRT
                 | Op::FST
                 | Op::FSTP
@@ -1884,6 +1915,8 @@ impl Op {
                 | Op::FXAM
                 | Op::FXCH
                 | Op::FXTRACT
+                | Op::FYL2X
+                | Op::FYL2XP1
         )
     }
 
@@ -2292,6 +2325,18 @@ impl Op {
             Op::FRNDINT => 21,
             Op::FSCALE => 30,
             Op::FXTRACT => 16,
+            // The transcendentals and the decimal pair, from the same table.
+            // `FISTTP` postdates the 486 and is given `FIST`'s figure.
+            Op::F2XM1 => 140,
+            Op::FYL2X => 196,
+            Op::FYL2XP1 => 171,
+            Op::FPTAN => 200,
+            Op::FPATAN => 218,
+            Op::FSIN | Op::FCOS => 257,
+            Op::FSINCOS => 292,
+            Op::FBLD => 70,
+            Op::FBSTP => 172,
+            Op::FISTTP => 29,
             Op::FLD | Op::FST | Op::FSTP | Op::FXCH => 4,
             Op::FILD => 13,
             Op::FIST | Op::FISTP => 29,
@@ -3918,9 +3963,11 @@ pub static X87_MEM: [[Insn; 8]; 8] = [
         7 x 1 FIDIVR St0 Mi32 Documented;
     },
     // DB: 32-bit integer transfer, and the 80-bit memory format. `/1` is
-    // `FISTTP`, which arrived with SSE3 and is not implemented here.
+    // `FISTTP`, which arrived with SSE3; it decodes everywhere and the
+    // executor raises `#UD` on a part without `Features::sse3`.
     x87map! { 8;
         0 x 1 FILD  None Mi32 Documented;
+        1 x 1 FISTTP Mi32 None Documented;
         2 x 1 FIST  Mi32 None Documented;
         3 x 1 FISTP Mi32 None Documented;
         5 x 1 FLD   None Mf80 Documented;
@@ -3940,6 +3987,7 @@ pub static X87_MEM: [[Insn; 8]; 8] = [
     // DD: double-precision transfer, and the whole-unit save and restore.
     x87map! { 8;
         0 x 1 FLD    None   Mf64   Documented;
+        1 x 1 FISTTP Mi64   None   Documented;
         2 x 1 FST    Mf64   None   Documented;
         3 x 1 FSTP   Mf64   None   Documented;
         4 x 1 FRSTOR None   Mfsave Documented;
@@ -3957,14 +4005,19 @@ pub static X87_MEM: [[Insn; 8]; 8] = [
         6 x 1 FIDIV  St0 Mi16 Documented;
         7 x 1 FIDIVR St0 Mi16 Documented;
     },
-    // DF: 16- and 64-bit integer transfer. `/4` and `/6` are `FBLD` and
-    // `FBSTP`, the packed-decimal pair, which are not implemented.
+    // DF: 16- and 64-bit integer transfer, and `FBLD`/`FBSTP`, the
+    // packed-decimal pair. Their ten-byte operand is spelled `Mf80` because
+    // that is its width and its disassembly (`tbyte`); the bytes are decimal
+    // digits, not an extended-precision value.
     x87map! { 8;
-        0 x 1 FILD  None Mi16 Documented;
-        2 x 1 FIST  Mi16 None Documented;
-        3 x 1 FISTP Mi16 None Documented;
-        5 x 1 FILD  None Mi64 Documented;
-        7 x 1 FISTP Mi64 None Documented;
+        0 x 1 FILD   None  Mi16 Documented;
+        1 x 1 FISTTP Mi16  None Documented;
+        2 x 1 FIST   Mi16  None Documented;
+        3 x 1 FISTP  Mi16  None Documented;
+        4 x 1 FBLD   None  Mf80 Documented;
+        5 x 1 FILD   None  Mi64 Documented;
+        6 x 1 FBSTP  Mf80  None Documented;
+        7 x 1 FISTP  Mi64  None Documented;
     },
 ];
 
@@ -3973,11 +4026,9 @@ pub static X87_MEM: [[Insn; 8]; 8] = [
 ///
 /// *Intel SDM* volume 2 appendix A.4, tables A-16 through A-23 (the odd
 /// halves). The transcendental functions — `F2XM1`, `FYL2X`, `FYL2XP1`,
-/// `FPTAN`, `FPATAN`, `FSIN`, `FCOS`, `FSINCOS` — are deliberately left
-/// unassigned: computing them without a host `f64` is a project of its own,
-/// and an encoding that raises `#UD` is a truthful "not implemented" where an
-/// approximation would be a silent wrong answer. `super`'s module
-/// documentation lists them.
+/// `FPTAN`, `FPATAN`, `FSIN`, `FCOS`, `FSINCOS` — are here, and are
+/// correctly rounded rather than approximated; see
+/// [`crate::float::elementary`] for how.
 pub static X87_REG: [[Insn; 64]; 8] = [
     // D8: ST(0) is the destination throughout.
     x87map! { 64;
@@ -3990,8 +4041,8 @@ pub static X87_REG: [[Insn; 64]; 8] = [
         0x30 x 8 FDIV  St0 Sti  Documented;
         0x38 x 8 FDIVR St0 Sti  Documented;
     },
-    // D9: the stack shuffles, the constants, and the exact transcendental
-    // helpers. `D9 F4`-`D9 FD` is where the implemented ones cluster.
+    // D9: the stack shuffles, the constants, the transcendentals, and their
+    // exact helpers. `D9 F0`-`D9 FF` is the whole arithmetic block.
     x87map! { 64;
         0x00 x 8 FLD     None Sti  Documented;
         0x08 x 8 FXCH    Sti  None Documented;
@@ -4007,14 +4058,22 @@ pub static X87_REG: [[Insn; 64]; 8] = [
         0x2c x 1 FLDLG2  None None Documented;
         0x2d x 1 FLDLN2  None None Documented;
         0x2e x 1 FLDZ    None None Documented;
+        0x30 x 1 F2XM1   None None Documented;
+        0x31 x 1 FYL2X   None None Documented;
+        0x32 x 1 FPTAN   None None Documented;
+        0x33 x 1 FPATAN  None None Documented;
         0x34 x 1 FXTRACT None None Documented;
         0x35 x 1 FPREM1  None None Documented;
         0x36 x 1 FDECSTP None None Documented;
         0x37 x 1 FINCSTP None None Documented;
         0x38 x 1 FPREM   None None Documented;
+        0x39 x 1 FYL2XP1 None None Documented;
         0x3a x 1 FSQRT   None None Documented;
+        0x3b x 1 FSINCOS None None Documented;
         0x3c x 1 FRNDINT None None Documented;
         0x3d x 1 FSCALE  None None Documented;
+        0x3e x 1 FSIN    None None Documented;
+        0x3f x 1 FCOS    None None Documented;
     },
     // DA: the four "move if the integer flags say so" forms.
     x87map! { 64;
