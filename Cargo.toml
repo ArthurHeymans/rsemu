@@ -2027,9 +2027,13 @@ dev-stm32-dmamux = []
 # the alias at address zero belongs, and MEM_MODE picks which of the board's
 # `boot-sources` answers through it, so a bootloader that remaps SRAM to zero
 # and branches there fetches SRAM. On an L4 it also drives `fwdis`, which is
-# what switches `st.firewall` on. Written from ST RM0090 S9 and S12 and ST
-# RM0351 S9 and S13; no emulator source was consulted (ROADMAP.md S1).
-# `no_std + alloc`, no `unsafe`, no dependencies.
+# what switches `st.firewall` on. `st.exti`'s `variant = "u5"` is the
+# STM32U575/U585 block (RM0456 S22), which ST rebuilt: separate rising and
+# falling pending registers, and the EXTICR port mux moved *into* EXTI, so on a
+# U5 the GPIO pins wire straight to `exti.pa0`... with st.syscfg's names.
+# Written from ST RM0090 S9 and S12, ST RM0351 S9 and S13 and ST RM0456 S22
+# with the ST CMSIS stm32u585xx.h offsets (Apache-2.0); no emulator source was
+# consulted (ROADMAP.md S1). `no_std + alloc`, no `unsafe`, no dependencies.
 dev-stm32-exti = []
 
 # The STM32L0/L4/L4+ Firewall (src/dev/stm32/firewall.rs): one class,
