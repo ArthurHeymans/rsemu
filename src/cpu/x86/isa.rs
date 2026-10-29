@@ -1577,7 +1577,7 @@ define_ops! {
     XORPS = "bitwise exclusive OR of packed singles",
 
     // ---- SSE2's packed-integer half --------------------------------------
-    MASKMOVDQU = "store the bytes of a register selected by a mask, to [DS:rDI]",
+    MASKMOVDQU = "store the bytes of a register selected by a mask, to the address in DS:rDI",
     MOVNTDQ = "store a double quadword bypassing the cache",
     PACKSSDW = "pack doublewords into words with signed saturation",
     PACKSSWB = "pack words into bytes with signed saturation",
