@@ -155,6 +155,18 @@
 //! the register face, which is why it is a property here rather than a second
 //! class.
 //!
+//! `variant = "u5"` is the STM32U5's (RM0456's HASH chapter; `HASH_CR_ALGO`
+//! and the `HASH_SR_*` definitions in ST CMSIS `stm32u585xx.h`, Apache-2.0),
+//! and `v2` is **not** it: the U5 moved `ALGO` to a contiguous two-bit field
+//! at `[18:17]`, with bit 7 reserved. ST's U5 HAL writes MD5 as bit 17 alone
+//! and SHA-256 as both, which a `v2` block would read as SHA-1 and SHA-224 —
+//! a wrong digest with no error. The U5's `SR` also reports the FIFO: `NBWP`
+//! at `[13:9]` (words pushed), `DINNE` at 15 and `NBWE` at `[20:16]` (words
+//! still expected). Here those are this model's FIFO count, whether it is
+//! nonzero, and the room left before `DINIS` clears. The rest — `DIN`, `STR`,
+//! both `HR` windows, `IMR`, the fifty-four `CSR` words — sits at the `v2`
+//! offsets and behaves as described above.
+//!
 //! `no_std + alloc`, no `unsafe`, no dependencies.
 
 use alloc::boxed::Box;
@@ -222,6 +234,9 @@ const CR_DINNE: u32 = 1 << 12;
 const CR_MDMAT: u32 = 1 << 13;
 const CR_LKEY: u32 = 1 << 16;
 const CR_ALGO1: u32 = 1 << 18;
+/// The U5's `ALGO[1:0]`, bits 17 and 18 (ST CMSIS `HASH_CR_ALGO`).
+const CR_ALGO_U5_SHIFT: u32 = 17;
+const CR_ALGO_U5: u32 = 0x3 << CR_ALGO_U5_SHIFT;
 
 const STR_NBLW_MASK: u32 = 0x1f;
 const STR_DCAL: u32 = 1 << 8;
@@ -234,6 +249,12 @@ const SR_DINIS: u32 = 1 << 0;
 const SR_DCIS: u32 = 1 << 1;
 const SR_DMAS: u32 = 1 << 2;
 const SR_BUSY: u32 = 1 << 3;
+/// The U5's `SR.NBWP[4:0]`: words pushed into the FIFO.
+const SR_NBWP_SHIFT: u32 = 9;
+/// The U5's `SR.DINNE`.
+const SR_DINNE: u32 = 1 << 15;
+/// The U5's `SR.NBWE[4:0]`: words still expected.
+const SR_NBWE_SHIFT: u32 = 16;
 
 /// The FIFO depth, in words — one 512-bit block.
 const FIFO_WORDS: usize = 16;
@@ -617,6 +638,9 @@ pub enum Variant {
     F4,
     /// RM0351 §30 / RM0432 §26: adds SHA-224, SHA-256 and `MDMAT`.
     V2,
+    /// RM0456 (STM32U5): `v2`'s algorithms with `ALGO` at `[18:17]` and the
+    /// FIFO counts in `SR`.
+    U5,
 }
 
 impl Variant {
@@ -626,16 +650,35 @@ impl Variant {
         match self {
             Variant::F4 => "f4",
             Variant::V2 => "v2",
+            Variant::U5 => "u5",
+        }
+    }
+
+    /// The snapshot's encoding of the variant.
+    const fn code(self) -> u8 {
+        match self {
+            Variant::F4 => 0,
+            Variant::V2 => 1,
+            Variant::U5 => 2,
+        }
+    }
+
+    /// `ALGO[1:0]` out of a `CR` value.
+    const fn algo_bits(self, cr: u32) -> u32 {
+        match self {
+            Variant::F4 => (cr >> 7) & 0x1,
+            Variant::V2 => ((cr >> 7) & 0x1) | ((cr >> 17) & 0x2),
+            Variant::U5 => (cr & CR_ALGO_U5) >> CR_ALGO_U5_SHIFT,
         }
     }
 
     /// The `CR` bits this variant actually implements.
     const fn cr_mask(self) -> u32 {
-        let common =
-            CR_DMAE | (CR_DATATYPE_MASK << CR_DATATYPE_SHIFT) | CR_MODE | CR_ALGO0 | CR_LKEY;
+        let common = CR_DMAE | (CR_DATATYPE_MASK << CR_DATATYPE_SHIFT) | CR_MODE | CR_LKEY;
         match self {
-            Variant::F4 => common,
-            Variant::V2 => common | CR_MDMAT | CR_ALGO1,
+            Variant::F4 => common | CR_ALGO0,
+            Variant::V2 => common | CR_ALGO0 | CR_MDMAT | CR_ALGO1,
+            Variant::U5 => common | CR_MDMAT | CR_ALGO_U5,
         }
     }
 }
@@ -777,13 +820,7 @@ impl State {
 
     /// `INIT`: latch the configuration from the same write and start over.
     fn init(&mut self, cr: u32, variant: Variant) {
-        let algo_bits = ((cr >> 7) & 0x1)
-            | if variant == Variant::V2 {
-                (cr >> 17) & 0x2
-            } else {
-                0
-            };
-        self.algo = Algo::from_bits(algo_bits);
+        self.algo = Algo::from_bits(variant.algo_bits(cr));
         self.hmac = cr & CR_MODE != 0;
         self.datatype = (cr >> CR_DATATYPE_SHIFT) & CR_DATATYPE_MASK;
         self.lkey = cr & CR_LKEY != 0;
@@ -1072,7 +1109,18 @@ impl Registers {
             R_DIN => Ok(state.din),
             R_STR => Ok(state.nblw & STR_NBLW_MASK),
             R_IMR => Ok(state.imr & IMR_MASK),
-            R_SR => Ok(state.sr()),
+            R_SR => {
+                let mut sr = state.sr();
+                if self.variant == Variant::U5 {
+                    let pushed = state.nwords.min(FIFO_WORDS as u32);
+                    sr |= pushed << SR_NBWP_SHIFT;
+                    if pushed > 0 {
+                        sr |= SR_DINNE;
+                    }
+                    sr |= (FIFO_WORDS as u32 - pushed) << SR_NBWE_SHIFT;
+                }
+                Ok(sr)
+            }
             o if (R_HR_LOW..R_HR_LOW + 5 * 4).contains(&o) && o % 4 == 0 => {
                 Ok(state.hr[((o - R_HR_LOW) / 4) as usize])
             }
@@ -1198,15 +1246,16 @@ impl Hash {
     ///
     /// # Errors
     ///
-    /// If `variant` is neither `f4` nor `v2`, or an unknown property is set.
+    /// If `variant` is not `f4`, `v2` or `u5`, or an unknown property is set.
     pub fn new(props: &Props) -> Result<Hash> {
         let mut r = props.reader();
         let variant = match r.or_str("variant", "f4")? {
             "f4" => Variant::F4,
             "v2" => Variant::V2,
+            "u5" => Variant::U5,
             other => {
                 return Err(Error::Property(format!(
-                    "`variant` is `f4` or `v2`, not `{other}`"
+                    "`variant` is `f4`, `v2` or `u5`, not `{other}`"
                 )));
             }
         };
@@ -1279,10 +1328,7 @@ impl Device for Hash {
 
     fn save(&self, w: &mut ChunkWriter<'_>) -> Result<()> {
         let state = *self.regs.state.lock();
-        w.write_u8(match self.regs.variant {
-            Variant::F4 => 0,
-            Variant::V2 => 1,
-        })?;
+        w.write_u8(self.regs.variant.code())?;
         w.write_u32(state.cr)?;
         w.write_u32(state.imr)?;
         w.write_u32(state.nblw)?;
@@ -1315,6 +1361,7 @@ impl Device for Hash {
         let variant = match r.read_u8()? {
             0 => Variant::F4,
             1 => Variant::V2,
+            2 => Variant::U5,
             other => {
                 return Err(Error::State(format!(
                     "snapshot has HASH variant {other}, which this build does not know"
@@ -1417,7 +1464,7 @@ pub static CLASS: DeviceClass = DeviceClass {
         kind: ValueKind::Str,
         required: false,
         summary: "`f4` (default): SHA-1 and MD5, RM0090 §25. `v2`: adds SHA-224, \
-                  SHA-256 and MDMAT",
+                  SHA-256 and MDMAT. `u5`: v2 with ALGO at [18:17] and SR's FIFO counts",
     }],
     construct: |props| Ok(Box::new(Hash::new(props)?)),
 };
@@ -1444,7 +1491,7 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
 #[must_use]
 pub fn schema() -> ClassSchema {
     let schema = ClassSchema::new(CLASS_NAME)
-        .prop(PropSchema::new("variant", ValueKind::Str).values(&["f4", "v2"]))
+        .prop(PropSchema::new("variant", ValueKind::Str).values(&["f4", "v2", "u5"]))
         .port(pin::IRQ, PortDir::Out)
         .port(pin::DMA, PortDir::Out)
         .region("")

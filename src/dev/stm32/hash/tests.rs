@@ -1076,3 +1076,109 @@ fn a_reset_level_that_did_not_move_is_not_an_edge() {
     reset.sink.set_level(id, 0, Level::Low);
     assert_eq!(nbw(&d), held, "a low that was already low resets nothing");
 }
+
+// ---------------------------------------------------------------------------
+// The u5 variant
+// ---------------------------------------------------------------------------
+
+/// The U5's `CR` write that starts an operation: `ALGO` at `[18:17]`.
+fn start_u5(d: &Hash, algo: Algo, datatype: u32, hmac: bool) {
+    let mut cr = CR_INIT | (datatype << CR_DATATYPE_SHIFT) | (algo.bits() << CR_ALGO_U5_SHIFT);
+    if hmac {
+        cr |= CR_MODE;
+    }
+    poke(d, R_CR, cr);
+}
+
+#[test]
+fn the_u5_decodes_algo_at_bits_17_and_18() {
+    let d = Hash::build(Variant::U5);
+    for (algo, msg, want) in [
+        (Algo::Md5, &b"abc"[..], "900150983cd24fb0d6963f7d28e17f72"),
+        (
+            Algo::Sha224,
+            &b"abc"[..],
+            "23097d223405d8228642a477bda255b32aadbce4bda0b3f7e36c9da7",
+        ),
+        (
+            Algo::Sha256,
+            &b"abc"[..],
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        ),
+        (
+            Algo::Sha1,
+            &b"abc"[..],
+            "a9993e364706816aba3e25717850c26c9cd0d89d",
+        ),
+    ] {
+        start_u5(&d, algo, 2, false);
+        let nblw = feed(&d, 2, msg);
+        poke(&d, R_STR, nblw | STR_DCAL);
+        assert_eq!(digest_of(&d, algo), hex(want), "{algo:?}");
+    }
+    // Bit 7 is reserved on a U5: it neither reads back nor selects MD5.
+    poke(&d, R_CR, CR_INIT | CR_ALGO0);
+    assert_eq!(peek(&d, R_CR) & CR_ALGO0, 0);
+    assert_eq!(d.regs.state.lock().algo, Algo::Sha1);
+    // And a `v2` reading the U5's SHA-256 encoding gets SHA-224: the
+    // difference this variant exists for.
+    let v = v2();
+    poke(&v, R_CR, CR_INIT | CR_ALGO_U5);
+    assert_eq!(v.regs.state.lock().algo, Algo::Sha224);
+}
+
+#[test]
+fn the_u5_sr_counts_the_fifo() {
+    let d = Hash::build(Variant::U5);
+    start_u5(&d, Algo::Sha256, 0, false);
+    let sr = peek(&d, R_SR);
+    assert_eq!(sr & SR_DINNE, 0);
+    assert_eq!((sr >> SR_NBWP_SHIFT) & 0x1f, 0);
+    assert_eq!((sr >> SR_NBWE_SHIFT) & 0x1f, 16);
+    for _ in 0..3 {
+        poke(&d, R_DIN, 0);
+    }
+    let sr = peek(&d, R_SR);
+    assert_eq!(sr & SR_DINNE, SR_DINNE);
+    assert_eq!((sr >> SR_NBWP_SHIFT) & 0x1f, 3);
+    assert_eq!((sr >> SR_NBWE_SHIFT) & 0x1f, 13);
+    assert_eq!(sr & SR_DINIS, SR_DINIS);
+    // `v2` reports none of it.
+    let v = v2();
+    for _ in 0..3 {
+        poke(&v, R_DIN, 0);
+    }
+    assert_eq!(peek(&v, R_SR) & !0xf, 0);
+}
+
+#[test]
+fn a_u5_snapshot_round_trips_and_refuses_a_v2_one() {
+    let saved = Hash::build(Variant::U5);
+    start_u5(&saved, Algo::Sha256, 2, false);
+    feed(&saved, 2, &alloc::vec![b'a'; 100]);
+    let restored = Hash::build(Variant::U5);
+    round_trip(&saved, &restored);
+    assert_eq!(save_context(&restored), save_context(&saved));
+    assert_eq!(peek(&restored, R_SR), peek(&saved, R_SR));
+    assert_eq!(peek(&restored, R_CR), peek(&saved, R_CR));
+
+    let mut shape = MachineShape::new();
+    shape.add_device("hash", CLASS_NAME).unwrap();
+    let mut w = StateWriter::new(shape);
+    {
+        let mut chunk = w.chunk("hash", CLASS_NAME, STATE_VERSION).unwrap();
+        Device::save(&v2(), &mut chunk).unwrap();
+    }
+    let bytes = w.to_vec().unwrap();
+    let reader = StateReader::new(&bytes).unwrap();
+    let chunk = reader
+        .load("hash", CLASS_NAME, STATE_VERSION, &Migrations::new())
+        .unwrap();
+    assert!(Device::load(&restored, &mut chunk.reader()).is_err());
+    assert_eq!(
+        Hash::new(&Props::new().with("variant", Value::from("u5")))
+            .unwrap()
+            .variant(),
+        Variant::U5
+    );
+}
