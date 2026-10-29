@@ -73,6 +73,7 @@ the question never arises.
 | [`platforms/riscv-virt.md`](platforms/riscv-virt.md) | The RISC-V `virt` board |
 | [`platforms/arm64-virt.md`](platforms/arm64-virt.md) | The AArch64 `virt` board: a GICv2, a PL011, PSCI, and a generated device tree |
 | [`platforms/stm32f407.md`](platforms/stm32f407.md) | The `stm32f407` microcontroller board, its peripherals, and how an M-profile interrupt is wired |
+| [`platforms/stm32u5.md`](platforms/stm32u5.md) | The `stm32u575` and `stm32u585` boards: a Cortex-M33 with TrustZone off, a live clock tree, gated peripheral clocks, and ST's own HAL as the test |
 
 #### Which board boots what, and how far
 

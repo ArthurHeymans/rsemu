@@ -241,6 +241,8 @@ full = [
     "dev-stm32-icache",
     "dev-stm32-rng",
     "machine-stm32f407",
+    "machine-stm32u575",
+    "machine-stm32u585",
     "cpu-z80",
     "machine-z80-mini",
     "machine-usb-mini",
@@ -2315,6 +2317,40 @@ machine-stm32f407 = [
     # in the machine file selects.
     "dev-keypad-matrix",
 ]
+
+# The STM32U575 board (machines/stm32u575.machine plus the classes it names):
+# a Cortex-M33 with FPv5-SP-D16, 2 MiB of dual-bank flash and 768 KiB of SRAM,
+# as on ST's NUCLEO-U575ZI-Q, with TrustZone off (the factory option bytes).
+# The first board here whose clock tree is live -- it boots on MSIS at 4 MHz
+# and runs at whatever PLL1 is programmed to -- and whose peripheral clocks
+# are gated by RCC. docs/platforms/stm32u5.md has the account. Every feature
+# below names a class the board file instantiates. Adds no dependencies.
+machine-stm32u575 = [
+    "cpu-arm-v7m",
+    # The Armv8-M Mainline additions: the stack limits, the v8-M EXC_RETURN,
+    # PMSAv8, acquire/release, and the reset VTOR the board boots through.
+    "cpu-arm-v8m",
+    # FPv5-SP-D16: `part = "cortex-m33f"`, which firmware built
+    # `-mfloat-abi=hard` needs from its first function call.
+    "cpu-arm-v7m-fp",
+    "dev-stm32",
+    "dev-stm32-rcc",
+    "dev-stm32-pwr",
+    "dev-stm32-flash",
+    "dev-stm32-exti",
+    "dev-stm32-icache",
+    "dev-stm32-tim",
+    "dev-stm32-wdg",
+    "dev-stm32-dbgmcu",
+    "dev-stm32-crc",
+    "dev-stm32-rng",
+]
+
+# The STM32U585 board (machines/stm32u585.machine): the U575 with its crypto
+# blocks bonded out, as on ST's B-U585I-IOT02A Discovery kit. Of those, the
+# HASH processor is modelled; AES, SAES, PKA and OTFDEC are not. Adds no
+# dependencies.
+machine-stm32u585 = ["machine-stm32u575", "dev-stm32-hash"]
 
 # The Zilog Z80 core (src/cpu/z80): a cycle-accurate interpreter covering the
 # base, CB, ED, DD/FD and DDCB/FDCB pages, the undocumented IX/IY halves, SLL

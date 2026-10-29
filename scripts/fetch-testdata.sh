@@ -3009,6 +3009,101 @@ usermode_glibc_cc() {
 	printf '%s\n' "$wrapper"
 }
 
+# ---------------------------------------------------------------------------
+# stm32u5-hal: ST's own HAL, built into a smoke firmware for the U5 boards
+# ---------------------------------------------------------------------------
+#
+# Built rather than downloaded, like a64-tests: the app is ours
+# (tests/fixtures/stm32u5-hal, MIT) and what is fetched is the vendor code it
+# links against. All three are permissive, so they may be read as well as run
+# (CLAUDE.md, Provenance); they are fetched rather than committed because they
+# are large and someone else's. Pinned by commit, so a rebuild is the same
+# firmware.
+#
+#   * ST CMSIS device files for the U5 — Apache-2.0 — the register header,
+#     the startup file with the vector table, and system_stm32u5xx.c.
+#   * ST's STM32U5 HAL/LL driver — BSD-3-Clause.
+#   * Arm CMSIS 5 core headers (core_cm33.h and friends) — Apache-2.0.
+#
+# Needs arm-none-eabi-gcc. No C library is used, so a bare toolchain (one
+# without newlib, as Homebrew's is) is enough.
+readonly U5_DEVICE_REPO="https://github.com/STMicroelectronics/cmsis-device-u5"
+readonly U5_DEVICE_REV="624374fa1e21ca195d6f2102ac0caaa50d0ea4c8"   # v1.4.3
+readonly U5_HAL_REPO="https://github.com/STMicroelectronics/stm32u5xx-hal-driver"
+readonly U5_HAL_REV="6555ec181c456cf8f0cd04d2c8a4501003271a7e"
+readonly CMSIS5_REPO="https://github.com/ARM-software/CMSIS_5"
+readonly CMSIS5_REV="55b19837f5703e418ca37894d5745b1dc05e4c91"
+
+# git_at <repo> <rev> <dir>: a shallow checkout of exactly one commit.
+git_at() {
+	local repo="$1" rev="$2" dir="$3"
+	if [ -d "${dir}/.git" ] && [ "$(git -C "$dir" rev-parse HEAD 2>/dev/null)" = "$rev" ] && [ "$FORCE" = 0 ]; then
+		return 0
+	fi
+	rm -rf "$dir"
+	mkdir -p "$dir"
+	git -C "$dir" init -q
+	git -C "$dir" fetch -q --depth 1 "$repo" "$rev"
+	git -C "$dir" checkout -q FETCH_HEAD
+}
+
+fetch_stm32u5_hal() {
+	need git
+	need arm-none-eabi-gcc
+	need arm-none-eabi-objcopy
+	local dest="${DEST_ROOT}/stm32u5-hal"
+	local fixture="${REPO_ROOT}/tests/fixtures/stm32u5-hal"
+	local src="${dest}/src"
+	git_at "$U5_DEVICE_REPO" "$U5_DEVICE_REV" "${src}/cmsis-device-u5"
+	git_at "$U5_HAL_REPO" "$U5_HAL_REV" "${src}/stm32u5xx-hal-driver"
+	git_at "$CMSIS5_REPO" "$CMSIS5_REV" "${src}/CMSIS_5"
+	ok "sources at ${src}"
+
+	local hal="${src}/stm32u5xx-hal-driver" dev="${src}/cmsis-device-u5"
+	local core="${src}/CMSIS_5/CMSIS/Core/Include"
+	local part p obj s
+	for part in U575 U585; do
+		p="$(printf '%s' "$part" | tr 'U' 'u')"
+		obj="${dest}/obj-${p}"
+		rm -rf "$obj"
+		mkdir -p "$obj"
+		local cflags=(-mcpu=cortex-m33 -mthumb -mfloat-abi=hard -mfpu=fpv5-sp-d16
+			-O2 -g -ffreestanding -fno-math-errno -ffunction-sections -fdata-sections
+			"-DSTM32${part}xx" -DUSE_HAL_DRIVER
+			"-I${fixture}" "-I${fixture}/libc" "-I${hal}/Inc" "-I${dev}/Include" "-I${core}")
+		local srcs=("${fixture}/main.c" "${dev}/Source/Templates/system_stm32u5xx.c")
+		for s in "${hal}"/Src/stm32u5xx_hal*.c; do
+			case "$s" in *template*) continue ;; esac
+			srcs+=("$s")
+		done
+		for s in "${srcs[@]}"; do
+			arm-none-eabi-gcc "${cflags[@]}" -c "$s" -o "${obj}/$(basename "$s" .c).o"
+		done
+		arm-none-eabi-gcc "${cflags[@]}" -c "${dev}/Source/Templates/gcc/startup_stm32${p}xx.s" \
+			-o "${obj}/startup.o"
+		arm-none-eabi-gcc "${cflags[@]}" -T"${fixture}/u5.ld" -nostdlib \
+			-Wl,--gc-sections -Wl,--no-warn-rwx-segments \
+			-o "${dest}/${p}.elf" "${obj}"/*.o -lgcc
+		arm-none-eabi-objcopy -O binary "${dest}/${p}.elf" "${dest}/${p}.bin"
+		rm -rf "$obj"
+		ok "${p}.bin ($(wc -c <"${dest}/${p}.bin" | tr -d ' ') bytes)"
+	done
+	write_notice "$dest" "stm32u5-hal — ST's STM32U5 HAL linked into a smoke firmware
+The app: tests/fixtures/stm32u5-hal (rsemu, MIT).
+${U5_DEVICE_REPO} @ ${U5_DEVICE_REV} (Apache-2.0)
+${U5_HAL_REPO} @ ${U5_HAL_REV} (BSD-3-Clause)
+${CMSIS5_REPO} @ ${CMSIS5_REV} (Apache-2.0)
+
+All permissive. Fetched rather than committed because they are large and
+someone else's; the binaries carry ST's and Arm's code under those licences.
+
+Consumed by RSEMU_STM32U5_HAL_DIR in tests/stm32u5_hal.rs."
+	note ""
+	note "  Run it:"
+	note "      RSEMU_STM32U5_HAL_DIR=${dest} \\"
+	note "          cargo test --release --test stm32u5_hal -- --nocapture"
+}
+
 usage() {
 	cat <<'EOF'
 usage: scripts/fetch-testdata.sh [options] [suite ...]
@@ -3077,6 +3172,10 @@ Suites:
                  around the local package's Shell.efi (BSD-2-Clause-Patent).
                  RSEMU_ESP_APP replaces the application; RSEMU_ESP_KERNEL and
                  RSEMU_ESP_INITRD put a bzImage and an initramfs beside it.
+  stm32u5-hal    ST's STM32U5 HAL (BSD-3-Clause) and CMSIS files (Apache-2.0),
+                 fetched at pinned commits and BUILT into a smoke firmware for
+                 the stm32u575/stm32u585 boards from tests/fixtures/stm32u5-hal.
+                 Needs arm-none-eabi-gcc (no C library required)
   linux          riscv64 Linux Image to boot on it (GPL-2.0, FETCH-ONLY)
   initramfs      a busybox root filesystem for that kernel, built here around
                  Debian's riscv64 busybox-static (GPL-2.0, FETCH-ONLY)
@@ -3130,7 +3229,7 @@ list_present() {
 	fi
 	local suite
 	for suite in sst-65x02 mips-r3000 nestest accuracycoin gb-blargg gb-mooneye \
-		sms-zexall apple1 riscv riscv-arch-test a64-tests arm64 freedos x86; do
+		sms-zexall apple1 riscv riscv-arch-test a64-tests arm64 freedos x86 stm32u5-hal; do
 		if [ -d "${DEST_ROOT}/${suite}" ]; then
 			printf '  %-14s %s\n' "$suite" \
 				"$(du -sh "${DEST_ROOT}/${suite}" 2>/dev/null | cut -f1) present"
@@ -3198,6 +3297,7 @@ for suite in "${SUITES[@]}"; do
 		initramfs|rootfs) fetch_initramfs ;;
 		initramfs-virtio|virtio) fetch_initramfs_virtio ;;
 		initramfs-x86|x86) fetch_initramfs_x86 ;;
+		stm32u5-hal|u5) fetch_stm32u5_hal ;;
 		*) die "unknown suite $suite (try --help)" ;;
 	esac
 done

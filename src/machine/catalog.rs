@@ -520,6 +520,32 @@ pub static STM32F407: CatalogEntry = CatalogEntry {
     source: include_str!("../../machines/stm32f407.machine"),
 };
 
+/// An STM32U575ZIT6Q microcontroller, when this build has a Cortex-M33.
+///
+/// The NUCLEO-U575ZI-Q's part, with TrustZone off: a Cortex-M33 that boots
+/// through `VTOR` at 0x08000000 rather than a boot alias at zero, on a clock
+/// tree `st.rcc` drives live from MSIS at 4 MHz. The `firmware` slot takes the
+/// flash image.
+#[cfg(feature = "machine-stm32u575")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-stm32u575")))]
+pub static STM32U575: CatalogEntry = CatalogEntry {
+    name: "stm32u575",
+    summary: "STM32U575ZIT6Q: Cortex-M33 up to 160 MHz, 2 MiB flash, 768 KiB SRAM, GPIO A-I, six U(S)ARTs",
+    media: &["firmware"],
+    source: include_str!("../../machines/stm32u575.machine"),
+};
+
+/// An STM32U585AII6Q microcontroller: the U575 plus the HASH processor, as on
+/// the B-U585I-IOT02A Discovery kit.
+#[cfg(feature = "machine-stm32u585")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-stm32u585")))]
+pub static STM32U585: CatalogEntry = CatalogEntry {
+    name: "stm32u585",
+    summary: "STM32U585AII6Q: the STM32U575 plus the HASH processor (SHA-1/224/256, MD5, HMAC)",
+    media: &["firmware"],
+    source: include_str!("../../machines/stm32u585.machine"),
+};
+
 /// A minimal Z80 board, when this build has a Z80.
 ///
 /// A synthetic board rather than a product: ROM at the reset vector, RAM above
@@ -1062,6 +1088,10 @@ pub fn machines() -> Vec<&'static CatalogEntry> {
     out.push(&SPI_FLASH);
     #[cfg(feature = "machine-stm32f407")]
     out.push(&STM32F407);
+    #[cfg(feature = "machine-stm32u575")]
+    out.push(&STM32U575);
+    #[cfg(feature = "machine-stm32u585")]
+    out.push(&STM32U585);
     #[cfg(feature = "machine-usb-mini")]
     out.push(&USB_MINI);
     #[cfg(feature = "machine-xhci-mini")]
@@ -2591,6 +2621,17 @@ mod tests {
             ("stm32f407", "firmware") => &[
                 0x00, 0x00, 0x02, 0x20, // SP = 0x20020000, the top of SRAM2
                 0x09, 0x00, 0x00, 0x00, // PC = 0x00000008 | 1
+                0xfe, 0xe7, // b .
+            ],
+            // The same three things for a U5, at the address the core boots
+            // through: `VTOR` resets to 0x08000000, where the flash image is
+            // loaded, and nothing is mapped at zero. The stack is the top of
+            // SRAM1. `tests/stm32u5_board.rs` has the program that does
+            // something.
+            #[cfg(feature = "machine-stm32u575")]
+            ("stm32u575" | "stm32u585", "firmware") => &[
+                0x00, 0x00, 0x03, 0x20, // SP = 0x20030000, the top of SRAM1
+                0x09, 0x00, 0x00, 0x08, // PC = 0x08000008 | 1
                 0xfe, 0xe7, // b .
             ],
             // `jal x0, 0` — the RV32 jump-to-itself, which is the whole

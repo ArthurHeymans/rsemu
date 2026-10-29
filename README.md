@@ -549,6 +549,18 @@ Cortex-M4's own bus and no DMA reaches it, so `dmabus` has SRAM and the
 peripherals in it and no CCM, and a stream pointed at `0x10000000` raises a
 transfer error exactly as the silicon does.
 
+`stm32u575` and `stm32u585` are its Armv8-M successors: an **STM32U575** (the
+NUCLEO-U575ZI-Q's part) and an **STM32U585** (the B-U585I-IOT02A's, which adds a
+HASH unit), each a Cortex-M33 with TrustZone left off as the factory ships it.
+They are the first boards here whose clock tree is *live* — the part wakes on a
+4 MHz internal oscillator and runs at whatever the firmware programs its PLL to
+— and whose peripheral clocks are gated by RCC, so a driver that forgets to
+enable one talks to a dead block. The test is ST's own STM32U5 HAL, fetched and
+built by `scripts/fetch-testdata.sh stm32u5-hal`: clock configuration to
+160 MHz, interrupts, timers, the RNG, CRC, a flash erase and program, and a
+SHA-256, each checked. `docs/platforms/stm32u5.md` lists what is not there yet,
+DMA and the RTC first.
+
 `amiga-a500` is the one that boots a **desktop**. A
 68000, the full custom chipset — Agnus with the copper, the blitter and the
 beam, Denise, Paula, two 8520s, Gary's address decode — and a 3.5-inch drive on
