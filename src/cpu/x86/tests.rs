@@ -4090,6 +4090,33 @@ mod long_mode {
     }
 
     #[test]
+    fn movq_with_rex_w_moves_a_whole_general_register_to_and_from_mm() {
+        // mov rax, imm64 ; movq mm0, rax ; movq [MARK], mm0 ;
+        // movd mm1, eax ; movq rcx, mm1 ; mov [MARK+8], rcx ; hlt
+        let mut code = alloc::vec![0x48u8, 0xb8];
+        code.extend_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
+        code.extend_from_slice(&[0x48, 0x0f, 0x6e, 0xc0]);
+        code.extend_from_slice(&[0x0f, 0x7f, 0x04, 0x25]);
+        code.extend_from_slice(&(la::MARK as u32).to_le_bytes());
+        code.extend_from_slice(&[0x0f, 0x6e, 0xc8, 0x48, 0x0f, 0x7e, 0xc9]);
+        code.extend_from_slice(&[0x48, 0x89, 0x0c, 0x25]);
+        code.extend_from_slice(&((la::MARK + 8) as u32).to_le_bytes());
+        code.push(0xf4);
+        let pc = pc64();
+        pc.start_protected();
+        pc.prepare_long();
+        pc.write(at::CODE0, &enter_long_mode_code(la::CODE64));
+        pc.write(la::CODE64, &code);
+        assert!(pc.run(200) < 200);
+        assert_eq!(pc.read64(la::MARK), 0x1122_3344_5566_7788);
+        assert_eq!(
+            pc.read64(la::MARK + 8),
+            0x5566_7788,
+            "movd zero-extends into the quadword"
+        );
+    }
+
+    #[test]
     fn a_pop_to_the_stack_addresses_its_destination_after_the_increment() {
         // *Intel SDM* volume 2, `POP`: "If the ESP register is used as a base
         // register for addressing a destination operand in memory, the POP
@@ -6938,14 +6965,13 @@ mod fp {
             (8, "CX8"),
             (13, "PGE"),
             (15, "CMOV"),
+            (23, "MMX"),
             (24, "FXSR"),
             (25, "SSE"),
             (26, "SSE2"),
         ] {
             assert_ne!(edx & (1u32 << bit), 0, "leaf 1 should report {name}");
         }
-        // And still not MMX, whose registers alias the x87 stack.
-        assert_eq!(edx & (1 << 23), 0, "MMX is not implemented");
     }
 
     #[test]
@@ -6993,6 +7019,7 @@ mod fp {
         let sources = [
             ("fpu.rs", include_str!("fpu.rs")),
             ("fpexec.rs", include_str!("fpexec.rs")),
+            ("mmx.rs", include_str!("mmx.rs")),
         ];
         let boundary = |src: &str, at: usize| {
             let before = src[..at].chars().next_back();
@@ -8005,7 +8032,9 @@ mod fp {
             &[0xf3, 0x0f, 0x2b, 0x05, 0, 0xb0, 0, 0],
             &[0xf2, 0x0f, 0x2b, 0x05, 0, 0xb0, 0, 0],
             &[0x0f, 0xe6, 0xc1],
-            &[0x0f, 0xf7, 0xc1],
+            // `0F F7` with no prefix is `MASKMOVQ` now, an MMX instruction;
+            // `0F D6` with none is still nothing.
+            &[0x0f, 0xd6, 0xc1],
         ] {
             let pc = ssepc();
             pc.idt(6, gate(0x08, HANDLER as u32, sys_type::INT_GATE32, 0));
@@ -8945,5 +8974,871 @@ mod multiprocessor {
         assert_eq!(after.mtrr_var, before.mtrr_var);
         assert_eq!(after.mtrr_fix, before.mtrr_fix);
         assert_eq!(after.mtrr_def_type, before.mtrr_def_type);
+    }
+}
+
+/// MMX: the `MM` registers that alias the x87 ones, their side effects on the
+/// x87 unit, and every encoding issue #37 asked for. Expected values are
+/// hand-checkable lane arithmetic or the rule on the instruction's page in
+/// *Intel SDM* volume 2; the aliasing is volume 1 §9.5.
+mod mmx {
+    use super::*;
+    use crate::cpu::x86::fpu::{Sse, Tag, mxcsr, sw};
+    use crate::cpu::x86::prot::{cr0, cr4};
+    use crate::float::x87::F80;
+
+    /// Scratch memory: two operands and a result.
+    const A: u64 = 0xb000;
+    const B: u64 = 0xb008;
+    const OUT: u64 = 0xc000;
+    /// A 512-byte save area, sixteen-byte aligned.
+    const SAVE: u64 = 0xd000;
+    /// Where a fault handler sits, and `RIP` once its `hlt` has retired.
+    const HANDLER: u64 = 0x3800;
+    const HANDLED: u64 = HANDLER + 1;
+
+    /// An x86-64 part (MMX, SSE, SSE2) in 32-bit protected mode with
+    /// `CR4.OSFXSR` set, so the cross-file forms are allowed too.
+    fn mmxpc() -> Pc {
+        let pc = Pc::new(Variant::X86_64);
+        pc.start_protected();
+        let mut sys = pc.cpu.sys();
+        sys.cr4 |= cr4::OSFXSR | cr4::OSXMMEXCPT;
+        pc.cpu.set_sys(sys);
+        pc
+    }
+
+    /// `disp32` addressing for `reg`: `mod == 00`, `r/m == 101`.
+    fn disp32(reg: u8, addr: u64) -> Vec<u8> {
+        let mut out = alloc::vec![((reg & 7) << 3) | 0b101];
+        out.extend_from_slice(&(addr as u32).to_le_bytes());
+        out
+    }
+
+    /// `0F opcode` with a `disp32` memory operand.
+    fn mem(opcode: u8, reg: u8, addr: u64) -> Vec<u8> {
+        let mut out = alloc::vec![0x0f, opcode];
+        out.extend_from_slice(&disp32(reg, addr));
+        out
+    }
+
+    /// Run `code` followed by `hlt`, and require that the `hlt` is reached.
+    fn run(pc: &Pc, code: &[u8]) {
+        let mut all = code.to_vec();
+        all.push(0xf4);
+        pc.write(at::CODE0, &all);
+        assert!(pc.run(200) < 200, "the program reached its hlt");
+        assert_eq!(pc.regs().rip, at::CODE0 + all.len() as u64, "and no fault");
+    }
+
+    /// Run `code` and require that it raises `vector`, handled by a `hlt`.
+    fn faults(pc: &Pc, vector: u64, code: &[u8]) {
+        pc.idt(vector, gate(0x08, HANDLER as u32, sys_type::INT_GATE32, 0));
+        pc.write(HANDLER, &[0xf4]);
+        let mut all = code.to_vec();
+        all.push(0xf4);
+        pc.write(at::CODE0, &all);
+        assert!(pc.run(200) < 200);
+        assert_eq!(pc.regs().rip, HANDLED, "{code:02x?} raises vector {vector}");
+    }
+
+    fn read64(pc: &Pc, addr: u64) -> u64 {
+        (0..8u64).fold(0, |v, i| {
+            v | (u64::from(pc.ram.read_u8(addr + i).unwrap()) << (8 * i))
+        })
+    }
+
+    fn write64(pc: &Pc, addr: u64, value: u64) {
+        for i in 0..8u64 {
+            pc.ram.write_u8(addr + i, (value >> (8 * i)) as u8).unwrap();
+        }
+    }
+
+    /// Load `MM` registers directly.
+    fn set_mm(pc: &Pc, values: &[(u8, u64)]) {
+        let mut x = pc.cpu.x87();
+        for &(n, v) in values {
+            x.set_mm(n, v);
+        }
+        pc.cpu.set_x87(x);
+    }
+
+    fn mm(pc: &Pc, n: u8) -> u64 {
+        pc.cpu.x87().mm(n)
+    }
+
+    /// `op mm0, mm1` on two values: `mm0` afterwards.
+    fn binary(opcode: u8, a: u64, b: u64) -> u64 {
+        let pc = mmxpc();
+        set_mm(&pc, &[(0, a), (1, b)]);
+        run(&pc, &[0x0f, opcode, 0xc1]);
+        mm(&pc, 0)
+    }
+
+    /// Four word lanes, lane 0 lowest.
+    fn words(w: [u16; 4]) -> u64 {
+        w.iter()
+            .enumerate()
+            .fold(0, |v, (i, &x)| v | (u64::from(x) << (16 * i)))
+    }
+
+    // -- The issue's tests ---------------------------------------------
+
+    #[test]
+    fn paddusb_saturates_each_byte() {
+        // movq mm0, [A] ; movq mm1, [B] ; paddusb mm0, mm1 ; movq [OUT], mm0
+        let pc = mmxpc();
+        write64(
+            &pc,
+            A,
+            u64::from_le_bytes([0xf0, 0x10, 0x80, 0x7f, 0, 0xff, 1, 0xfe]),
+        );
+        write64(
+            &pc,
+            B,
+            u64::from_le_bytes([0x20, 0x10, 0x80, 1, 0, 1, 0xff, 1]),
+        );
+        let mut code = mem(0x6f, 0, A);
+        code.extend(mem(0x6f, 1, B));
+        code.extend([0x0f, 0xdc, 0xc1]);
+        code.extend(mem(0x7f, 0, OUT));
+        run(&pc, &code);
+        assert_eq!(
+            read64(&pc, OUT).to_le_bytes(),
+            [0xff, 0x20, 0xff, 0x80, 0, 0xff, 0xff, 0xff]
+        );
+    }
+
+    #[test]
+    fn an_mmx_write_sets_top_zero_tags_valid_and_exponent_ffff() {
+        // fninit ; fld1 ; mov eax, 0x12345678 ; movd mm3, eax
+        let pc = mmxpc();
+        run(
+            &pc,
+            &[
+                0xdb, 0xe3, 0xd9, 0xe8, 0xb8, 0x78, 0x56, 0x34, 0x12, 0x0f, 0x6e, 0xd8,
+            ],
+        );
+        let x = pc.cpu.x87();
+        assert_eq!(x.top(), 0, "TOP was 7 after the push");
+        assert_eq!(x.tag, 0, "every register valid, empty ones included");
+        assert_eq!(x.regs[3], F80::new(0xffff, 0x1234_5678), "zero-extended");
+        // The register the `FLD1` wrote is untouched: only a *write* to an
+        // `MM` register changes its exponent.
+        assert_eq!(x.regs[7], F80::new(0x3fff, 0x8000_0000_0000_0000));
+        assert_eq!(x.mm(7), 0x8000_0000_0000_0000);
+    }
+
+    #[test]
+    fn an_mmx_read_alone_still_makes_the_transition() {
+        // fninit ; fld1 ; movd eax, mm7 — the significand of 1.0's low half.
+        let pc = mmxpc();
+        run(&pc, &[0xdb, 0xe3, 0xd9, 0xe8, 0x0f, 0x7e, 0xf8]);
+        let x = pc.cpu.x87();
+        assert_eq!((x.top(), x.tag), (0, 0));
+        assert_eq!(x.regs[7].sign_exp, 0x3fff, "a read writes no exponent");
+        assert_eq!(pc.regs().rax as u32, 0);
+    }
+
+    #[test]
+    fn emms_empties_the_tag_word() {
+        // movd mm0, eax ; emms
+        let pc = mmxpc();
+        run(&pc, &[0x0f, 0x6e, 0xc0, 0x0f, 0x77]);
+        let x = pc.cpu.x87();
+        assert_eq!(x.tag, 0xffff);
+        assert_eq!(x.top(), 0, "EMMS leaves TOP alone");
+        assert_eq!(x.tag_at(0), Tag::Empty);
+    }
+
+    #[test]
+    fn x87_code_after_mmx_needs_emms_first() {
+        // Without `EMMS` the stack is full and `FLD1` overflows; with it the
+        // push lands in an empty register. That asymmetry is why the
+        // instruction exists.
+        let pc = mmxpc();
+        run(&pc, &[0x0f, 0x6e, 0xc0, 0xd9, 0xe8]); // movd mm0, eax ; fld1
+        let x = pc.cpu.x87();
+        assert_ne!(x.status & sw::SF, 0, "a stack overflow");
+        assert_ne!(x.status & sw::C1, 0);
+
+        let pc = mmxpc();
+        run(&pc, &[0x0f, 0x6e, 0xc0, 0x0f, 0x77, 0xd9, 0xe8]); // ... emms ; fld1
+        let x = pc.cpu.x87();
+        assert_eq!(x.status & sw::EXCEPTIONS, 0);
+        assert_eq!(x.top(), 7);
+        assert_eq!(x.raw(0), F80::new(0x3fff, 0x8000_0000_0000_0000));
+    }
+
+    #[test]
+    fn mmx_is_ud_on_a_part_without_the_feature() {
+        // A 486DX has an x87 unit and no MMX.
+        let pc = Pc::new(Variant::I80486);
+        pc.start_protected();
+        faults(&pc, 6, &[0x0f, 0xfc, 0xc1]); // paddb mm0, mm1
+        let pc = Pc::new(Variant::I80486);
+        pc.start_protected();
+        faults(&pc, 6, &[0x0f, 0x77]); // emms
+        // And CPUID says so.
+        let pc = Pc::new(Variant::I80486);
+        pc.start_protected();
+        run(&pc, &[0xb8, 0x01, 0x00, 0x00, 0x00, 0x0f, 0xa2]);
+        assert_eq!(pc.regs().rdx & (1 << 23), 0);
+    }
+
+    #[test]
+    fn the_sse_and_sse2_additions_need_their_own_features() {
+        // A Pentium MMX's lattice point: MMX and an x87 unit, no SSE.
+        let features = Features {
+            sse: false,
+            sse2: false,
+            long: false,
+            nx: false,
+            syscall: false,
+            ..Features::X86_64
+        };
+        assert!(features.validate().is_ok());
+        let part = || {
+            let pc = Pc::with_features(Variant::X86_64, features);
+            pc.start_protected();
+            pc
+        };
+        run(&part(), &[0x0f, 0xfc, 0xc1]); // paddb mm0, mm1
+        faults(&part(), 6, &[0x0f, 0xe0, 0xc1]); // pavgb: SSE
+        faults(&part(), 6, &[0x0f, 0x70, 0xc1, 0x1b]); // pshufw: SSE
+        faults(&part(), 6, &[0x0f, 0xd4, 0xc1]); // paddq mm: SSE2
+        faults(&part(), 6, &[0x0f, 0xf4, 0xc1]); // pmuludq mm: SSE2
+    }
+
+    #[test]
+    fn the_feature_lattice_ties_mmx_to_the_x87_unit_and_sse_to_mmx() {
+        let no_mmx = Features {
+            mmx: false,
+            ..Features::X86_64
+        };
+        assert!(no_mmx.validate().is_err(), "SSE without MMX");
+        let no_fpu = Features {
+            mmx: true,
+            ..Features::NONE
+        };
+        assert!(no_fpu.validate().is_err(), "MMX without an x87 unit");
+        assert!(
+            Features {
+                mmx: true,
+                ..Features::I80486
+            }
+            .validate()
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn cr0_em_makes_mmx_invalid_rather_than_trappable() {
+        // Volume 2's MMX exception tables: `CR0.EM` is `#UD`, not the `#NM`
+        // an x87 instruction would take — there is no emulation protocol.
+        for code in [&[0x0f, 0xfc, 0xc1][..], &[0x0f, 0x77]] {
+            let pc = mmxpc();
+            let mut sys = pc.cpu.sys();
+            sys.cr0 |= cr0::EM;
+            pc.cpu.set_sys(sys);
+            faults(&pc, 6, code);
+        }
+    }
+
+    #[test]
+    fn cr0_ts_makes_mmx_a_device_not_available_fault() {
+        for code in [&[0x0f, 0xfc, 0xc1][..], &[0x0f, 0x77]] {
+            let pc = mmxpc();
+            let mut sys = pc.cpu.sys();
+            sys.cr0 |= cr0::TS;
+            pc.cpu.set_sys(sys);
+            faults(&pc, 7, code);
+            // And the x87 unit was left exactly as it was.
+            assert_eq!(pc.cpu.x87().tag, 0xffff);
+        }
+    }
+
+    #[test]
+    fn a_pending_x87_exception_is_delivered_before_an_mmx_instruction() {
+        for code in [&[0x0f, 0xfc, 0xc1][..], &[0x0f, 0x77]] {
+            let pc = mmxpc();
+            let mut sys = pc.cpu.sys();
+            sys.cr0 |= cr0::NE;
+            pc.cpu.set_sys(sys);
+            let mut x = pc.cpu.x87();
+            x.status |= sw::IE | sw::ES | sw::B;
+            x.set_top(5);
+            pc.cpu.set_x87(x);
+            faults(&pc, 16, code);
+            assert_eq!(pc.cpu.x87().top(), 5, "#MF comes before the transition");
+        }
+    }
+
+    #[test]
+    fn the_cross_file_forms_also_need_cr4_osfxsr() {
+        let pc = Pc::new(Variant::X86_64);
+        pc.start_protected();
+        run(&pc, &[0x0f, 0xfc, 0xc1]); // paddb mm0, mm1: no XMM, no gate
+        let pc = Pc::new(Variant::X86_64);
+        pc.start_protected();
+        faults(&pc, 6, &[0xf3, 0x0f, 0xd6, 0xc1]); // movq2dq xmm0, mm1
+        let pc = Pc::new(Variant::X86_64);
+        pc.start_protected();
+        faults(&pc, 6, &[0x0f, 0x2a, 0xc1]); // cvtpi2ps xmm0, mm1
+    }
+
+    // -- Arithmetic ------------------------------------------------------
+
+    #[test]
+    fn pmaddwd_sums_signed_products_in_pairs() {
+        // [1, 2 | 0x8000, 0x8000] . [4, 5 | 0x8000, 0x8000]: 1*4 + 2*5 = 14,
+        // and the one pair that overflows a signed doubleword wraps to
+        // 0x8000_0000, as the page says it does.
+        let out = binary(
+            0xf5,
+            words([1, 2, 0x8000, 0x8000]),
+            words([4, 5, 0x8000, 0x8000]),
+        );
+        assert_eq!(out, 14 | (0x8000_0000 << 32));
+        // Negative products: -3 * 6 + 7 * -1.
+        let out = binary(0xf5, words([0xfffd, 7, 0, 0]), words([6, 0xffff, 0, 0]));
+        assert_eq!(out as u32, (-25i32) as u32);
+    }
+
+    #[test]
+    fn psraw_by_a_register_count_of_sixteen_or_more_fills_with_the_sign() {
+        let v = words([0x8000, 0x7fff, 0xffff, 0x0001]);
+        assert_eq!(binary(0xe1, v, 16), words([0xffff, 0, 0xffff, 0]));
+        // The count is the whole quadword, not its low bits.
+        assert_eq!(binary(0xe1, v, 1 << 32), words([0xffff, 0, 0xffff, 0]));
+        assert_eq!(binary(0xe1, v, 1), words([0xc000, 0x3fff, 0xffff, 0]));
+        // The logical shifts clear instead.
+        assert_eq!(binary(0xd1, v, 16), 0, "psrlw");
+        assert_eq!(binary(0xf3, v, 64), 0, "psllq");
+        assert_eq!(binary(0xd3, v, 4), v >> 4, "psrlq");
+    }
+
+    #[test]
+    fn the_immediate_shifts_name_their_register_in_r_m() {
+        // psraw mm1, 3 ; psrld mm2, 4 ; psllq mm3, 8
+        let pc = mmxpc();
+        set_mm(
+            &pc,
+            &[
+                (1, words([0x8000, 0x0010, 0, 0])),
+                (2, 0xf000_0000_0000_00f0),
+                (3, 0xff),
+            ],
+        );
+        run(
+            &pc,
+            &[
+                0x0f, 0x71, 0xe1, 0x03, 0x0f, 0x72, 0xd2, 0x04, 0x0f, 0x73, 0xf3, 0x08,
+            ],
+        );
+        assert_eq!(mm(&pc, 1), words([0xf000, 0x0002, 0, 0]));
+        assert_eq!(mm(&pc, 2), 0x0f00_0000_0000_000f);
+        assert_eq!(mm(&pc, 3), 0xff00);
+    }
+
+    #[test]
+    fn the_byte_shifts_have_no_mmx_form() {
+        // `0F 73 /3` and `/7` are `PSRLDQ`/`PSLLDQ` only under `66`.
+        faults(&mmxpc(), 6, &[0x0f, 0x73, 0xd9, 0x01]);
+        faults(&mmxpc(), 6, &[0x0f, 0x73, 0xf9, 0x01]);
+    }
+
+    #[test]
+    fn packsswb_saturates_and_puts_the_source_above_the_destination() {
+        let dst = words([0x0100, 0xff80, 0x0005, 0x7fff]);
+        let src = words([0xffff, 0x0000, 0x8000, 0x0001]);
+        assert_eq!(binary(0x63, dst, src), 0x0180_00ff_7f05_807f, "packsswb");
+        assert_eq!(binary(0x67, dst, src), 0x0100_0000_ff05_00ff, "packuswb");
+        // packssdw: [70000, -70000] and [1, -1].
+        let out = binary(
+            0x6b,
+            u64::from(70000u32) | (u64::from((-70000i32) as u32) << 32),
+            1 | (u64::from(u32::MAX) << 32),
+        );
+        assert_eq!(out, words([0x7fff, 0x8000, 1, 0xffff]));
+    }
+
+    #[test]
+    fn the_unpacks_interleave_the_named_half() {
+        let a = 0x8786_8584_8382_8180;
+        let b = 0x9796_9594_9392_9190;
+        assert_eq!(binary(0x60, a, b), 0x9383_9282_9181_9080, "punpcklbw");
+        assert_eq!(binary(0x68, a, b), 0x9787_9686_9585_9484, "punpckhbw");
+        assert_eq!(binary(0x61, a, b), 0x9392_8382_9190_8180, "punpcklwd");
+        assert_eq!(binary(0x6a, a, b), 0x9796_9594_8786_8584, "punpckhdq");
+    }
+
+    #[test]
+    fn a_low_unpack_reads_four_bytes_of_memory() {
+        // punpcklbw mm0, [OUT - 4]: the four bytes before `OUT` are read and
+        // the four at it are not — the operand is `m32`.
+        let pc = mmxpc();
+        write64(&pc, OUT - 4, 0xeeee_eeee_0403_0201);
+        set_mm(&pc, &[(0, 0)]);
+        run(&pc, &mem(0x60, 0, OUT - 4));
+        assert_eq!(mm(&pc, 0), 0x0400_0300_0200_0100);
+    }
+
+    #[test]
+    fn the_adds_and_compares_work_lane_by_lane() {
+        assert_eq!(binary(0xfc, 0x01ff, 0x0101), 0x0200, "paddb wraps per byte");
+        assert_eq!(binary(0xec, 0x7f, 0x01), 0x7f, "paddsb saturates");
+        assert_eq!(binary(0xe8, 0x80, 0x01), 0x80, "psubsb saturates");
+        assert_eq!(binary(0xd8, 0x05, 0x09), 0, "psubusb floors at zero");
+        assert_eq!(
+            binary(0xfe, 0xffff_ffff, 1),
+            0,
+            "paddd wraps per doubleword"
+        );
+        assert_eq!(binary(0xd4, u64::MAX, 2), 1, "paddq");
+        assert_eq!(binary(0xfb, 0, 1), u64::MAX, "psubq");
+        assert_eq!(
+            binary(0x74, 0x1234, 0x5534),
+            0xffff_ffff_ffff_00ff,
+            "pcmpeqb"
+        );
+        assert_eq!(binary(0x65, words([1, 0xffff, 0, 0]), 0), 0xffff, "pcmpgtw");
+        let w = |x: u16| words([x, 0, 0, 0]);
+        assert_eq!(binary(0xd5, w(300), w(300)), 90000 & 0xffff, "pmullw");
+        assert_eq!(binary(0xe5, w(0x8000), w(2)), 0xffff, "pmulhw");
+        assert_eq!(binary(0xe4, w(0x8000), w(2)), 1, "pmulhuw");
+        assert_eq!(
+            binary(0xf4, 0xffff_ffff, 0xffff_ffff),
+            0xffff_fffe_0000_0001,
+            "pmuludq"
+        );
+        assert_eq!(binary(0xe0, 0x01, 0x02), 0x02, "pavgb rounds up");
+        assert_eq!(binary(0xda, 0x0105, 0x0203), 0x0103, "pminub");
+        assert_eq!(binary(0xee, 0xffff, 0x0001), 0x0001, "pmaxsw is signed");
+        assert_eq!(binary(0xf6, 0xff, 0x0101_0101_0101_0100), 262, "psadbw");
+    }
+
+    #[test]
+    fn the_logic_is_the_whole_quadword() {
+        let a = 0xff00_ff00_f0f0_0f0f;
+        let b = 0x0ff0_0ff0_ffff_0000;
+        assert_eq!(binary(0xdb, a, b), a & b);
+        assert_eq!(binary(0xdf, a, b), !a & b);
+        assert_eq!(binary(0xeb, a, b), a | b);
+        assert_eq!(binary(0xef, a, b), a ^ b);
+    }
+
+    #[test]
+    fn pshufw_selects_words_by_two_bit_fields() {
+        let pc = mmxpc();
+        set_mm(&pc, &[(1, words([0x1111, 0x2222, 0x3333, 0x4444]))]);
+        run(&pc, &[0x0f, 0x70, 0xc1, 0x1b]); // pshufw mm0, mm1, 0b00_01_10_11
+        assert_eq!(mm(&pc, 0), words([0x4444, 0x3333, 0x2222, 0x1111]));
+    }
+
+    #[test]
+    fn pmovmskb_pextrw_and_pinsrw_cross_to_the_general_registers() {
+        let pc = mmxpc();
+        set_mm(&pc, &[(1, 0x8001_7f80_00ff_8000)]);
+        run(&pc, &[0x0f, 0xd7, 0xc1]); // pmovmskb eax, mm1
+        assert_eq!(pc.regs().rax as u32, 0b1001_0110);
+
+        let pc = mmxpc();
+        set_mm(&pc, &[(1, words([1, 2, 0xbeef, 4])), (0, u64::MAX)]);
+        let mut regs = pc.regs();
+        regs.rax = 0xffff_1234;
+        pc.cpu.set_regs(regs);
+        // pextrw ecx, mm1, 2 ; pinsrw mm0, eax, 1
+        run(&pc, &[0x0f, 0xc5, 0xc9, 0x02, 0x0f, 0xc4, 0xc0, 0x01]);
+        assert_eq!(pc.regs().rcx as u32, 0xbeef, "zero-extended");
+        assert_eq!(mm(&pc, 0), 0xffff_ffff_1234_ffff);
+        // The register-only forms have no memory form.
+        faults(&mmxpc(), 6, &mem(0xd7, 0, A));
+    }
+
+    #[test]
+    fn the_moves_cover_every_form() {
+        let pc = mmxpc();
+        write64(&pc, A, 0x0123_4567_89ab_cdef);
+        set_mm(&pc, &[(5, 0xffff_ffff_8765_4321)]);
+        // movq mm2, [A] ; movq mm3, mm2 ; movd [OUT], mm5 ; movd ecx, mm2
+        let mut code = mem(0x6f, 2, A);
+        code.extend([0x0f, 0x6f, 0xda]);
+        code.extend(mem(0x7e, 5, OUT));
+        code.extend([0x0f, 0x7e, 0xd1]);
+        // movd mm4, [A]: a doubleword, zero-extended.
+        code.extend(mem(0x6e, 4, A));
+        // movntq [OUT + 8], mm3
+        code.extend(mem(0xe7, 3, OUT + 8));
+        run(&pc, &code);
+        assert_eq!(mm(&pc, 3), 0x0123_4567_89ab_cdef);
+        assert_eq!(read64(&pc, OUT) as u32, 0x8765_4321);
+        assert_eq!(pc.regs().rcx as u32, 0x89ab_cdef);
+        assert_eq!(mm(&pc, 4), 0x89ab_cdef);
+        assert_eq!(read64(&pc, OUT + 8), 0x0123_4567_89ab_cdef);
+        // `MOVNTQ` has no register form.
+        faults(&mmxpc(), 6, &[0x0f, 0xe7, 0xc1]);
+    }
+
+    #[test]
+    fn maskmovq_stores_the_selected_bytes_to_ds_edi() {
+        let pc = mmxpc();
+        write64(&pc, OUT, 0xeeee_eeee_eeee_eeee);
+        set_mm(
+            &pc,
+            &[(0, 0x8877_6655_4433_2211), (1, 0x8000_0080_0000_ff00)],
+        );
+        let mut regs = pc.regs();
+        regs.rdi = OUT;
+        pc.cpu.set_regs(regs);
+        run(&pc, &[0x0f, 0xf7, 0xc1]); // maskmovq mm0, mm1
+        assert_eq!(read64(&pc, OUT), 0x88ee_ee55_eeee_22ee);
+    }
+
+    #[test]
+    fn movq2dq_and_movdq2q_cross_between_the_register_files() {
+        let pc = mmxpc();
+        let mut sse = Sse::new();
+        sse.set(0, [u64::MAX, u64::MAX]);
+        sse.set(1, [0x1111_2222_3333_4444, 0x5555_6666_7777_8888]);
+        pc.cpu.set_sse(sse);
+        set_mm(&pc, &[(1, 0xaaaa_bbbb_cccc_dddd)]);
+        // movq2dq xmm0, mm1 ; movdq2q mm2, xmm1
+        run(&pc, &[0xf3, 0x0f, 0xd6, 0xc1, 0xf2, 0x0f, 0xd6, 0xd1]);
+        assert_eq!(
+            pc.cpu.sse().get(0),
+            [0xaaaa_bbbb_cccc_dddd, 0],
+            "upper zeroed"
+        );
+        assert_eq!(mm(&pc, 2), 0x1111_2222_3333_4444);
+        assert_eq!(pc.cpu.x87().regs[2].sign_exp, 0xffff);
+    }
+
+    // -- The conversions -------------------------------------------------
+
+    /// Run `code` with `mm1` and `xmm1` loaded and `xmm0` holding junk.
+    fn convert(code: &[u8], mm1: u64, xmm1: [u64; 2]) -> Pc {
+        let pc = mmxpc();
+        let mut sse = Sse::new();
+        sse.set(0, [0xdead_beef_dead_beef, 0xfeed_face_feed_face]);
+        sse.set(1, xmm1);
+        pc.cpu.set_sse(sse);
+        set_mm(&pc, &[(1, mm1)]);
+        run(&pc, code);
+        pc
+    }
+
+    /// Two doubleword lanes.
+    fn pair(lo: i32, hi: i32) -> u64 {
+        u64::from(lo as u32) | (u64::from(hi as u32) << 32)
+    }
+
+    #[test]
+    fn cvtpi2ps_and_cvtpi2pd_widen_two_doublewords() {
+        // cvtpi2ps xmm0, mm1: [3, -2] -> [3.0f, -2.0f] in the low quadword,
+        // the upper two singles kept.
+        let pc = convert(&[0x0f, 0x2a, 0xc1], pair(3, -2), [0; 2]);
+        assert_eq!(
+            pc.cpu.sse().get(0),
+            [0xc000_0000_4040_0000, 0xfeed_face_feed_face]
+        );
+        // cvtpi2pd xmm0, mm1: the whole register.
+        let pc = convert(&[0x66, 0x0f, 0x2a, 0xc1], pair(3, -2), [0; 2]);
+        assert_eq!(
+            pc.cpu.sse().get(0),
+            [0x4008_0000_0000_0000, 0xc000_0000_0000_0000]
+        );
+        // 2^24 + 1 is inexact as a single, and says so.
+        let pc = convert(&[0x0f, 0x2a, 0xc1], pair(16_777_217, 0), [0; 2]);
+        assert_eq!(pc.cpu.sse().low(0) as u32, 0x4b80_0000);
+        assert_eq!(pc.cpu.sse().mxcsr & mxcsr::EXCEPTIONS, mxcsr::PE);
+    }
+
+    #[test]
+    fn cvtps2pi_rounds_and_cvttps2pi_truncates() {
+        // [1.5, -2.5]: to nearest even is [2, -2]; truncated, [1, -2].
+        let src = [0xc020_0000_3fc0_0000, 0];
+        let pc = convert(&[0x0f, 0x2d, 0xc1], 0, src);
+        assert_eq!(mm(&pc, 0), pair(2, -2));
+        let pc = convert(&[0x0f, 0x2c, 0xc1], 0, src);
+        assert_eq!(mm(&pc, 0), pair(1, -2));
+        // A NaN is the integer indefinite, and invalid.
+        let pc = convert(&[0x0f, 0x2c, 0xc1], 0, [0x7fc0_0000, 0]);
+        assert_eq!(mm(&pc, 0), 0x8000_0000);
+        assert_ne!(pc.cpu.sse().mxcsr & mxcsr::IE, 0);
+    }
+
+    #[test]
+    fn cvtpd2pi_rounds_and_cvttpd2pi_truncates() {
+        // [2.5, -3.7]: to nearest [2, -4]; truncated [2, -3].
+        let src = [0x4004_0000_0000_0000, 0xc00d_9999_9999_999a];
+        let pc = convert(&[0x66, 0x0f, 0x2d, 0xc1], 0, src);
+        assert_eq!(mm(&pc, 0), pair(2, -4));
+        let pc = convert(&[0x66, 0x0f, 0x2c, 0xc1], 0, src);
+        assert_eq!(mm(&pc, 0), pair(2, -3));
+        // Its memory operand is sixteen bytes and must be aligned.
+        let mut code = alloc::vec![0x66];
+        code.extend(mem(0x2d, 0, B));
+        faults(&mmxpc(), 13, &code);
+    }
+
+    #[test]
+    fn the_conversions_make_the_transition_only_when_they_name_an_mm_register() {
+        // cvtpi2ps xmm0, mm1 after fninit ; fld1: TOP goes to zero.
+        let pc = mmxpc();
+        run(&pc, &[0xdb, 0xe3, 0xd9, 0xe8, 0x0f, 0x2a, 0xc1]);
+        assert_eq!((pc.cpu.x87().top(), pc.cpu.x87().tag), (0, 0));
+        // cvtpi2ps xmm0, [A]: no `MM` register, no transition.
+        let pc = mmxpc();
+        let mut code = alloc::vec![0xdb, 0xe3, 0xd9, 0xe8];
+        code.extend(mem(0x2a, 0, A));
+        run(&pc, &code);
+        assert_eq!(pc.cpu.x87().top(), 7);
+        // cvtps2pi mm0, xmm1 writes an `MM` register: it does.
+        let pc = mmxpc();
+        run(&pc, &[0xdb, 0xe3, 0xd9, 0xe8, 0x0f, 0x2d, 0xc1]);
+        assert_eq!(pc.cpu.x87().top(), 0);
+        assert_eq!(pc.cpu.x87().regs[0].sign_exp, 0xffff);
+    }
+
+    #[test]
+    fn an_unmasked_conversion_exception_faults_and_leaves_mm_alone() {
+        let pc = mmxpc();
+        let mut sse = Sse::new();
+        sse.set(1, [0x7fc0_0000, 0]);
+        sse.mxcsr = mxcsr::RESET & !mxcsr::IM;
+        pc.cpu.set_sse(sse);
+        set_mm(&pc, &[(0, 0x1234)]);
+        faults(&pc, 19, &[0x0f, 0x2c, 0xc1]); // cvttps2pi mm0, xmm1
+        assert_eq!(mm(&pc, 0), 0x1234);
+    }
+
+    // -- The save formats carry the MMX state ------------------------------
+
+    #[test]
+    fn fxsave_holds_the_mm_registers_and_fxrstor_brings_them_back() {
+        let pc = mmxpc();
+        write64(&pc, A, 0x0123_4567_89ab_cdef);
+        // movq mm2, [A] ; fxsave [SAVE]
+        let mut code = mem(0x6f, 2, A);
+        code.extend(mem(0xae, 0, SAVE));
+        run(&pc, &code);
+        // `ST(2)` is at 32 + 2 * 16, and with `TOP` zero it is `R2`: the
+        // significand, then the all-ones exponent.
+        assert_eq!(read64(&pc, SAVE + 64), 0x0123_4567_89ab_cdef);
+        assert_eq!(read64(&pc, SAVE + 72) & 0xffff, 0xffff);
+        assert_eq!(
+            pc.ram.read_u8(SAVE + 4).unwrap(),
+            0xff,
+            "abridged tag: all full"
+        );
+        assert_eq!((read64(&pc, SAVE) >> 16) & u64::from(sw::TOP), 0, "TOP");
+
+        // The image into a fresh core: fxrstor [SAVE] brings the register
+        // back, and the tag word with it — full, and `Special` because of
+        // the all-ones exponent.
+        let fresh = mmxpc();
+        for i in 0..512 {
+            let byte = pc.ram.read_u8(SAVE + i).unwrap();
+            fresh.ram.write_u8(SAVE + i, byte).unwrap();
+        }
+        run(&fresh, &mem(0xae, 1, SAVE));
+        let x = fresh.cpu.x87();
+        assert_eq!(x.mm(2), 0x0123_4567_89ab_cdef);
+        assert_eq!(x.regs[2].sign_exp, 0xffff);
+        assert_eq!((x.top(), x.tag_at(2)), (0, Tag::Special));
+    }
+
+    #[test]
+    fn fsave_holds_the_mm_registers_too() {
+        let pc = mmxpc();
+        set_mm(&pc, &[(0, 0x1111), (1, 0xffff), (7, 0x7777)]);
+        // pxor mm1, mm1 ; fnsave [SAVE] — straight after an MMX instruction,
+        // with no `EMMS`, the way a task switch would catch it.
+        let mut code = alloc::vec![0x0f, 0xef, 0xc9];
+        code.push(0xdd);
+        code.extend(disp32(6, SAVE));
+        run(&pc, &code);
+        // The 32-bit image: 28 bytes of environment, then ten per register.
+        assert_eq!(read64(&pc, SAVE + 8) & 0xffff, 0, "tag word: all valid");
+        assert_eq!(read64(&pc, SAVE + 28), 0x1111);
+        assert_eq!(read64(&pc, SAVE + 28 + 8) & 0xffff, 0xffff);
+        assert_eq!(read64(&pc, SAVE + 28 + 10), 0, "pxor wrote mm1");
+        assert_eq!(read64(&pc, SAVE + 28 + 70), 0x7777);
+    }
+
+    #[test]
+    fn the_mmx_state_survives_a_snapshot() {
+        // The registers are the x87 unit's, so the core's own save/load
+        // carries them; this is the round trip CLAUDE.md asks of a device.
+        let pc = mmxpc();
+        set_mm(&pc, &[(4, 0xfeed_beef_cafe_f00d)]);
+        let before = pc.cpu.x87();
+        let mut shape = MachineShape::new();
+        shape.add_device("/cpu0", "cpu.x86").unwrap();
+        let mut writer = StateWriter::new(shape);
+        {
+            let mut chunk = writer
+                .chunk("/cpu0", "cpu.x86", crate::cpu::x86::CLASS.version)
+                .unwrap();
+            pc.cpu.save(&mut chunk).unwrap();
+        }
+        let bytes = writer.to_vec().unwrap();
+        let restored = mmxpc();
+        let reader = crate::core::state::StateReader::new(&bytes).unwrap();
+        let (_, _, data) = reader.load_raw("/cpu0").unwrap();
+        let mut chunk = ChunkReader::new(data);
+        restored.cpu.load(&mut chunk).unwrap();
+        chunk.end().unwrap();
+        assert_eq!(restored.cpu.x87(), before);
+        assert_eq!(restored.cpu.x87().mm(4), 0xfeed_beef_cafe_f00d);
+    }
+
+    // -- The disassembler -------------------------------------------------
+
+    #[test]
+    fn every_mmx_encoding_disassembles_with_mm_register_names() {
+        let pc = mmxpc();
+        let listing = |bytes: &[u8]| {
+            pc.write(at::CODE0, bytes);
+            let out = pc.cpu.disassemble(0x08, at::CODE0, 1);
+            alloc::format!("{}", out[0])
+        };
+        for (op, name) in [
+            (0x60, "punpcklbw"),
+            (0x61, "punpcklwd"),
+            (0x62, "punpckldq"),
+            (0x63, "packsswb"),
+            (0x64, "pcmpgtb"),
+            (0x65, "pcmpgtw"),
+            (0x66, "pcmpgtd"),
+            (0x67, "packuswb"),
+            (0x68, "punpckhbw"),
+            (0x69, "punpckhwd"),
+            (0x6a, "punpckhdq"),
+            (0x6b, "packssdw"),
+            (0x6f, "movq"),
+            (0x74, "pcmpeqb"),
+            (0x75, "pcmpeqw"),
+            (0x76, "pcmpeqd"),
+            (0xd1, "psrlw"),
+            (0xd2, "psrld"),
+            (0xd3, "psrlq"),
+            (0xd4, "paddq"),
+            (0xd5, "pmullw"),
+            (0xd8, "psubusb"),
+            (0xd9, "psubusw"),
+            (0xda, "pminub"),
+            (0xdb, "pand"),
+            (0xdc, "paddusb"),
+            (0xdd, "paddusw"),
+            (0xde, "pmaxub"),
+            (0xdf, "pandn"),
+            (0xe0, "pavgb"),
+            (0xe1, "psraw"),
+            (0xe2, "psrad"),
+            (0xe3, "pavgw"),
+            (0xe4, "pmulhuw"),
+            (0xe5, "pmulhw"),
+            (0xe8, "psubsb"),
+            (0xe9, "psubsw"),
+            (0xea, "pminsw"),
+            (0xeb, "por"),
+            (0xec, "paddsb"),
+            (0xed, "paddsw"),
+            (0xee, "pmaxsw"),
+            (0xef, "pxor"),
+            (0xf1, "psllw"),
+            (0xf2, "pslld"),
+            (0xf3, "psllq"),
+            (0xf4, "pmuludq"),
+            (0xf5, "pmaddwd"),
+            (0xf6, "psadbw"),
+            (0xf7, "maskmovq"),
+            (0xf8, "psubb"),
+            (0xf9, "psubw"),
+            (0xfa, "psubd"),
+            (0xfb, "psubq"),
+            (0xfc, "paddb"),
+            (0xfd, "paddw"),
+            (0xfe, "paddd"),
+        ] {
+            let text = listing(&[0x0f, op, 0xc1]);
+            let want = alloc::format!("{name} mm0, mm1");
+            assert!(text.ends_with(&want), "0f {op:02x}: {text}");
+        }
+        for (bytes, want) in [
+            (&[0x0f, 0x77][..], "emms"),
+            (&[0x0f, 0x6e, 0xc8], "movd mm1, eax"),
+            (&[0x0f, 0x7e, 0xc8], "movd eax, mm1"),
+            (&[0x0f, 0x7f, 0xc1], "movq mm1, mm0"),
+            (&[0x0f, 0x70, 0xc1, 0x1b], "pshufw mm0, mm1, 0x1b"),
+            (&[0x0f, 0x71, 0xd1, 0x04], "psrlw mm1, 0x4"),
+            (&[0x0f, 0x71, 0xe1, 0x04], "psraw mm1, 0x4"),
+            (&[0x0f, 0x71, 0xf1, 0x04], "psllw mm1, 0x4"),
+            (&[0x0f, 0x72, 0xd1, 0x04], "psrld mm1, 0x4"),
+            (&[0x0f, 0x72, 0xe1, 0x04], "psrad mm1, 0x4"),
+            (&[0x0f, 0x72, 0xf1, 0x04], "pslld mm1, 0x4"),
+            (&[0x0f, 0x73, 0xd1, 0x04], "psrlq mm1, 0x4"),
+            (&[0x0f, 0x73, 0xf1, 0x04], "psllq mm1, 0x4"),
+            (&[0x0f, 0xc4, 0xc0, 0x01], "pinsrw mm0, ax, 0x1"),
+            (&[0x0f, 0xc5, 0xc1, 0x02], "pextrw eax, mm1, 0x2"),
+            (&[0x0f, 0xd7, 0xc1], "pmovmskb eax, mm1"),
+            (
+                &[0x0f, 0xe7, 0x05, 0, 0xc0, 0, 0],
+                "movntq qword [ds:0xc000], mm0",
+            ),
+            (
+                &[0x0f, 0x6f, 0x05, 0, 0xb0, 0, 0],
+                "movq mm0, qword [ds:0xb000]",
+            ),
+            (
+                &[0x0f, 0x60, 0x05, 0, 0xb0, 0, 0],
+                "punpcklbw mm0, dword [ds:0xb000]",
+            ),
+            (&[0xf3, 0x0f, 0xd6, 0xc1], "movq2dq xmm0, mm1"),
+            (&[0xf2, 0x0f, 0xd6, 0xc1], "movdq2q mm0, xmm1"),
+            (&[0x0f, 0x2a, 0xc1], "cvtpi2ps xmm0, mm1"),
+            (&[0x0f, 0x2c, 0xc1], "cvttps2pi mm0, xmm1"),
+            (&[0x0f, 0x2d, 0xc1], "cvtps2pi mm0, xmm1"),
+            (&[0x66, 0x0f, 0x2a, 0xc1], "cvtpi2pd xmm0, mm1"),
+            (&[0x66, 0x0f, 0x2c, 0xc1], "cvttpd2pi mm0, xmm1"),
+            (&[0x66, 0x0f, 0x2d, 0xc1], "cvtpd2pi mm0, xmm1"),
+        ] {
+            let text = listing(bytes);
+            assert!(text.ends_with(want), "{bytes:02x?}: {text}");
+        }
+    }
+
+    #[test]
+    fn rex_widens_movd_and_never_extends_an_mm_register() {
+        use crate::cpu::x86::disasm::disassemble_as;
+        use crate::cpu::x86::isa::{Bits, Gen};
+        let text =
+            |bytes: &[u8]| alloc::format!("{}", disassemble_as(Gen::I386, Bits::B64, 0, 0, bytes));
+        assert!(text(&[0x48, 0x0f, 0x6e, 0xc0]).ends_with("movq mm0, rax"));
+        assert!(text(&[0x48, 0x0f, 0x7e, 0xc1]).ends_with("movq rcx, mm0"));
+        // `REX.R` and `REX.B` have nothing to extend: `mm9` does not exist.
+        assert!(text(&[0x45, 0x0f, 0xfc, 0xc1]).ends_with("paddb mm0, mm1"));
+        assert!(text(&[0x44, 0x0f, 0x6e, 0xc0]).ends_with("movd mm0, eax"));
+        assert!(text(&[0x41, 0x0f, 0x6e, 0xc0]).ends_with("movd mm0, r8d"));
+    }
+
+    #[test]
+    fn a_mandatory_prefix_the_maps_do_not_list_is_still_invalid() {
+        // `F3`/`F2` in front of an MMX opcode is not the MMX instruction with
+        // the prefix ignored, and `66 0F 77` is not `EMMS`.
+        for bytes in [
+            &[0xf3, 0x0f, 0xfc, 0xc1][..],
+            &[0xf2, 0x0f, 0x6f, 0xc1],
+            &[0x66, 0x0f, 0x77],
+            &[0xf3, 0x0f, 0xf7, 0xc1],
+        ] {
+            faults(&mmxpc(), 6, bytes);
+        }
+        // And `66` still selects the XMM form, not the MMX one.
+        let pc = mmxpc();
+        run(&pc, &[0x66, 0x0f, 0xfc, 0xc1]);
+        assert_eq!(pc.cpu.x87().tag, 0xffff, "paddb xmm made no transition");
     }
 }

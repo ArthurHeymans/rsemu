@@ -2362,6 +2362,13 @@ impl<'a> Exec<'a> {
         if insn.op.is_x87() {
             return self.x87_instruction(f);
         }
+        // Ahead of the SSE dispatcher because most MMX rows name an SSE2
+        // operation (`PADDB` on `MM` registers is `PADDB`); the row's
+        // operands are what route it here, with MMX's gates and its x87 side
+        // effects.
+        if insn.is_mmx() {
+            return self.mmx_instruction(f);
+        }
         if insn.op.is_simd() {
             return self.sse_instruction(f);
         }
@@ -4069,19 +4076,18 @@ impl<'a> Exec<'a> {
     /// are assembled from [`Features`](super::Features) rather than written
     /// out as a plausible-looking constant, and the two cannot drift.
     ///
-    /// Conspicuously absent, and absent on purpose: **`MMX` (bit 23)**, whose
-    /// sixty-four-bit register file aliases the x87 stack and which nothing
-    /// here implements; **`TSC`'s companion `RDTSC`** is claimed because the
-    /// counter exists, but no performance-monitoring leaf is; and every bit
-    /// above leaf 1, which is why leaf 0 reports a maximum of one.
+    /// Conspicuously absent, and absent on purpose: **`TSC`'s companion
+    /// `RDTSC`** is claimed because the counter exists, but no
+    /// performance-monitoring leaf is; and every bit above leaf 1, which is
+    /// why leaf 0 reports a maximum of one.
     ///
     /// The one thing said about that counter beyond its existence is the
     /// **invariant-TSC bit** in leaf `8000_0007`, and it is said for the same
     /// reason as everything else here: the counter runs at the board's rate
     /// whatever state the processor is in, `HLT` included.
     ///
-    /// `FPU`, `FXSR`, `SSE`, `SSE2` and `CX8` **are** reported now, and each
-    /// is reported because the instructions behind it execute. They follow
+    /// `FPU`, `MMX`, `FXSR`, `SSE`, `SSE2` and `CX8` **are** reported now, and
+    /// each is reported because the instructions behind it execute. They follow
     /// [`Features`](super::Features) rather than the variant, so an instance
     /// configured as a 486SX answers `FPU` clear and one configured without
     /// `sse2` answers a 64-bit Linux honestly enough for it to refuse to boot
@@ -4133,6 +4139,9 @@ impl<'a> Exec<'a> {
         }
         if features.sse {
             edx1 |= 1 << 25; // SSE
+        }
+        if features.mmx {
+            edx1 |= 1 << 23; // MMX: the `MM` registers, aliasing the x87 ones
         }
         if features.sse2 {
             edx1 |= 1 << 26; // SSE2

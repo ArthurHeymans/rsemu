@@ -248,7 +248,7 @@ impl Exec<'_> {
     /// destination, and otherwise propagates — an unmasked exception leaves
     /// the destination exactly as the handler needs to see it, and the `?` at
     /// every call site is what implements that.
-    fn sse_raise(&mut self, flags: Flags) -> Ex<()> {
+    pub(super) fn sse_raise(&mut self, flags: Flags) -> Ex<()> {
         if !self.state.sse.raise(flags) {
             return Ok(());
         }
@@ -1364,7 +1364,7 @@ impl Exec<'_> {
     /// A narrower memory operand is zero-extended, which is right for every
     /// instruction that reads one: the lanes above the operand are either
     /// unused or explicitly zeroed.
-    fn sse_read_rm(&mut self, f: &Fields, arg: Arg, aligned: bool) -> Ex<[u64; 2]> {
+    pub(super) fn sse_read_rm(&mut self, f: &Fields, arg: Arg, aligned: bool) -> Ex<[u64; 2]> {
         let register = f.modrm.is_some_and(super::isa::ModRm::is_register);
         if register || matches!(arg, Arg::Ux) {
             return Ok(self.state.sse.get(f.rm_num()));
@@ -2519,7 +2519,7 @@ fn map_qwords(a: [u64; 2], b: [u64; 2], f: impl Fn(u64, u64) -> u64) -> [u64; 2]
 /// quadword rather than lane by lane, and a count at or past the lane's width
 /// is defined — zero for a logical shift, the sign for an arithmetic one —
 /// rather than being the host's undefined behaviour.
-fn is_shift(op: Op) -> bool {
+pub(super) fn is_shift(op: Op) -> bool {
     matches!(
         op,
         Op::PSRLW
@@ -2542,7 +2542,7 @@ fn is_shift(op: Op) -> bool {
 /// SDM* volume 2 says a count greater than the operand width produces zero
 /// (or, for `PSRAW`/`PSRAD`, a lane of sign bits), and a count of 300 has to
 /// reach that rule rather than wrap into a shift of 44.
-fn shift_lanes(op: Op, v: [u64; 2], count: u64) -> [u64; 2] {
+pub(super) fn shift_lanes(op: Op, v: [u64; 2], count: u64) -> [u64; 2] {
     // A logical shift by the width or more clears the lane. Named once so the
     // four widths cannot disagree about it.
     let zero = [0u64; 2];
@@ -2635,7 +2635,7 @@ fn shift_lanes(op: Op, v: [u64; 2], count: u64) -> [u64; 2] {
 /// and the wrapping forms with `wrapping_*`, because guest arithmetic wraps by
 /// definition (CLAUDE.md, "Arithmetic").
 #[allow(clippy::too_many_lines)]
-fn packed(op: Op, dst: [u64; 2], src: [u64; 2], imm: u8) -> [u64; 2] {
+pub(super) fn packed(op: Op, dst: [u64; 2], src: [u64; 2], imm: u8) -> [u64; 2] {
     match op {
         // -- Addition and subtraction ------------------------------------
         Op::PADDB => map_bytes(dst, src, u8::wrapping_add),

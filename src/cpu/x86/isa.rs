@@ -326,6 +326,24 @@ pub enum Arg {
     /// A general register from the ModRM `reg` field at four or eight bytes,
     /// chosen by `REX.W` — Intel's `Gy`.
     Gy,
+
+    // ---- MMX -----------------------------------------------------------
+    //
+    // An `MM` register is named by three bits and no more: `REX.R` and
+    // `REX.B` do not extend it, because there are eight and only eight — they
+    // are the significands of the eight x87 registers (*Intel SDM* volume 1
+    // §9.2.1, volume 2 §2.2.1.7).
+    /// An `MM` register from the ModRM `reg` field — Intel's `Pq`.
+    Pq,
+    /// An `MM` register or a 64-bit memory operand, from ModRM r/m — `Qq`.
+    Qq,
+    /// An `MM` register or a **32-bit** memory operand — `Qd`. The low-half
+    /// unpacks read only the half they interleave, so their memory form is
+    /// four bytes (*Intel SDM* volume 2, `PUNPCKLBW`).
+    Qd,
+    /// An `MM` register from ModRM r/m, register form only — `Nq`. The
+    /// shift-by-immediate groups, `PMOVMSKB`, `PEXTRW` and `MASKMOVQ`.
+    Nq,
 }
 
 impl Arg {
@@ -387,7 +405,11 @@ impl Arg {
             | Arg::Mq
             | Arg::Mfx
             | Arg::Ey
-            | Arg::Gy => None,
+            | Arg::Gy
+            | Arg::Pq
+            | Arg::Qq
+            | Arg::Qd
+            | Arg::Nq => None,
         }
     }
 
@@ -403,8 +425,8 @@ impl Arg {
     #[must_use]
     pub const fn fp_bytes(self, osz: u8) -> Option<u8> {
         match self {
-            Arg::Mf32 | Arg::Mi32 | Arg::Wd => Some(4),
-            Arg::Mf64 | Arg::Mi64 | Arg::Wq | Arg::Mq => Some(8),
+            Arg::Mf32 | Arg::Mi32 | Arg::Wd | Arg::Qd => Some(4),
+            Arg::Mf64 | Arg::Mi64 | Arg::Wq | Arg::Mq | Arg::Qq => Some(8),
             Arg::Mf80 => Some(10),
             Arg::Mi16 => Some(2),
             Arg::Wx => Some(16),
@@ -452,6 +474,10 @@ impl Arg {
                 | Arg::Mfx
                 | Arg::Ey
                 | Arg::Gy
+                | Arg::Pq
+                | Arg::Qq
+                | Arg::Qd
+                | Arg::Nq
         )
     }
 
@@ -464,7 +490,11 @@ impl Arg {
     /// decodes a ModRM byte has a memory form.
     #[must_use]
     pub const fn uses_modrm_memory(self) -> bool {
-        self.needs_modrm() && !matches!(self, Arg::Rd | Arg::Cd | Arg::Dd | Arg::Td | Arg::Ux)
+        self.needs_modrm()
+            && !matches!(
+                self,
+                Arg::Rd | Arg::Cd | Arg::Dd | Arg::Td | Arg::Ux | Arg::Nq
+            )
     }
 
     /// How many immediate bytes follow the displacement for this operand,
@@ -1119,6 +1149,19 @@ const LOWERCASE: &[(&str, &str)] = &[
     ("PUNPCKLDQ", "punpckldq"),
     ("PUNPCKLQDQ", "punpcklqdq"),
     ("PUNPCKLWD", "punpcklwd"),
+    // MMX, and the forms SSE and SSE2 added that name an `MM` register.
+    ("CVTPD2PI", "cvtpd2pi"),
+    ("CVTPI2PD", "cvtpi2pd"),
+    ("CVTPI2PS", "cvtpi2ps"),
+    ("CVTPS2PI", "cvtps2pi"),
+    ("CVTTPD2PI", "cvttpd2pi"),
+    ("CVTTPS2PI", "cvttps2pi"),
+    ("EMMS", "emms"),
+    ("MASKMOVQ", "maskmovq"),
+    ("MOVDQ2Q", "movdq2q"),
+    ("MOVNTQ", "movntq"),
+    ("MOVQ2DQ", "movq2dq"),
+    ("PSHUFW", "pshufw"),
 ];
 
 define_ops! {
@@ -1575,6 +1618,25 @@ define_ops! {
     PUNPCKLDQ = "interleave the low doublewords",
     PUNPCKLQDQ = "interleave the low quadwords",
     PUNPCKLWD = "interleave the low words",
+
+    // ---- MMX -------------------------------------------------------------
+    //
+    // Only the operations MMX does not share with SSE2's packed-integer half
+    // are new here: `PADDB mm, mm/m64` is the operation `PADDB` with `MM`
+    // operands ([`Arg::Pq`], [`Arg::Qq`]), not an operation of its own, which
+    // is what keeps one lane kernel serving both register files.
+    CVTPD2PI = "convert two packed doubles to two doublewords in an MM register",
+    CVTPI2PD = "convert two doublewords in an MM register or memory to two doubles",
+    CVTPI2PS = "convert two doublewords in an MM register or memory to the low two singles",
+    CVTPS2PI = "convert the low two singles to two doublewords in an MM register",
+    CVTTPD2PI = "convert two packed doubles to two doublewords in an MM register, truncating",
+    CVTTPS2PI = "convert the low two singles to two doublewords in an MM register, truncating",
+    EMMS = "empty the MMX state: mark every x87 register empty",
+    MASKMOVQ = "store the bytes of an MM register selected by a mask, at DS:rDI",
+    MOVDQ2Q = "move the low quadword of an XMM register to an MM register",
+    MOVNTQ = "store an MM register bypassing the cache",
+    MOVQ2DQ = "move an MM register to the low quadword of an XMM register, zeroing the rest",
+    PSHUFW = "permute four words under an immediate",
 }
 
 impl Op {
@@ -2394,6 +2456,21 @@ impl Insn {
     pub const fn is_prefix(self) -> bool {
         matches!(self.class, Class::Prefix)
     }
+
+    /// Whether this encoding names an `MM` register — or a 64-bit operand in
+    /// its place — or is `EMMS`.
+    ///
+    /// Asked of the *row* rather than of the operation, because `PADDB` is
+    /// one operation with two register files: `0F FC` adds `MM` registers and
+    /// `66 0F FC` adds `XMM` ones, and only the operands say which. Every row
+    /// this answers yes for is executed by `mmx`, ahead of the SSE
+    /// dispatcher, and has MMX's gates and its x87 side effects.
+    #[must_use]
+    pub const fn is_mmx(self) -> bool {
+        matches!(self.op, Op::EMMS)
+            || matches!(self.dst, Arg::Pq | Arg::Qq | Arg::Qd | Arg::Nq)
+            || matches!(self.src, Arg::Pq | Arg::Qq | Arg::Qd | Arg::Nq)
+    }
 }
 
 /// The row an opcode map holds where nothing is assigned.
@@ -3039,7 +3116,122 @@ const SECONDARY: ([Insn; 256], [bool; 256]) = opmap! {
     0xcd BSWAP Rv   None None   Documented;
     0xce BSWAP Rv   None None   Documented;
     0xcf BSWAP Rv   None None   Documented;
+
+    // ---- MMX, with no mandatory prefix -----------------------------------
+    //
+    // The same opcodes as SSE2's packed-integer half, which is no accident:
+    // SSE2 widened MMX by putting a `66` in front of it. So most of these
+    // rows name the very operation [`TABLE_0F_66`] does, with `MM` operands
+    // instead of `XMM` ones, and `Insn::is_mmx` is what tells them apart.
+    // Gated at execution: `Features::mmx` for the original set, `sse` for the
+    // integer instructions SSE added on `MM` registers (`PAVGB` through
+    // `MOVNTQ`), `sse2` for the three SSE2 added (`PADDQ`, `PSUBQ`,
+    // `PMULUDQ`). *Intel SDM* volume 2 appendix A, table A-3.
+    //
+    // The low-half unpacks read only four bytes from memory; the high-half
+    // ones read eight.
+    0x60 PUNPCKLBW Pq  Qd  None   Documented;
+    0x61 PUNPCKLWD Pq  Qd  None   Documented;
+    0x62 PUNPCKLDQ Pq  Qd  None   Documented;
+    0x63 PACKSSWB  Pq  Qq  None   Documented;
+    0x64 PCMPGTB   Pq  Qq  None   Documented;
+    0x65 PCMPGTW   Pq  Qq  None   Documented;
+    0x66 PCMPGTD   Pq  Qq  None   Documented;
+    0x67 PACKUSWB  Pq  Qq  None   Documented;
+    0x68 PUNPCKHBW Pq  Qq  None   Documented;
+    0x69 PUNPCKHWD Pq  Qq  None   Documented;
+    0x6a PUNPCKHDQ Pq  Qq  None   Documented;
+    0x6b PACKSSDW  Pq  Qq  None   Documented;
+    // `MOVD`, and `MOVQ` with `REX.W`: the general-register operand is `Ey`.
+    0x6e MOVD      Pq  Ey  None   Documented;
+    0x6f MOVQ      Pq  Qq  None   Documented;
+    0x70 PSHUFW    Pq  Qq +Ib None Documented;
+    // The three shift-by-immediate groups, as in the `66` map; their
+    // byte-shifting members have no `MM` form (see [`resolve_modrm`]).
+    0x71 PSRLW     Nq  Ib  Grp12  Documented;
+    0x72 PSRLD     Nq  Ib  Grp13  Documented;
+    0x73 PSRLQ     Nq  Ib  Grp14  Documented;
+    0x74 PCMPEQB   Pq  Qq  None   Documented;
+    0x75 PCMPEQW   Pq  Qq  None   Documented;
+    0x76 PCMPEQD   Pq  Qq  None   Documented;
+    0x77 EMMS      None None None Documented;
+    0x7e MOVD      Ey  Pq  None   Documented;
+    0x7f MOVQ      Qq  Pq  None   Documented;
+    0xc4 PINSRW    Pq  Ew +Ib None Documented;
+    0xc5 PEXTRW    Gy  Nq +Ib None Documented;
+    0xd1 PSRLW     Pq  Qq  None   Documented;
+    0xd2 PSRLD     Pq  Qq  None   Documented;
+    0xd3 PSRLQ     Pq  Qq  None   Documented;
+    0xd4 PADDQ     Pq  Qq  None   Documented;
+    0xd5 PMULLW    Pq  Qq  None   Documented;
+    0xd7 PMOVMSKB  Gy  Nq  None   Documented;
+    0xd8 PSUBUSB   Pq  Qq  None   Documented;
+    0xd9 PSUBUSW   Pq  Qq  None   Documented;
+    0xda PMINUB    Pq  Qq  None   Documented;
+    0xdb PAND      Pq  Qq  None   Documented;
+    0xdc PADDUSB   Pq  Qq  None   Documented;
+    0xdd PADDUSW   Pq  Qq  None   Documented;
+    0xde PMAXUB    Pq  Qq  None   Documented;
+    0xdf PANDN     Pq  Qq  None   Documented;
+    0xe0 PAVGB     Pq  Qq  None   Documented;
+    0xe1 PSRAW     Pq  Qq  None   Documented;
+    0xe2 PSRAD     Pq  Qq  None   Documented;
+    0xe3 PAVGW     Pq  Qq  None   Documented;
+    0xe4 PMULHUW   Pq  Qq  None   Documented;
+    0xe5 PMULHW    Pq  Qq  None   Documented;
+    // Intel writes the destination `Mq`: memory only. It is `Qq` here so the
+    // register form decodes to something the executor can refuse with `#UD`,
+    // exactly as `MOVNTDQ`'s is.
+    0xe7 MOVNTQ    Qq  Pq  None   Documented;
+    0xe8 PSUBSB    Pq  Qq  None   Documented;
+    0xe9 PSUBSW    Pq  Qq  None   Documented;
+    0xea PMINSW    Pq  Qq  None   Documented;
+    0xeb POR       Pq  Qq  None   Documented;
+    0xec PADDSB    Pq  Qq  None   Documented;
+    0xed PADDSW    Pq  Qq  None   Documented;
+    0xee PMAXSW    Pq  Qq  None   Documented;
+    0xef PXOR      Pq  Qq  None   Documented;
+    0xf1 PSLLW     Pq  Qq  None   Documented;
+    0xf2 PSLLD     Pq  Qq  None   Documented;
+    0xf3 PSLLQ     Pq  Qq  None   Documented;
+    0xf4 PMULUDQ   Pq  Qq  None   Documented;
+    0xf5 PMADDWD   Pq  Qq  None   Documented;
+    0xf6 PSADBW    Pq  Qq  None   Documented;
+    // The data is `reg` and the mask `r/m`, as for `MASKMOVDQU`.
+    0xf7 MASKMOVQ  Pq  Nq  None   Documented;
+    0xf8 PSUBB     Pq  Qq  None   Documented;
+    0xf9 PSUBW     Pq  Qq  None   Documented;
+    0xfa PSUBD     Pq  Qq  None   Documented;
+    0xfb PSUBQ     Pq  Qq  None   Documented;
+    0xfc PADDB     Pq  Qq  None   Documented;
+    0xfd PADDW     Pq  Qq  None   Documented;
+    0xfe PADDD     Pq  Qq  None   Documented;
+    // SSE's conversions between packed singles and `MM` doublewords. The
+    // single-precision side is a quadword — two singles — in both
+    // directions.
+    0x2a CVTPI2PS  Vx  Qq  None   Documented;
+    0x2c CVTTPS2PI Pq  Wq  None   Documented;
+    0x2d CVTPS2PI  Pq  Wq  None   Documented;
 };
+
+/// [`SECONDARY`] with every MMX row taken out: the base the three
+/// mandatory-prefix maps are deltas on.
+///
+/// A mandatory prefix in front of an MMX opcode is either a *different*
+/// instruction, which that prefix's map lists (`66 0F FC` is `PADDB xmm`), or
+/// no instruction at all — never the MMX one with the prefix ignored. Before
+/// MMX was here every one of these rows was unassigned, so this keeps every
+/// prefixed encoding the maps do not list exactly as it was: `#UD`.
+const fn without_mmx(mut t: [Insn; 256]) -> [Insn; 256] {
+    let mut i = 0;
+    while i < 256 {
+        if t[i].is_mmx() {
+            t[i] = UNASSIGNED;
+        }
+        i += 1;
+    }
+    t
+}
 
 /// The two-byte (`0F`) decode table with no mandatory prefix.
 pub static TABLE_0F: [Insn; 256] = SECONDARY.0;
@@ -3057,7 +3249,7 @@ pub static LISTED_0F: [bool; 256] = SECONDARY.1;
 /// the opcode — Intel calls it a **mandatory prefix** (*SDM* volume 2 §2.1.1)
 /// — so the effective operand size means nothing to it.
 const SECONDARY_66: ([Insn; 256], [bool; 256]) = opmap! {
-    base SECONDARY.0;
+    base without_mmx(SECONDARY.0);
 
     0x10 MOVUPD   Vx Wx None   Documented;
     0x11 MOVUPD   Wx Vx None   Documented;
@@ -3070,6 +3262,12 @@ const SECONDARY_66: ([Insn; 256], [bool; 256]) = opmap! {
     0x28 MOVAPD   Vx Wx None   Documented;
     0x29 MOVAPD   Wx Vx None   Documented;
     0x2b MOVNTPD  Wx Vx None   Documented;
+    // SSE2's conversions between packed doubles and `MM` doublewords. The
+    // double side is a full register, so its memory form is sixteen aligned
+    // bytes; the `MM` side is a quadword.
+    0x2a CVTPI2PD  Vx Qq None  Documented;
+    0x2c CVTTPD2PI Pq Wx None  Documented;
+    0x2d CVTPD2PI  Pq Wx None  Documented;
     0x2e UCOMISD  Vx Wq None   Documented;
     0x2f COMISD   Vx Wq None   Documented;
     0x50 MOVMSKPD Gy Ux None   Documented;
@@ -3185,7 +3383,7 @@ pub static CHANGED_0F_66: [bool; 256] = SECONDARY_66.1;
 
 /// The two-byte map as an `F3` prefix decodes it: the scalar-single half.
 const SECONDARY_F3: ([Insn; 256], [bool; 256]) = opmap! {
-    base SECONDARY.0;
+    base without_mmx(SECONDARY.0);
 
     0x10 MOVSS     Vx Wd None Documented;
     0x11 MOVSS     Wd Vx None Documented;
@@ -3213,6 +3411,9 @@ const SECONDARY_F3: ([Insn; 256], [bool; 256]) = opmap! {
     0x7f MOVDQU    Wx Vx None Documented;
     0xc2 CMPSS     Vx Wd +Ib None Documented;
     0xc3 UD        None None None Undefined;
+    // Between the two register files: an `MM` register into the low
+    // quadword of an `XMM` one. Register form only.
+    0xd6 MOVQ2DQ   Vx Nq None Documented;
     // Two doublewords in, so the memory form is a quadword.
     0xe6 CVTDQ2PD  Vx Wq None Documented;
 };
@@ -3225,7 +3426,7 @@ pub static CHANGED_0F_F3: [bool; 256] = SECONDARY_F3.1;
 
 /// The two-byte map as an `F2` prefix decodes it: the scalar-double half.
 const SECONDARY_F2: ([Insn; 256], [bool; 256]) = opmap! {
-    base SECONDARY.0;
+    base without_mmx(SECONDARY.0);
 
     0x10 MOVSD     Vx Wq None Documented;
     0x11 MOVSD     Wq Vx None Documented;
@@ -3247,6 +3448,8 @@ const SECONDARY_F2: ([Insn; 256], [bool; 256]) = opmap! {
     0x70 PSHUFLW   Vx Wx +Ib None Documented;
     0xc2 CMPSD     Vx Wq +Ib None Documented;
     0xc3 UD        None None None Undefined;
+    // `MOVQ2DQ`'s converse. Register form only.
+    0xd6 MOVDQ2Q   Pq Ux None Documented;
     0xe6 CVTPD2DQ  Vx Wx None Documented;
 };
 
@@ -3608,11 +3811,24 @@ pub const fn resolve_modrm(map: Gen, insn: Insn, opcode: u8, two_byte: bool, mod
             if modrm.md != 3 {
                 return UNASSIGNED;
             }
-            match insn.group {
+            let row = match insn.group {
                 Grp::Grp12 => GROUP12[idx],
                 Grp::Grp13 => GROUP13[idx],
                 _ => GROUP14[idx],
+            };
+            // The no-prefix map's rows are the same groups on an `MM`
+            // register, minus the two whole-register byte shifts, which have
+            // no 64-bit form (*Intel SDM* volume 2, `PSRLDQ`: `66` only).
+            if matches!(insn.dst, Arg::Nq) {
+                if matches!(row.op, Op::UD | Op::PSRLDQ | Op::PSLLDQ) {
+                    return UNASSIGNED;
+                }
+                return Insn {
+                    dst: Arg::Nq,
+                    ..row
+                };
             }
+            row
         }
         Grp::ModAlt => {
             if modrm.md != 3 {

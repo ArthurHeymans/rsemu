@@ -88,6 +88,16 @@
 //! an SSE instruction is `#UD`, and without the second an unmasked SIMD
 //! exception is `#UD` rather than `#XM`.
 //!
+//! **MMX** (`mmx`): the eight `MM` registers, which are the significands of
+//! the eight x87 registers rather than storage of their own, with the
+//! architectural side effects of that aliasing — every MMX instruction sets
+//! `TOP` to zero and the tag word to all-valid, a write to `MMn` sets the
+//! exponent and sign of physical register `n` to all ones, and `EMMS` empties
+//! the tag word — so `FSAVE` and `FXSAVE` carry the MMX state without knowing
+//! it exists. The whole integer set, SSE's additions on `MM` registers, and
+//! SSE2's (`PADDQ`, `PSUBQ`, `PMULUDQ`, `MOVQ2DQ`, `MOVDQ2Q`, the `CVT*PI*`
+//! conversions).
+//!
 //! **The model-specific registers** ([`prot::msr`]): `RDMSR` and `WRMSR`
 //! reaching `IA32_EFER`, the four `SYSCALL` registers, the three segment-base
 //! registers, the time-stamp counter that `RDTSC` also reads,
@@ -131,8 +141,6 @@
 //!
 //! # What is not
 //!
-//! - **No MMX.** Its eight registers alias the x87 stack, which is a
-//!   correctness trap rather than a feature, and `CPUID`'s `MMX` bit is clear.
 //! - **No x87 transcendentals.** `F2XM1`, `FYL2X`, `FYL2XP1`, `FPTAN`,
 //!   `FPATAN`, `FSIN`, `FCOS` and `FSINCOS` are unassigned in [`isa`] and
 //!   raise `#UD`. Computing them to the last bit of a 64-bit significand
@@ -330,6 +338,7 @@ mod fpexec;
 pub mod fpu;
 mod hostexit;
 pub mod isa;
+mod mmx;
 pub mod paging;
 pub mod prot;
 
@@ -594,6 +603,16 @@ pub struct Features {
     /// SSE2: the double-precision half, the packed-integer logic, and the
     /// conversions between them. Requires [`sse`](Features::sse).
     pub sse2: bool,
+    /// MMX: the eight 64-bit `MM` registers and the packed-integer
+    /// instructions on them, and `CPUID` leaf 1's `MMX` bit.
+    ///
+    /// The registers are not new storage — they are the significands of the
+    /// eight x87 registers (*Intel SDM* volume 1 §9.5) — so it requires
+    /// [`fpu`](Features::fpu). [`sse`](Features::sse) requires it in turn:
+    /// SSE added integer instructions on `MM` registers, and no part shipped
+    /// SSE without MMX. A Pentium MMX, a Pentium II and everything later has
+    /// it; a Pentium Pro and everything earlier does not.
+    pub mmx: bool,
 }
 
 impl Features {
@@ -615,6 +634,7 @@ impl Features {
         fxsr: false,
         sse: false,
         sse2: false,
+        mmx: false,
     };
 
     /// What an 80486DX has: the 486 additions and an on-die x87 unit.
@@ -661,6 +681,7 @@ impl Features {
         fxsr: true,
         sse: true,
         sse2: true,
+        mmx: true,
     };
 
     /// Whether this combination describes a part that could exist.
@@ -716,6 +737,17 @@ impl Features {
             // The two share `CR0.EM` and `CR0.TS`, and `FXSAVE`'s image has
             // the x87 registers in it whether or not anything uses them.
             return missing("fpu", "sse");
+        }
+        if self.mmx && !self.fpu {
+            // The `MM` registers *are* the x87 registers' significands; a
+            // part with no x87 unit has nowhere to keep them.
+            return missing("fpu", "mmx");
+        }
+        if self.sse && !self.mmx {
+            // SSE's integer additions (`PAVGB`, `PSHUFW`, `MOVNTQ` and the
+            // rest) operate on `MM` registers, and every part with SSE has
+            // MMX.
+            return missing("mmx", "sse");
         }
         if self.fxsr && !self.cr4 {
             return missing("cr4", "fxsr");
@@ -2418,7 +2450,7 @@ impl X86 {
         let mut features = variant.features();
         for name in [
             "cpuid", "cr4", "msr", "mtrr", "pae", "long", "nx", "syscall", "cmov", "pse", "pge",
-            "fpu", "cx8", "fxsr", "sse", "sse2",
+            "fpu", "cx8", "fxsr", "sse", "sse2", "mmx",
         ] {
             let Some(on) = r.optional::<bool>(name)? else {
                 continue;
@@ -2439,6 +2471,7 @@ impl X86 {
                 "cx8" => features.cx8 = on,
                 "fxsr" => features.fxsr = on,
                 "sse" => features.sse = on,
+                "mmx" => features.mmx = on,
                 _ => features.sse2 = on,
             }
         }

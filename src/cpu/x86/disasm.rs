@@ -211,6 +211,10 @@ const fn fixes_size(arg: Arg) -> bool {
             | Arg::Mfsave
             | Arg::Mfx
             | Arg::Mq
+            | Arg::Pq
+            | Arg::Qq
+            | Arg::Qd
+            | Arg::Nq
     )
 }
 
@@ -327,7 +331,9 @@ impl Disassembled {
         for arg in [insn.dst, insn.src, insn.aux] {
             match arg {
                 Arg::Eb | Arg::Ev | Arg::Ew | Arg::Ed if modrm_mem => return true,
-                Arg::Wx | Arg::Wq | Arg::Wd | Arg::Ey if modrm_mem => return true,
+                Arg::Wx | Arg::Wq | Arg::Wd | Arg::Ey | Arg::Qq | Arg::Qd if modrm_mem => {
+                    return true;
+                }
                 Arg::M | Arg::Mp | Arg::Ms => return true,
                 Arg::Ob | Arg::Ov | Arg::Xb | Arg::Xv | Arg::Yb | Arg::Yv => return true,
                 Arg::Mf32
@@ -508,6 +514,21 @@ impl Disassembled {
             Arg::Gy => {
                 let width = if fields.rex_w() { 8 } else { 4 };
                 f.write_str(regs_for(width, rex)[fields.reg_num() as usize])
+            }
+
+            // The MMX operands. Three bits name an `MM` register whatever
+            // `REX` says, so these read the ModRM fields raw rather than
+            // through `reg_num`/`rm_num`.
+            Arg::Pq => write!(f, "mm{}", fields.modrm.map_or(0, |m| m.reg & 7)),
+            Arg::Nq => write!(f, "mm{}", fields.modrm.map_or(0, |m| m.rm & 7)),
+            Arg::Qq | Arg::Qd => {
+                let modrm = fields.modrm.unwrap_or(ModRm::new(0));
+                if modrm.is_register() {
+                    write!(f, "mm{}", modrm.rm & 7)
+                } else {
+                    let size = arg.fp_bytes(osz).unwrap_or(0);
+                    self.write_mem(f, modrm, size, true)
+                }
             }
         }
     }

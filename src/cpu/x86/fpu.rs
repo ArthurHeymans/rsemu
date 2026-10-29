@@ -525,6 +525,44 @@ impl X87 {
             i += 1;
         }
     }
+
+    // -- The MMX view of the same eight registers ------------------------
+    //
+    // `MMn` is the 64-bit significand of **physical** register `n` — not of
+    // `ST(n)` — and the MMX instructions make the two coincide by setting
+    // `TOP` to zero (*Intel SDM* volume 1 §9.5, table 9-2).
+
+    /// `MMn`: the significand of physical register `n`.
+    #[inline]
+    #[must_use]
+    pub const fn mm(&self, n: u8) -> u64 {
+        self.regs[(n & 7) as usize].sig
+    }
+
+    /// Write `MMn`. The register's sign and exponent become all ones, which
+    /// is what an x87 instruction reading it afterwards sees: a NaN or an
+    /// infinity, never a plausible number (*Intel SDM* volume 1 §9.5.1).
+    /// The tag is not touched — [`X87::enter_mmx`] has already made it valid.
+    #[inline]
+    pub const fn set_mm(&mut self, n: u8, value: u64) {
+        self.regs[(n & 7) as usize] = F80::new(0xffff, value);
+    }
+
+    /// The transition every MMX instruction but `EMMS` makes: `TOP` to zero
+    /// and every tag to valid, whatever the stack held.
+    #[inline]
+    pub const fn enter_mmx(&mut self) {
+        self.set_top(0);
+        self.tag = 0;
+    }
+
+    /// `EMMS`: every tag empty, so the x87 code that follows starts from an
+    /// empty stack. Nothing else changes — not `TOP`, and not the register
+    /// contents.
+    #[inline]
+    pub const fn empty_mmx(&mut self) {
+        self.tag = 0xffff;
+    }
 }
 
 // ---------------------------------------------------------------------------
