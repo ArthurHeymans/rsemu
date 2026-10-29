@@ -2,7 +2,7 @@
 
 Consumed by: `cpu/arm/aprofile` (ARMv5TE, and ARMv7-A's A32 and T32 (Thumb-2)
 instruction sets with VFPv3; NEON to follow),
-`cpu/arm/v7m` (ARMv7E-M, Cortex-M3/M4/M7), `cpu/arm/a64` (ARMv8-A AArch64).
+`cpu/arm/v7m` (ARMv7E-M and Armv8-M Mainline, Cortex-M3/M4/M7/M33), `cpu/arm/a64` (ARMv8-A AArch64).
 
 ## Primary
 
@@ -15,7 +15,8 @@ instruction sets with VFPv3; NEON to follow),
 | ARM926EJ-S TRM (DDI 0198) | The implementation-defined half of the above: the main ID and cache type register values, the c7 `test and clean` behaviour, the TCM status register, and the instruction cycle timings | developer.arm.com **[browser]** |
 | GIC Architecture Specification (IHI 0069) | Generic Interrupt Controller v3/v4 — required by any modern ARM board | `developer.arm.com/documentation/ihi0069/latest/` **[browser]** |
 | Arm ARM for ARMv7-M (DDI 0403) | The **M profile**: T32 only, Handler/Thread modes, the exception model and `EXC_RETURN`, the NVIC/SCB/SysTick/MPU register map at `0xE000E000`, PMSAv7, and the **FPv4-SP/FPv5 extension** — A2.5 for `FPSCR` and the data types, A6.4/A7.5 for the encodings, A7.7 for the per-instruction pseudocode, B1.5.7 for `FPCCR`/`FPCAR`/`FPDSCR` and lazy state preservation | `developer.arm.com/documentation/ddi0403/latest/` **[browser]** |
-| Cortex-M4 TRM (DDI 0439), Cortex-M7 TRM (DDI 0489) | The implementation-defined values a guest can see: `CPUID`, `MVFR0`/`MVFR1`/`MVFR2`, how many priority bits, how many MPU regions, instruction timings | developer.arm.com **[browser]** |
+| Armv8-M ARM (DDI 0553) | The **Cortex-M33's architecture**: the stack-limit checks (`MSPLIM`/`PSPLIM`, `UFSR.STKOF`), the v8-M `EXC_RETURN`, the load-acquire/store-release family, `TT`, PMSAv8 (base/limit regions, `MAIR`), and the Security Extension this repository does not model | `developer.arm.com/documentation/ddi0553/latest/` **[browser]** |
+| Cortex-M4 TRM (DDI 0439), Cortex-M7 TRM (DDI 0489), Cortex-M33 TRM (100230) | The implementation-defined values a guest can see: `CPUID`, `MVFR0`/`MVFR1`/`MVFR2`, how many priority bits, how many MPU regions, instruction timings | developer.arm.com **[browser]** |
 | PrimeCell UART (PL011), TRM DDI 0183 | The UART every ARM virtual board exposes | developer.arm.com **[browser]** |
 
 Arm's site blocks automated fetches but the documents are free to download after
@@ -113,6 +114,23 @@ secondary reference for the exception model.
   [`ROADMAP.md`](../../ROADMAP.md) §9.1 makes guest floating point
   bit-reproducible across hosts. `tests/conformance/ledgers/cpu-arm-v7m-fp.txt`
   is the list of what is deliberately absent.
+- **Armv8-M Mainline is the same core, not a fourth one.** A Cortex-M33 runs
+  the same T32 and the same exception model as a Cortex-M4 with a list of
+  changes small enough to key off one `Config::arch` flag: the stack limits,
+  the `0xFF`-prefixed `EXC_RETURN` (`0xFFFFFFBC` for Thread/PSP), the
+  acquire/release loads and stores, `TT`, and PMSAv8 in place of PMSAv7 —
+  base/limit regions with no priority among them, so an overlap is a fault.
+  It is behind `cpu-arm-v8m` (`part = "cortex-m33"`/`"cortex-m33f"`) and is
+  modelled **without the Security Extension**, which is what an STM32U5 with
+  `TZEN = 0` gives its firmware: no Secure state, no SAU, RAZ/WI `_NS`
+  aliases, `TTA`/`BXNS`/`BLXNS` UNDEFINED. Every new encoding is UNDEFINED on a
+  v7-M part, and the v7-M suite runs unchanged with the feature on.
+  `src/cpu/arm/v7m/v8m.rs`'s documentation is the precise statement, and
+  `tests/conformance/ledgers/cpu-arm-v8m.txt` the list of what is absent.
+- **The boot vector table is the SoC's.** `cpu.arm.v7m`'s `vtor` property is
+  `VTOR`'s reset value and where every reset, warm or cold, reads `SP` and
+  `PC`. It is zero on a part that boots from zero; an STM32U5 boots from
+  `0x08000000` and maps nothing at all at zero.
 - The A64 encoding is regular enough that a generated decoder from the manual's
   encoding tables is straightforward — unlike x86. `cpu/arm/a64/isa.rs` is that
   decoder: one `(mask, bits)` row per instruction, bucketed at compile time on

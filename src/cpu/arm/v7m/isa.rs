@@ -32,8 +32,12 @@
 //!
 //! *ARMv7-M Architecture Reference Manual*, ARM DDI 0403 — A5 (the encoding
 //! tables), A6.3/A7.3 (conditional execution and `IT`), A7.4 (shift and
-//! immediate helpers) and A7.7 (the alphabetical instruction list). No
-//! emulator source of any licence was consulted (`ROADMAP.md` §1).
+//! immediate helpers) and A7.7 (the alphabetical instruction list). The
+//! Armv8-M Mainline additions — the acquire/release family, `TT`, `SG`,
+//! `BXNS`/`BLXNS`, `CSDB`/`SSBB`/`PSSBB` — are from the *Armv8-M
+//! Architecture Reference Manual*, Arm DDI 0553, C2.4, and each was checked
+//! against a real assembler run as a black box. No emulator source of any
+//! licence was consulted (`ROADMAP.md` §1).
 
 use core::fmt;
 
