@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/KarpelesLab/rsemu/compare/v0.0.6...v0.0.7) - 2026-10-29
+
+### Added
+
+- *(cpu-arm)* [**breaking**] make the v7-M Config and Extensions non_exhaustive
+- *(machine)* the stm32u575 and stm32u585 boards
+- *(dev-stm32)* st.devinfo, the factory signature block
+- *(dev-tim)* a u5 register layout with CCR5..OR1 and DCR/DMAR at 0x3DC
+- *(dev-hash)* a u5 variant with ALGO at [18:17] and the SR FIFO counts
+- *(dev-crc)* a u5 variant with the 32-bit IDR
+- *(dev-iwdg)* a u5 variant with the four-bit PR and the early wakeup
+- *(dev-wwdg)* wdgtb-width for the U5's three-bit prescaler
+- *(dev-dbgmcu)* a u5 variant with the seven-word RM0456 layout
+- *(dev-rng)* a u5 variant with CONDRST, CONFIGLOCK, NSCR and HTCR
+- *(dev-usart)* a u5 variant with TEACK/REACK, the FIFO mode, PRESC and AUTOCR
+- *(dev-gpio)* a u5 variant with BRR, HSLVR and SECCFGR
+- *(cpu-arm)* [**breaking**] Armv8-M Mainline (Cortex-M33) in the v7-M core, and a reset VTOR
+- *(dev-icache)* the STM32U5 ICACHE and DCACHE control blocks
+- *(dev-pwr)* the STM32U5 power controller
+- *(dev-rcc)* the STM32U5 reset and clock controller
+- *(dev-stm32-exti)* a "u5" variant with RPR/FPR and the EXTICR mux
+- *(dev-stm32-flash)* a "u5" variant for the STM32U575/U585
+- *(dev-sgx)* the host's soft reset stops the firmware in the hardware mode
+- *(dev-sgx)* the firmware's memory context and timer in the hardware mode
+- *(dev-sgx)* a hardware mode that runs the GPU's own firmware
+- *(dev-sgx)* a PDS decoder, disassembler and interpreter
+- *(dev-sgx)* a USSE2 decoder, disassembler and interpreter
+
+### Fixed
+
+- *(cpu-arm)* publish the M-profile core's position, and two NVIC defects
+- *(cpu-arm)* decode the doubleword moves an FPv4/FPv5-SP unit has
+- follow oxideav-png 0.1.12, whose PngImage::new returns a Result
+- *(cpu-arm)* take B<cond>.W imm6 from hw1[5:0], not the condition field
+- *(dev-sgx)* b53 picks how a USSE writeback load or store advances
+- *(dev-sgx)* USSE b41 loads and stores post-increment the base
+- *(dev-sgx)* opcode 26 negates src2 when b39 is set
+- *(dev-sgx)* syncs ends a USSE phase, and STR's b43 is not END
+- gate the A9 board test on VFP, and drop four redundant doc-link targets
+
+### Other
+
+- *(cpu-arm)* register the cpu-arm-v8m ledger with the conformance suite
+- *(cpu-arm)* describe Armv8-M Mainline and the boot VTOR in the ARM notes
+- *(cpu-arm)* Cortex-M33 unit tests, a v8-M corpus program and its ledger
+- take purecrypto 0.10 now that the MSRV allows it
+- raise the MSRV to 1.91
+- oxideav changes its API in patch releases on purpose; drop the note that said otherwise
+- *(dev-sgx)* move the device into a module directory
+
 ## [0.0.6](https://github.com/KarpelesLab/rsemu/compare/v0.0.5...v0.0.6) - 2026-10-04
 
 ### Added
