@@ -878,3 +878,409 @@ fn an_output_nobody_named_is_driven_by_nothing() {
         "an unwired controller drives nothing"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The U5 (RM0456 §11; ST CMSIS `stm32u585xx.h`, `RCC_TypeDef`)
+// ---------------------------------------------------------------------------
+
+mod u5 {
+    use super::*;
+
+    pub(super) const CR: u64 = 0x00;
+    pub(super) const ICSCR1: u64 = 0x08;
+    pub(super) const CFGR1: u64 = 0x1c;
+    pub(super) const CFGR2: u64 = 0x20;
+    pub(super) const CFGR3: u64 = 0x24;
+    pub(super) const PLL1CFGR: u64 = 0x28;
+    pub(super) const PLL1DIVR: u64 = 0x34;
+    pub(super) const PLL1FRACR: u64 = 0x38;
+    pub(super) const CIER: u64 = 0x50;
+    pub(super) const CIFR: u64 = 0x54;
+    pub(super) const CICR: u64 = 0x58;
+    pub(super) const AHB2ENR2: u64 = 0x90;
+    pub(super) const AHB3ENR: u64 = 0x94;
+    pub(super) const APB3ENR: u64 = 0xa8;
+    pub(super) const APB3RSTR: u64 = 0x80;
+    pub(super) const BDCR: u64 = 0xf0;
+    pub(super) const CSR: u64 = 0xf4;
+
+    pub(super) const CR_MSISRDY: u32 = 1 << 2;
+    pub(super) const CR_MSIKON: u32 = 1 << 4;
+    pub(super) const CR_HSION: u32 = 1 << 8;
+    pub(super) const CR_HSIRDY: u32 = 1 << 10;
+    pub(super) const CR_HSI48ON: u32 = 1 << 12;
+    pub(super) const CR_HSI48RDY: u32 = 1 << 13;
+    pub(super) const CR_HSEON: u32 = 1 << 16;
+    pub(super) const CR_HSERDY: u32 = 1 << 17;
+    pub(super) const CR_PLL1ON: u32 = 1 << 24;
+    pub(super) const CR_PLL1RDY: u32 = 1 << 25;
+    pub(super) const CR_PLL2ON: u32 = 1 << 26;
+    pub(super) const CR_PLL2RDY: u32 = 1 << 27;
+
+    pub(super) fn rcc() -> Rcc {
+        Rcc::with_config(
+            Variant::U5,
+            Frequencies {
+                // The B-U585I-IOT02A's 16 MHz can.
+                hse: 16_000_000,
+                ..Frequencies::default()
+            },
+            DELAY,
+        )
+    }
+
+    /// `PLL1DIVR` from the HAL's *real* factors, each stored as value − 1.
+    pub(super) fn divr(n: u32, p: u32, q: u32, r: u32) -> u32 {
+        (n - 1) | ((p - 1) << 9) | ((q - 1) << 16) | ((r - 1) << 24)
+    }
+
+    /// Run `SystemClock_Config` as CubeMX writes it for a U585 at 160 MHz:
+    /// MSIS at 4 MHz into PLL1 with M = 1, N = 80, R = 2.
+    pub(super) fn clock_config(rcc: &Rcc) {
+        // PLL1SRC = MSIS, PLL1RGE = 4–8 MHz, M = 1, PLL1MBOOST = ÷1, REN|QEN.
+        poke(rcc, PLL1CFGR, 1 | (1 << 2) | (1 << 17) | (1 << 18));
+        poke(rcc, PLL1DIVR, divr(80, 2, 2, 2));
+        poke(rcc, CR, peek(rcc, CR) | CR_PLL1ON);
+        let mut spins = 0;
+        while peek(rcc, CR) & CR_PLL1RDY == 0 {
+            tick(rcc, 1);
+            spins += 1;
+            assert!(spins < 1000, "PLL1RDY never came");
+        }
+        // HPRE = PPRE1 = PPRE2 = ÷1, PPRE3 = ÷2.
+        poke(rcc, CFGR2, 0);
+        poke(rcc, CFGR3, 4 << 4);
+        poke(rcc, CFGR1, (peek(rcc, CFGR1) & !0b11) | 0b11);
+        while peek(rcc, CFGR1) & 0b1100 != 0b1100 {
+            tick(rcc, 1);
+            spins += 1;
+            assert!(spins < 1000, "SWS never followed SW");
+        }
+    }
+}
+
+#[test]
+fn a_u5_boots_on_the_4mhz_msis() {
+    let rcc = u5::rcc();
+    assert_eq!(
+        peek(&rcc, u5::CR),
+        0x0000_0035,
+        "MSIS and MSIK on and ready"
+    );
+    assert_eq!(peek(&rcc, u5::CFGR1) & 0b1111, 0, "SW = SWS = MSIS");
+    assert_eq!(peek(&rcc, u5::PLL1DIVR), 0x0101_0280);
+    let clocks = rcc.clocks();
+    for out in [
+        ClockOutput::SYSCLK,
+        ClockOutput::HCLK,
+        ClockOutput::PCLK1,
+        ClockOutput::PCLK2,
+        ClockOutput::PCLK3,
+    ] {
+        assert_eq!(clocks.rate(out), Rational::integer(4_000_000), "{out}");
+    }
+}
+
+#[test]
+fn the_u5_msis_range_follows_msirgsel() {
+    let rcc = u5::rcc();
+    // With MSIRGSEL clear the range is `CSR.MSISSRANGE`; writing a new
+    // `ICSCR1.MSISRANGE` does nothing until MSIRGSEL says to look there.
+    poke(&rcc, u5::ICSCR1, 0x0400_0000);
+    assert_eq!(
+        rcc.clocks().rate(ClockOutput::SYSCLK),
+        Rational::integer(4_000_000)
+    );
+    // Range 0 is 48 MHz.
+    poke(&rcc, u5::ICSCR1, 1 << 23);
+    assert_eq!(
+        rcc.clocks().rate(ClockOutput::SYSCLK),
+        Rational::integer(48_000_000)
+    );
+    // Range 6 is 4 MHz ÷ 3, exactly, not ST's rounded 1 330 000.
+    poke(&rcc, u5::ICSCR1, (1 << 23) | (6 << 28));
+    assert_eq!(
+        rcc.clocks().rate(ClockOutput::SYSCLK),
+        Rational::integer(4_000_000).checked_scale(1, 3).unwrap()
+    );
+}
+
+#[test]
+fn the_u5_vendor_clock_config_reaches_160mhz() {
+    let rcc = u5::rcc();
+    u5::clock_config(&rcc);
+    let clocks = rcc.clocks();
+    assert_eq!(
+        clocks.rate(ClockOutput::SYSCLK),
+        Rational::integer(160_000_000)
+    );
+    assert_eq!(
+        clocks.rate(ClockOutput::HCLK),
+        Rational::integer(160_000_000)
+    );
+    assert_eq!(
+        clocks.rate(ClockOutput::PCLK1),
+        Rational::integer(160_000_000)
+    );
+    assert_eq!(
+        clocks.rate(ClockOutput::PCLK3),
+        Rational::integer(80_000_000)
+    );
+    assert_eq!(
+        clocks.rate(ClockOutput::TIMCLK1),
+        Rational::integer(160_000_000)
+    );
+    // PLL1Q = 320 MHz / 2.
+    assert_eq!(
+        clocks.rate(ClockOutput::PLL48),
+        Rational::integer(160_000_000)
+    );
+
+    // And APB1 at ÷4 gives the timers twice that.
+    poke(&rcc, u5::CFGR2, 5 << 4);
+    assert_eq!(
+        clocks.rate(ClockOutput::PCLK1),
+        Rational::integer(40_000_000)
+    );
+    assert_eq!(
+        clocks.rate(ClockOutput::TIMCLK1),
+        Rational::integer(80_000_000)
+    );
+}
+
+#[test]
+fn the_u5_pll1_takes_its_fraction_only_behind_fracen() {
+    let rcc = u5::rcc();
+    poke(&rcc, u5::CR, peek(&rcc, u5::CR) | u5::CR_HSEON);
+    tick(&rcc, DELAY);
+    assert_ne!(peek(&rcc, u5::CR) & u5::CR_HSERDY, 0);
+    // HSE 16 MHz, M = 2, N = 20 + 4096/8192, R = 1: VCO = 8 × 20.5 = 164.
+    poke(&rcc, u5::PLL1DIVR, u5::divr(20, 2, 2, 1));
+    poke(&rcc, u5::PLL1FRACR, 4096 << 3);
+    poke(&rcc, u5::PLL1CFGR, 3 | (1 << 8) | (1 << 18));
+    poke(&rcc, u5::CR, peek(&rcc, u5::CR) | u5::CR_PLL1ON);
+    tick(&rcc, DELAY);
+    poke(&rcc, u5::CFGR1, 0b11);
+    tick(&rcc, 1);
+    assert_eq!(
+        rcc.clocks().rate(ClockOutput::SYSCLK),
+        Rational::integer(160_000_000),
+        "FRACEN clear: the fraction is ignored"
+    );
+    poke(&rcc, u5::PLL1CFGR, 3 | (1 << 4) | (1 << 8) | (1 << 18));
+    assert_eq!(
+        rcc.clocks().rate(ClockOutput::SYSCLK),
+        Rational::integer(164_000_000)
+    );
+    // PLL1MBOOST divides the booster's clock, not the VCO's input.
+    poke(
+        &rcc,
+        u5::PLL1CFGR,
+        3 | (1 << 4) | (1 << 8) | (3 << 12) | (1 << 18),
+    );
+    assert_eq!(
+        rcc.clocks().rate(ClockOutput::SYSCLK),
+        Rational::integer(164_000_000)
+    );
+}
+
+#[test]
+fn a_u5_switch_to_a_pll_that_is_not_ready_is_refused() {
+    let rcc = u5::rcc();
+    poke(&rcc, u5::CFGR1, 0b11);
+    tick(&rcc, 2);
+    assert_eq!(peek(&rcc, u5::CFGR1) & 0b1111, 0, "SW refused, SWS unmoved");
+    poke(&rcc, u5::CR, peek(&rcc, u5::CR) | u5::CR_HSION);
+    tick(&rcc, DELAY);
+    assert_ne!(peek(&rcc, u5::CR) & u5::CR_HSIRDY, 0);
+    poke(&rcc, u5::CFGR1, 0b01);
+    tick(&rcc, 1);
+    assert_eq!(peek(&rcc, u5::CFGR1) & 0b1111, 0b0101);
+    assert_eq!(
+        rcc.clocks().rate(ClockOutput::SYSCLK),
+        Rational::integer(16_000_000)
+    );
+}
+
+#[test]
+fn every_u5_oscillator_the_hal_polls_comes_ready() {
+    let rcc = u5::rcc();
+    rcc.set_dbp(true);
+    poke(
+        &rcc,
+        u5::CR,
+        peek(&rcc, u5::CR) | u5::CR_HSI48ON | u5::CR_PLL2ON | (1 << 14) | (1 << 28),
+    );
+    poke(&rcc, u5::BDCR, 1 | (1 << 7) | (1 << 26));
+    tick(&rcc, DELAY);
+    let cr = peek(&rcc, u5::CR);
+    for (name, bit) in [
+        ("HSI48RDY", u5::CR_HSI48RDY),
+        ("PLL2RDY", u5::CR_PLL2RDY),
+        ("SHSIRDY", 1 << 15),
+        ("PLL3RDY", 1 << 29),
+        ("MSISRDY", u5::CR_MSISRDY),
+    ] {
+        assert_ne!(cr & bit, 0, "{name}");
+    }
+    let bdcr = peek(&rcc, u5::BDCR);
+    assert_ne!(bdcr & (1 << 1), 0, "LSERDY");
+    assert_ne!(bdcr & (1 << 11), 0, "LSESYSRDY");
+    assert_ne!(bdcr & (1 << 27), 0, "LSIRDY — in BDCR on a U5");
+
+    // And each drops the moment its enable does.
+    poke(&rcc, u5::CR, cr & !(u5::CR_MSIKON | u5::CR_PLL2ON));
+    assert_eq!(peek(&rcc, u5::CR) & ((1 << 5) | u5::CR_PLL2RDY), 0);
+}
+
+#[test]
+fn the_u5_lsi_is_behind_the_backup_domain_protection() {
+    let rcc = u5::rcc();
+    rcc.set_dbp(false);
+    poke(&rcc, u5::BDCR, 1 << 26);
+    tick(&rcc, DELAY);
+    assert_eq!(peek(&rcc, u5::BDCR), 0, "dropped while DBP is clear");
+    rcc.set_dbp(true);
+    // LSI ÷ 128 to the RTC.
+    poke(&rcc, u5::BDCR, (1 << 26) | (1 << 28) | (2 << 8) | (1 << 15));
+    tick(&rcc, DELAY);
+    assert_eq!(
+        rcc.clocks().rate(ClockOutput::RTCCLK),
+        Rational::integer(32_000).checked_scale(1, 128).unwrap()
+    );
+}
+
+#[test]
+fn the_u5_clock_interrupt_has_msik_at_eleven() {
+    let rcc = u5::rcc();
+    let (_wire, source, probe) = probe();
+    Device::connect(&rcc, IRQ_PIN, source).unwrap();
+    poke(&rcc, u5::CIER, 1 << 11);
+    poke(&rcc, u5::CR, peek(&rcc, u5::CR) & !u5::CR_MSIKON);
+    poke(&rcc, u5::CR, peek(&rcc, u5::CR) | u5::CR_MSIKON);
+    tick(&rcc, DELAY);
+    assert_eq!(peek(&rcc, u5::CIFR), 1 << 11, "MSIKRDYF");
+    assert!(probe.is_high());
+    poke(&rcc, u5::CIFR, 0);
+    assert_eq!(peek(&rcc, u5::CIFR), 1 << 11, "CIFR is read-only");
+    poke(&rcc, u5::CICR, 1 << 11);
+    assert_eq!(peek(&rcc, u5::CIFR), 0);
+    assert!(!probe.is_high());
+}
+
+#[test]
+fn the_u5_gate_banks_are_where_the_header_puts_them() {
+    let rcc = u5::rcc();
+    // `ahb3en2` is `AHB3ENR.PWREN`: the wire a U5 board runs to `st.pwr`.
+    for (pin, reg, bit) in [
+        ("ahb3en2", u5::AHB3ENR, 2),
+        ("ahb2enb0", u5::AHB2ENR2, 0),
+        ("apb3en6", u5::APB3ENR, 6),
+        ("apb3rst6", u5::APB3RSTR, 6),
+        ("apb1en17", 0x9c, 17),
+        ("apb1enb1", 0xa0, 1),
+        ("ahb2en0", 0x8c, 0),
+        ("apb2en14", 0xa4, 14),
+        ("ahb1en1", 0x88, 1),
+    ] {
+        let (_w, source, probe) = probe();
+        Device::connect(&rcc, pin, source).unwrap_or_else(|e| panic!("{pin}: {e}"));
+        assert!(!probe.is_high(), "{pin} starts low");
+        poke(&rcc, reg, 1 << bit);
+        assert!(probe.is_high(), "{pin} follows its bit");
+        poke(&rcc, reg, 0);
+    }
+    // The new prefixes are refused by the families that do not have them.
+    let (_w, source, _p) = probe();
+    assert!(Device::connect(&l4(), "apb3en0", source).is_err());
+    let (_w, source, _p) = probe();
+    assert!(Device::connect(&f4(), "ahb2enb0", source).is_err());
+    let layout = Variant::U5.layout();
+    assert_ne!(
+        parse_bank_pin(layout, "ahb2en1"),
+        parse_bank_pin(layout, "ahb2enb1")
+    );
+    let schema = schema();
+    for pin in ["ahb2enb31", "apb3en0", "ahb2rstb3", "apb3rst31"] {
+        assert!(schema.port_named(pin).is_some(), "{pin} is declared");
+    }
+}
+
+#[test]
+fn the_u5_reset_flags_and_rmvf() {
+    let rcc = u5::rcc();
+    assert_eq!(
+        peek(&rcc, u5::CSR),
+        0x0c00_4400,
+        "PIN + BOR, MSI ranges 4 MHz"
+    );
+    assert!(Device::sink(&rcc, "fwrst", &[WireId::new(1)]).is_none());
+    let src = WireId::new(1);
+    let pin = Device::sink(&rcc, "iwdgrst", &[src]).expect("iwdgrst");
+    pin.sink.set_level(src, pin.line, Level::High);
+    assert_ne!(peek(&rcc, u5::CSR) & (1 << 29), 0);
+    poke(&rcc, u5::CSR, peek(&rcc, u5::CSR) | (1 << 23));
+    assert_eq!(peek(&rcc, u5::CSR) & 0xff80_0000, 0);
+    assert_eq!(peek(&rcc, u5::CSR) & 0xffff, 0x4400, "the ranges stay");
+}
+
+#[test]
+fn a_u5_snapshot_round_trips_to_identical_state() {
+    let saved = u5::rcc();
+    saved.set_dbp(true);
+    u5::clock_config(&saved);
+    poke(&saved, u5::BDCR, 1 | (1 << 26));
+    poke(&saved, u5::CR, peek(&saved, u5::CR) | u5::CR_HSI48ON);
+    // Mid-transition: three ready deadlines pending.
+    assert_eq!(peek(&saved, u5::CR) & u5::CR_HSI48RDY, 0);
+
+    let mut shape = MachineShape::new();
+    shape.add_device("rcc", CLASS_NAME).unwrap();
+    let mut w = StateWriter::new(shape);
+    {
+        let mut chunk = w.chunk("rcc", CLASS_NAME, STATE_VERSION).unwrap();
+        Device::save(&saved, &mut chunk).unwrap();
+    }
+    let bytes = w.to_vec().unwrap();
+
+    let restored = u5::rcc();
+    restored.set_dbp(true);
+    let reader = StateReader::new(&bytes).unwrap();
+    let chunk = reader
+        .load("rcc", CLASS_NAME, STATE_VERSION, &Migrations::new())
+        .unwrap();
+    Device::load(&restored, &mut chunk.reader()).unwrap();
+
+    let words = Variant::U5.register_bytes() / 4;
+    let before: Vec<u32> = (0..words).map(|i| peek_debug(&saved, i * 4)).collect();
+    let after: Vec<u32> = (0..words).map(|i| peek_debug(&restored, i * 4)).collect();
+    assert_eq!(before, after);
+    assert_eq!(
+        Device::next_event_tick(&saved),
+        Device::next_event_tick(&restored)
+    );
+    assert_eq!(
+        restored.clocks().rate(ClockOutput::SYSCLK),
+        Rational::integer(160_000_000)
+    );
+    tick(&restored, DELAY);
+    assert_ne!(peek(&restored, u5::CR) & u5::CR_HSI48RDY, 0);
+    assert_eq!(
+        peek(&restored, u5::BDCR) & ((1 << 1) | (1 << 27)),
+        (1 << 1) | (1 << 27)
+    );
+}
+
+#[test]
+fn the_u5_variant_is_a_property() {
+    let props = Props::new()
+        .with("variant", Value::from("u5"))
+        .with("pclk3", Value::from("pclk3"));
+    let rcc = Rcc::new(&props).unwrap();
+    assert_eq!(rcc.variant(), Variant::U5);
+    assert_eq!(
+        Device::region(&rcc, "").map(|r| r.len()),
+        Some(0x118),
+        "through PRIVCFGR"
+    );
+}

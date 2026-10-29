@@ -16,7 +16,7 @@
 //! | the switch | `CFGR.SW` is refused outright when the source it names is not ready; when it is accepted, `SWS` follows one tick later |
 //! | the tree | `SYSCLK`, `HCLK`, `PCLK1`, `PCLK2`, the timer clocks and `RTCCLK` are computed as **exact rationals** from the PLL factors and the prescalers, and published through [`Clocks`] |
 //! | gating | every `xxENR` and `xxRSTR` bit is an output pin, and [`gate`](super::gate) is the input a peripheral receives it on |
-//! | interrupts | a ready bit coming true with its `xxRDYIE` set raises `CIR`/`CIFR`'s flag and the `irq` output, which an F4 board wires to NVIC position 5 |
+//! | interrupts | a ready bit coming true with its `xxRDYIE` set raises `CIR`/`CIFR`'s flag and the `irq` output, which an F4 board wires to NVIC position 5 and a U5 board to position 9 (`RCC_IRQn`) |
 //! | the backup domain | `BDCR` is write-protected until `PWR_CR.DBP` arrives on the `dbp` input, and `BDRST` clears the domain |
 //! | reset causes | `CSR`'s `xxRSTF` flags are set by a pulse on the matching input pin and cleared by `RMVF` |
 //!
@@ -75,8 +75,56 @@
 //! * *STM32L4x5 and STM32L4x6 advanced Arm-based 32-bit MCUs*, ST **RM0351**
 //!   rev 9, §6 "Reset and clock control (RCC)" — §6.2 for the tree, §6.4 for
 //!   the register map.
+//! * *STM32U5 series Arm-based 32-bit MCUs*, ST **RM0456**, §11 "Reset and
+//!   clock control (RCC)" — §11.4 for the tree and the MSI ranges, §11.8 for
+//!   the register map — with the offsets and bit positions taken from ST's
+//!   CMSIS device header `stm32u585xx.h` (`RCC_TypeDef`, `RCC_*_Pos`;
+//!   Apache-2.0). What the U5 variant must answer was read off the polling
+//!   loops of ST's BSD-3-Clause U5 HAL (`HAL_RCC_OscConfig`,
+//!   `HAL_RCC_ClockConfig`, `HAL_RCCEx_PeriphCLKConfig`) and the PLL formula
+//!   off `SystemCoreClockUpdate` in `system_stm32u5xx.c`; none of that code
+//!   is reproduced here.
 //!
 //! No emulator source of any licence was consulted (`ROADMAP.md` §1).
+//!
+//! # The U5 variant
+//!
+//! `variant = "u5"` is RM0456's map, which is the L4's logic redrawn:
+//!
+//! * It boots on **MSIS at 4 MHz** (`CR` = `0x35`: `MSISON`/`MSISRDY` and
+//!   `MSIKON`/`MSIKRDY`), and the MSIS range comes from
+//!   `CSR.MSISSRANGE` until `ICSCR1.MSIRGSEL` points at `ICSCR1.MSISRANGE`.
+//!   The sixteen ranges are exact rationals — range 6 is 4 MHz ÷ 3 — where
+//!   ST's `MSIRangeTable` rounds.
+//! * `CFGR1.SW`/`SWS` keep the L4's bits and encoding (MSIS, HSI16, HSE,
+//!   PLL1); the prescalers moved to `CFGR2` (`HPRE`, `PPRE1`, `PPRE2`) and
+//!   `CFGR3` (`PPRE3`), and [`ClockOutput::PCLK3`] is the APB3 clock.
+//! * PLL1 is `src / (M+1) × (N+1 + FRACN/8192) / (R+1)`, with the fraction
+//!   only while `PLL1FRACEN` stands and `R`/`Q` only behind `PLL1REN`/`QEN`.
+//!   `PLL1MBOOST` divides the EPOD booster's clock and no output.
+//! * Twelve ready bits: MSIS, MSIK, HSI16, HSI48, SHSI, HSE, PLL1–3 in `CR`;
+//!   LSE, `LSESYS` and **LSI** in `BDCR` — the U5 moved the LSI into the
+//!   backup domain, so its enable is behind `DBP` too. `CIER`/`CIFR`/`CICR`
+//!   carry `MSIKRDY` at 11 and `SHSIRDY` at 12; `LSESYSRDY` has no flag.
+//! * Eight gate banks each way. The second words take a letter, as the L4's
+//!   `apb1enb` already does, so no pin name can be read two ways:
+//!
+//!   | enable pin | register | reset pin | register |
+//!   | --- | --- | --- | --- |
+//!   | `ahb1en<n>` | `AHB1ENR` `+0x88` | `ahb1rst<n>` | `AHB1RSTR` `+0x60` |
+//!   | `ahb2en<n>` | `AHB2ENR1` `+0x8c` | `ahb2rst<n>` | `AHB2RSTR1` `+0x64` |
+//!   | `ahb2enb<n>` | `AHB2ENR2` `+0x90` | `ahb2rstb<n>` | `AHB2RSTR2` `+0x68` |
+//!   | `ahb3en<n>` | `AHB3ENR` `+0x94` | `ahb3rst<n>` | `AHB3RSTR` `+0x6c` |
+//!   | `apb1en<n>` | `APB1ENR1` `+0x9c` | `apb1rst<n>` | `APB1RSTR1` `+0x74` |
+//!   | `apb1enb<n>` | `APB1ENR2` `+0xa0` | `apb1rstb<n>` | `APB1RSTR2` `+0x78` |
+//!   | `apb2en<n>` | `APB2ENR` `+0xa4` | `apb2rst<n>` | `APB2RSTR` `+0x7c` |
+//!   | `apb3en<n>` | `APB3ENR` `+0xa8` | `apb3rst<n>` | `APB3RSTR` `+0x80` |
+//!
+//!   `<n>` is the bit from the header's `RCC_xxxENR_yyyEN_Pos`: the PWR is
+//!   `ahb3en2`/`ahb3rst2`, GPIOA `ahb2en0`, USART1 `apb2en14`, USART2
+//!   `apb1en17`, LPUART1 `apb3en6`.
+//! * The reset-cause inputs are `oblrst`, `pinrst`, `borrst`, `sftrst`,
+//!   `iwdgrst`, `wwdgrst`, `lpwrrst` (`CSR[31:25]`), `RMVF` is bit 23.
 //!
 //! # Known deviations
 //!
@@ -96,6 +144,21 @@
 //!   a tick early, which no driver can tell from having serviced it.
 //! * `SSCGR`, `PLLI2SCFGR`, `PLLSAICFGR`, `DCKCFGR`, `CCIPR`, `CCIPR2` and
 //!   `CRRCR` read back and select nothing: their outputs have no consumer yet.
+//!   On a U5 the same is true of `CCIPR1`…`CCIPR3`, `SRDAMR`, `PLL2`/`PLL3`'s
+//!   configuration, `MSIK`, `HSI48` and `SHSI` — each answers its ready bit
+//!   and drives no output — and of `SECCFGR`/`PRIVCFGR`, which are storage
+//!   because the model runs with TrustZone off (`TZEN` = 0).
+//! * **U5 reset values.** `CR`, `ICSCR1`…`ICSCR3`, the `PLLxDIVR` words and
+//!   `CSR` have their manual/HAL reset values; the `MSICALx`/`HSICAL` factory
+//!   trims read zero, and the `xxxENR`/`xxxSMENR` words reset to **zero** for
+//!   the reason given for the `*LPENR` above, though RM0456 has some SRAM and
+//!   flash interface clocks on out of reset. A board that gates its SRAM on
+//!   one of those bits would see it off until firmware sets it.
+//! * The U5's `PLL1FRACN` is used live while `PLL1FRACEN` stands; the
+//!   hardware latches it on `FRACEN`'s rising edge, which the HAL's
+//!   disable–write–enable sequence cannot tell apart. `BDCR.LSIPREDIV`
+//!   divides the LSI on its way to `RTCCLK` only, and `MSIPLLEN` (MSI
+//!   trimmed by the LSE) changes nothing because the MSI is already exact.
 
 use alloc::boxed::Box;
 use alloc::format;
@@ -123,15 +186,19 @@ use crate::machine::validate::{ClassSchema, PortDir, PropSchema, port_index};
 const CLASS_NAME: &str = "st.rcc";
 
 /// The snapshot chunk version. Bump it with the encoding, never on its own.
-const STATE_VERSION: u32 = 1;
+///
+/// Version 2 widened the register file to the U5's seventy words and the
+/// ready-bit table to twelve deadlines; a version-1 chunk is refused rather
+/// than guessed at.
+const STATE_VERSION: u32 = 2;
 
-/// How many 32-bit words the widest layout occupies. The L4 map ends at
-/// `CCIPR2` (`+0x9c`), so forty words covers both families and the snapshot
-/// encoding is one shape whatever the variant.
-const WORDS: usize = 0x28;
+/// How many 32-bit words the widest layout occupies. The U5 map ends at
+/// `PRIVCFGR` (`+0x114`), so seventy words covers every family and the
+/// snapshot encoding is one shape whatever the variant.
+const WORDS: usize = 0x46;
 
-/// How many `xxxON`/`xxxRDY` pairs the widest layout has.
-const MAX_READY: usize = 8;
+/// How many `xxxON`/`xxxRDY` pairs the widest layout has — the U5's twelve.
+const MAX_READY: usize = 12;
 
 /// "No deadline": this ready bit is not waiting on anything.
 const NO_DEADLINE: u64 = u64::MAX;
@@ -190,9 +257,12 @@ impl ClockOutput {
     pub const RTCCLK: ClockOutput = ClockOutput(6);
     /// The PLL's `Q` output — 48 MHz for USB and the SDIO on a configured F4.
     pub const PLL48: ClockOutput = ClockOutput(7);
+    /// The APB3 clock: `HCLK / CFGR3.PPRE3`. A U5 has one; on an F4 or an L4
+    /// it is always zero.
+    pub const PCLK3: ClockOutput = ClockOutput(8);
 
     /// How many outputs there are, which is the width of a [`Clocks`] table.
-    pub const COUNT: usize = 8;
+    pub const COUNT: usize = 9;
 
     /// The name this output is known by, for a diagnostic.
     #[must_use]
@@ -206,6 +276,7 @@ impl ClockOutput {
             ClockOutput::TIMCLK2 => "timclk2",
             ClockOutput::RTCCLK => "rtcclk",
             ClockOutput::PLL48 => "pll48",
+            ClockOutput::PCLK3 => "pclk3",
             _ => return None,
         })
     }
@@ -234,13 +305,14 @@ pub const OUTPUT_TREE: &[(ClockOutput, &str)] = &[
     (ClockOutput::PCLK2, "pclk2"),
     (ClockOutput::TIMCLK1, "timclk1"),
     (ClockOutput::TIMCLK2, "timclk2"),
+    (ClockOutput::PCLK3, "pclk3"),
 ];
 
 /// Which output `out` hangs off, or `None` when it hangs off the crystal.
 fn parent_output(out: ClockOutput) -> Option<ClockOutput> {
     Some(match out {
         ClockOutput::HCLK => ClockOutput::SYSCLK,
-        ClockOutput::PCLK1 | ClockOutput::PCLK2 => ClockOutput::HCLK,
+        ClockOutput::PCLK1 | ClockOutput::PCLK2 | ClockOutput::PCLK3 => ClockOutput::HCLK,
         ClockOutput::TIMCLK1 => ClockOutput::PCLK1,
         ClockOutput::TIMCLK2 => ClockOutput::PCLK2,
         _ => return None,
@@ -323,6 +395,10 @@ pub enum Variant {
     /// RM0351's L4 map: `ICSCR` at `+0x04`, `PLLCFGR` at `+0x0c`, `BDCR` at
     /// `+0x90`, and an MSI the F4 does not have.
     L4,
+    /// RM0456's U5 map: `CFGR1`…`CFGR3`, three PLLs each with a `CFGR`, a
+    /// `DIVR` and a `FRACR`, split `AHB2`/`APB1` enable words, an APB3, and
+    /// the LSI moved into `BDCR` at `+0xf0`.
+    U5,
 }
 
 impl Variant {
@@ -332,6 +408,7 @@ impl Variant {
         match self {
             Variant::F4 => "f4",
             Variant::L4 => "l4",
+            Variant::U5 => "u5",
         }
     }
 
@@ -343,6 +420,9 @@ impl Variant {
             Variant::F4 => 0x90,
             // Through `CCIPR2` at `+0x9c` (RM0351 §6.4.31).
             Variant::L4 => 0xa0,
+            // Through `PRIVCFGR` at `+0x114` (RM0456 §11.8; ST CMSIS
+            // `stm32u585xx.h`, `RCC_TypeDef`).
+            Variant::U5 => 0x118,
         }
     }
 
@@ -350,6 +430,7 @@ impl Variant {
         match self {
             Variant::F4 => &F4,
             Variant::L4 => &L4,
+            Variant::U5 => &U5,
         }
     }
 
@@ -358,6 +439,7 @@ impl Variant {
         match self {
             Variant::F4 => F4_CAUSES,
             Variant::L4 => L4_CAUSES,
+            Variant::U5 => U5_CAUSES,
         }
     }
 }
@@ -369,12 +451,15 @@ enum Osc {
     Hsi,
     /// The external high-speed crystal.
     Hse,
-    /// The L4's multi-speed internal RC.
+    /// The L4's multi-speed internal RC; the U5's `MSIS`, the one that can
+    /// be the system clock.
     Msi,
     /// The main PLL.
     Pll,
-    /// A secondary PLL: `PLLI2S`/`PLLSAI` on an F4, `PLLSAI1`/`PLLSAI2` on an
-    /// L4. Modelled for its ready bit only — nothing consumes its output yet.
+    /// A secondary source modelled for its ready bit only — nothing consumes
+    /// its output yet: `PLLI2S`/`PLLSAI` on an F4, `PLLSAI1`/`PLLSAI2` on an
+    /// L4, and on a U5 `PLL2`, `PLL3`, `MSIK`, `HSI48`, `SHSI` and the
+    /// `LSESYS` path.
     Aux,
     /// The 32.768 kHz backup-domain crystal.
     Lse,
@@ -392,8 +477,9 @@ struct ReadyBit {
     /// The `xxxRDY` bit the hardware answers with.
     rdy: u32,
     /// This source's bit in the interrupt flag register — `CIR` on an F4,
-    /// `CIFR` on an L4. The enable and the clear live at the same position in
-    /// their own words, which is what makes one number enough.
+    /// `CIFR` on an L4 or a U5. The enable and the clear live at the same
+    /// position in their own words, which is what makes one number enough.
+    /// [`NO_FLAG`] for a ready bit with no interrupt (the U5's `LSESYSRDY`).
     flag: u32,
     /// Which source it starts.
     osc: Osc,
@@ -410,10 +496,19 @@ enum Interrupts {
     /// `RCC_CIR` (RM0090 §7.3.5): flags in `[7:0]`, enables in `[14:8]`,
     /// write-one-to-clear in `[23:16]`.
     One { cir: u64 },
-    /// `RCC_CIER`/`CIFR`/`CICR` (RM0351 §6.4.5–§6.4.7): the same bit in three
-    /// registers, the flag word read-only and the clear word write-one.
-    Three { cier: u64, cifr: u64, cicr: u64 },
+    /// `RCC_CIER`/`CIFR`/`CICR` (RM0351 §6.4.5–§6.4.7, RM0456 §11.8.18–20):
+    /// the same bit in three registers, the flag word read-only and the clear
+    /// word write-one. `flags` is which bits of `CIFR` exist.
+    Three {
+        cier: u64,
+        cifr: u64,
+        cicr: u64,
+        flags: u32,
+    },
 }
+
+/// A ready bit with no interrupt flag behind it.
+const NO_FLAG: u32 = u32::MAX;
 
 /// How far above a flag its enable sits in an F4's `CIR`.
 const F4_IE_SHIFT: u32 = 8;
@@ -432,6 +527,11 @@ const F4_ENABLES: u32 = 0x7f << F4_IE_SHIFT;
 /// `LSECSSF` at 9, plus `HSI48RDYF` at 10 on a part that has an HSI48.
 const L4_FLAGS: u32 = 0x7ff;
 
+/// The flag bits a U5's `CIFR` has: `LSIRDYF`…`PLL3RDYF` in `[8:0]`, `CSSF`
+/// at 10, `MSIKRDYF` at 11 and `SHSIRDYF` at 12 (ST CMSIS `stm32u585xx.h`,
+/// `RCC_CIFR_*`). Bit 9 is reserved.
+const U5_FLAGS: u32 = 0x1dff;
+
 impl Interrupts {
     /// Raise `flag`, if the guest asked to be told.
     ///
@@ -442,6 +542,9 @@ impl Interrupts {
     ///
     /// Returns whether anything moved.
     fn raise(self, state: &mut State, flag: u32) -> bool {
+        if flag == NO_FLAG {
+            return false;
+        }
         let (enables, flags_reg, shift) = match self {
             Interrupts::One { cir } => (state.word(cir), cir, F4_IE_SHIFT),
             Interrupts::Three { cier, cifr, .. } => (state.word(cier), cifr, 0),
@@ -462,9 +565,9 @@ impl Interrupts {
                 let value = words[(cir / 4) as usize];
                 value & F4_FLAGS & (value >> F4_IE_SHIFT) != 0
             }
-            Interrupts::Three { cier, cifr, .. } => {
-                words[(cifr / 4) as usize] & words[(cier / 4) as usize] & L4_FLAGS != 0
-            }
+            Interrupts::Three {
+                cier, cifr, flags, ..
+            } => words[(cifr / 4) as usize] & words[(cier / 4) as usize] & flags != 0,
         }
     }
 
@@ -497,8 +600,10 @@ impl Interrupts {
                 // `CIFR` is read-only: only the hardware and `CICR` move it.
                 true
             }
-            Interrupts::Three { cifr, cicr, .. } if offset == cicr => {
-                *state.word_mut(cifr) &= !(value & L4_FLAGS);
+            Interrupts::Three {
+                cifr, cicr, flags, ..
+            } if offset == cicr => {
+                *state.word_mut(cifr) &= !(value & flags);
                 // `CICR` holds nothing of its own.
                 *state.word_mut(cicr) = 0;
                 true
@@ -550,17 +655,19 @@ struct Layout {
 /// Every gate-pin prefix either layout uses, so the schema can declare the
 /// union.
 ///
-/// `apb1en` is `APB1ENR` on an F4 and `APB1ENR1` on an L4; `apb1enb` is the
-/// L4's **second** APB1 word and an F4 has none. A `connect` to a bank the
-/// variant does not have is refused by name.
+/// `apb1en` is `APB1ENR` on an F4 and `APB1ENR1` on an L4 or a U5; `apb1enb`
+/// is the **second** APB1 word and an F4 has none. A U5 splits `AHB2` the same
+/// way — `ahb2en` is `AHB2ENR1`, `ahb2enb` is `AHB2ENR2` — and adds an APB3
+/// (`apb3en`, `apb3rst`). A `connect` to a bank the variant does not have is
+/// refused by name.
 ///
 /// The second word is `apb1enb` rather than `apb1en2` because a bank pin is a
 /// prefix followed by decimal digits, and `apb1en21` would then be two pins
 /// with one spelling — `APB1ENR1` bit 21 and `APB1ENR2` bit 1. A letter cannot
 /// be read as a digit, so the ambiguity cannot arise.
 const ALL_BANKS: &[&str] = &[
-    "ahb1en", "ahb2en", "ahb3en", "apb1en", "apb1enb", "apb2en", "ahb1rst", "ahb2rst", "ahb3rst",
-    "apb1rst", "apb1rstb", "apb2rst",
+    "ahb1en", "ahb2en", "ahb2enb", "ahb3en", "apb1en", "apb1enb", "apb2en", "apb3en", "ahb1rst",
+    "ahb2rst", "ahb2rstb", "ahb3rst", "apb1rst", "apb1rstb", "apb2rst", "apb3rst",
 ];
 
 /// Every reset-cause pin either layout offers, for the schema's union.
@@ -908,8 +1015,170 @@ static L4: Layout = Layout {
         cier: 0x18,
         cifr: 0x1c,
         cicr: 0x20,
+        flags: L4_FLAGS,
     },
     reset_values: L4_RESET_VALUES,
+};
+
+// -- the U5 map (RM0456 §11.8; ST CMSIS `stm32u585xx.h`, `RCC_TypeDef`) -------
+
+/// A bank, spelled the way the tables below need it.
+const fn bank(prefix: &'static str, reg: u64) -> Bank {
+    Bank { prefix, reg }
+}
+
+/// A ready bit, likewise.
+const fn ready(reg: u64, on: u32, rdy: u32, flag: u32, osc: Osc) -> ReadyBit {
+    ReadyBit {
+        reg,
+        on,
+        rdy,
+        flag,
+        osc,
+    }
+}
+
+/// `RCC_CR` on a U5.
+const U5_CR: u64 = 0x00;
+/// `RCC_ICSCR1`: `MSIRGSEL` and the two MSI range fields.
+const U5_ICSCR1: u64 = 0x08;
+/// `RCC_CFGR1`: `SW`/`SWS`, the same two fields at the same bits as an L4's
+/// `CFGR`.
+const U5_CFGR1: u64 = 0x1c;
+/// `RCC_CFGR2`: `HPRE[3:0]`, `PPRE1[6:4]`, `PPRE2[10:8]`.
+const U5_CFGR2: u64 = 0x20;
+/// `RCC_CFGR3`: `PPRE3[6:4]`.
+const U5_CFGR3: u64 = 0x24;
+/// `RCC_PLL1CFGR`: `PLL1SRC[1:0]`, `PLL1FRACEN[4]`, `PLL1M[11:8]`,
+/// `PLL1MBOOST[15:12]`, `PLL1PEN/QEN/REN[18:16]`.
+const U5_PLL1CFGR: u64 = 0x28;
+/// `RCC_PLL1DIVR`: `PLL1N[8:0]`, `PLL1P[15:9]`, `PLL1Q[22:16]`,
+/// `PLL1R[30:24]`, each "value + 1".
+const U5_PLL1DIVR: u64 = 0x34;
+/// `RCC_PLL1FRACR`: `PLL1FRACN[15:3]`.
+const U5_PLL1FRACR: u64 = 0x38;
+/// `RCC_BDCR`, with the LSI's enable in it.
+const U5_BDCR: u64 = 0xf0;
+/// `RCC_CSR`.
+const U5_CSR: u64 = 0xf4;
+
+static U5_ENABLE: &[Bank] = &[
+    bank("ahb1en", 0x88),
+    bank("ahb2en", 0x8c),
+    bank("ahb2enb", 0x90),
+    bank("ahb3en", 0x94),
+    bank("apb1en", 0x9c),
+    bank("apb1enb", 0xa0),
+    bank("apb2en", 0xa4),
+    bank("apb3en", 0xa8),
+];
+
+static U5_RESET_BANKS: &[Bank] = &[
+    bank("ahb1rst", 0x60),
+    bank("ahb2rst", 0x64),
+    bank("ahb2rstb", 0x68),
+    bank("ahb3rst", 0x6c),
+    bank("apb1rst", 0x74),
+    bank("apb1rstb", 0x78),
+    bank("apb2rst", 0x7c),
+    bank("apb3rst", 0x80),
+];
+
+/// Every `xxxON`/`xxxRDY` pair `HAL_RCC_OscConfig` and
+/// `HAL_RCCEx_PeriphCLKConfig` poll, with its `CIFR` flag (`RCC_CR_*`,
+/// `RCC_BDCR_*`, `RCC_CIFR_*` in `stm32u585xx.h`).
+static U5_READY: &[ReadyBit] = &[
+    ready(U5_CR, 0, 2, 2, Osc::Msi),
+    // `MSIKON`/`MSIKRDY`: the kernel-clock MSI, which nothing here consumes.
+    ready(U5_CR, 4, 5, 11, Osc::Aux),
+    ready(U5_CR, 8, 10, 3, Osc::Hsi),
+    ready(U5_CR, 12, 13, 5, Osc::Aux),
+    // `SHSION`/`SHSIRDY`, the secure HSI for SAES (U585 only; reserved and
+    // harmless on a U575).
+    ready(U5_CR, 14, 15, 12, Osc::Aux),
+    ready(U5_CR, 16, 17, 4, Osc::Hse),
+    ready(U5_CR, 24, 25, 6, Osc::Pll),
+    ready(U5_CR, 26, 27, 7, Osc::Aux),
+    ready(U5_CR, 28, 29, 8, Osc::Aux),
+    ready(U5_BDCR, 0, 1, 1, Osc::Lse),
+    // `LSESYSEN`/`LSESYSRDY`: the LSE propagated to the system, with no
+    // interrupt of its own.
+    ready(U5_BDCR, 7, 11, NO_FLAG, Osc::Aux),
+    // The U5 keeps `LSION`/`LSIRDY` in `BDCR`, not in `CSR`.
+    ready(U5_BDCR, 26, 27, 0, Osc::Lsi),
+];
+
+static U5_RESET_VALUES: &[(u64, u32)] = &[
+    // `CR`: `MSISON`/`MSISRDY` and `MSIKON`/`MSIKRDY` — the U5 boots on the
+    // 4 MHz MSIS with the kernel MSI running beside it (RM0456 §11.8,
+    // `RCC_CR`, "Reset value: 0x0000 0035").
+    (U5_CR, 0x0000_0035),
+    // `ICSCR1`: `MSISRANGE` = `MSIKRANGE` = 4, i.e. 4 MHz, and `MSIRGSEL`
+    // clear, so the range really comes from `CSR`. The `MSICALx`
+    // factory trims read as zero.
+    (U5_ICSCR1, 0x4400_0000),
+    // `ICSCR2`: every `MSITRIMx` at its mid-scale 16 — the value
+    // `HAL_RCC_DeInit` writes back as the default.
+    (0x0c, 0x0008_4210),
+    // `ICSCR3`: `HSITRIM` = 16, `RCC_HSICALIBRATION_DEFAULT`.
+    (0x10, 0x0010_0000),
+    // `PLLxDIVR`: N = 129, P = Q = R = 2 — `PLLDIVR_RESET_VALUE`.
+    (U5_PLL1DIVR, 0x0101_0280),
+    (0x3c, 0x0101_0280),
+    (0x44, 0x0101_0280),
+    // `CSR`: `MSIKSRANGE` = `MSISSRANGE` = 4 MHz, and a power-on sets the BOR
+    // and pin flags.
+    (U5_CSR, 0x0c00_4400),
+];
+
+static U5_CAUSES: &[ResetCause] = &[
+    ResetCause {
+        pin: "oblrst",
+        bit: 25,
+    },
+    ResetCause {
+        pin: "pinrst",
+        bit: 26,
+    },
+    ResetCause {
+        pin: "borrst",
+        bit: 27,
+    },
+    ResetCause {
+        pin: "sftrst",
+        bit: 28,
+    },
+    ResetCause {
+        pin: "iwdgrst",
+        bit: 29,
+    },
+    ResetCause {
+        pin: "wwdgrst",
+        bit: 30,
+    },
+    ResetCause {
+        pin: "lpwrrst",
+        bit: 31,
+    },
+];
+
+static U5: Layout = Layout {
+    cr: U5_CR,
+    cfgr: U5_CFGR1,
+    pllcfgr: U5_PLL1CFGR,
+    bdcr: U5_BDCR,
+    csr: U5_CSR,
+    rmvf: 23,
+    enable: U5_ENABLE,
+    reset: U5_RESET_BANKS,
+    ready: U5_READY,
+    interrupts: Interrupts::Three {
+        cier: 0x50,
+        cifr: 0x54,
+        cicr: 0x58,
+        flags: U5_FLAGS,
+    },
+    reset_values: U5_RESET_VALUES,
 };
 
 // ---------------------------------------------------------------------------
@@ -951,6 +1220,33 @@ impl Default for Frequencies {
 const MSI_RANGES: [u64; 12] = [
     100_000, 200_000, 400_000, 800_000, 1_000_000, 2_000_000, 4_000_000, 8_000_000, 16_000_000,
     24_000_000, 32_000_000, 48_000_000,
+];
+
+/// The U5's MSIS ranges, `MSISRANGE`/`MSISSRANGE` = 0…15, as exact
+/// `(numerator, denominator)` hertz (RM0456 §11.4, the MSI clock).
+///
+/// Four RC oscillators of 48 MHz, 4 MHz, 3.072 MHz and 400 kHz, each divided
+/// by 1, 2, 3 and 4. That makes ranges 6 and 14 *thirds* — 1.333… MHz and
+/// 133.3… kHz — which `MSIRangeTable` in ST's `system_stm32u5xx.c` rounds to
+/// 1 330 000 and 133 000. The hardware divides; it does not round, so neither
+/// does this table.
+const U5_MSI_RANGES: [(u64, u64); 16] = [
+    (48_000_000, 1),
+    (24_000_000, 1),
+    (16_000_000, 1),
+    (12_000_000, 1),
+    (4_000_000, 1),
+    (2_000_000, 1),
+    (4_000_000, 3),
+    (1_000_000, 1),
+    (3_072_000, 1),
+    (1_536_000, 1),
+    (1_024_000, 1),
+    (768_000, 1),
+    (400_000, 1),
+    (200_000, 1),
+    (400_000, 3),
+    (100_000, 1),
 ];
 
 /// `CFGR.HPRE` as a divisor (RM0090 §7.3.3, RM0351 §6.4.3 — the same table).
@@ -1151,22 +1447,38 @@ impl Registers {
             .any(|b| b.osc == osc && state.word(b.reg) & (1 << b.rdy) != 0)
     }
 
-    /// The MSI's programmed rate (L4 only).
+    /// The MSI's programmed rate (L4 and U5).
     ///
     /// `CR.MSIRGSEL` chooses whether the range comes from `CR.MSIRANGE` or
     /// from `CSR.MSISRANGE`, which is the range a standby wake-up comes back
-    /// at (RM0351 §6.4.1).
-    fn msi_hz(&self, state: &State) -> u64 {
+    /// at (RM0351 §6.4.1). A U5 moved the select and the run-time range to
+    /// `ICSCR1` — `MSIRGSEL` at 23, `MSISRANGE[31:28]` — and keeps the
+    /// standby range in `CSR.MSISSRANGE[15:12]` (RM0456 §11.8).
+    fn msi_hz(&self, state: &State) -> Rational {
+        if self.variant == Variant::U5 {
+            let icscr1 = state.word(U5_ICSCR1);
+            let range = if icscr1 & (1 << 23) != 0 {
+                icscr1 >> 28
+            } else {
+                (state.word(U5_CSR) >> 12) & 0xf
+            };
+            let (num, den) = U5_MSI_RANGES[(range & 0xf) as usize];
+            return Rational::integer(num)
+                .checked_scale(1, den)
+                .unwrap_or(Rational::integer(0));
+        }
         let cr = state.word(self.layout.cr);
         let range = if cr & (1 << 3) != 0 {
             (cr >> 4) & 0xf
         } else {
             (state.word(self.layout.csr) >> 8) & 0xf
         };
-        MSI_RANGES
-            .get(range as usize)
-            .copied()
-            .unwrap_or(MSI_RANGES[6])
+        Rational::integer(
+            MSI_RANGES
+                .get(range as usize)
+                .copied()
+                .unwrap_or(MSI_RANGES[6]),
+        )
     }
 
     /// The rate of one source, in hertz, or zero when it is not running.
@@ -1179,7 +1491,7 @@ impl Registers {
             Osc::Hse => self.freq.hse,
             Osc::Lse => self.freq.lse,
             Osc::Lsi => self.freq.lsi,
-            Osc::Msi => self.msi_hz(state),
+            Osc::Msi => return self.msi_hz(state),
             // Neither is a source in its own right.
             Osc::Pll | Osc::Aux => 0,
         })
@@ -1255,6 +1567,51 @@ impl Registers {
                 };
                 (sys, out48)
             }
+            Variant::U5 => {
+                // RM0456 §11.8 (`RCC_PLL1CFGR`, `RCC_PLL1DIVR`,
+                // `RCC_PLL1FRACR`): SRC[1:0] 01 MSIS, 10 HSI16, 11 HSE;
+                // M[11:8] (÷ M+1); N[8:0] (× N+1) plus FRACN[15:3] / 2^13
+                // when FRACEN[4] stands; Q[22:16] (÷ Q+1) behind QEN[17];
+                // R[30:24] (÷ R+1) behind REN[18].
+                //
+                // `PLL1MBOOST[15:12]` is deliberately absent: it divides the
+                // clock the EPOD *booster* runs on, not the VCO's input, and
+                // so changes no frequency a guest can measure.
+                let src = match cfg & 0x3 {
+                    1 => Osc::Msi,
+                    2 => Osc::Hsi,
+                    3 => Osc::Hse,
+                    _ => return (zero, zero),
+                };
+                let divr = state.word(U5_PLL1DIVR);
+                let m = u64::from((cfg >> 8) & 0xf) + 1;
+                let n = u64::from(divr & 0x1ff) + 1;
+                let q = u64::from((divr >> 16) & 0x7f) + 1;
+                let r = u64::from((divr >> 24) & 0x7f) + 1;
+                let frac = if cfg & (1 << 4) != 0 {
+                    u64::from((state.word(U5_PLL1FRACR) >> 3) & 0x1fff)
+                } else {
+                    0
+                };
+                // VCO = src / M × (N + FRACN / 8192), exactly.
+                let Some(vco) = self
+                    .source_hz(state, src)
+                    .checked_scale(n * 8192 + frac, m * 8192)
+                else {
+                    return (zero, zero);
+                };
+                let sys = if cfg & (1 << 18) != 0 {
+                    vco.checked_scale(1, r).unwrap_or(zero)
+                } else {
+                    zero
+                };
+                let out48 = if cfg & (1 << 17) != 0 {
+                    vco.checked_scale(1, q).unwrap_or(zero)
+                } else {
+                    zero
+                };
+                (sys, out48)
+            }
         }
     }
 
@@ -1267,10 +1624,16 @@ impl Registers {
         }
         match ((bdcr >> 8) & 0x3, self.variant) {
             (1, _) => self.source_hz(state, Osc::Lse),
+            // A U5's `BDCR.LSIPREDIV` (bit 28) divides the LSI by 128 on its
+            // way to the RTC (RM0456 §11.8, `RCC_BDCR`).
+            (2, Variant::U5) if bdcr & (1 << 28) != 0 => self
+                .source_hz(state, Osc::Lsi)
+                .checked_scale(1, 128)
+                .unwrap_or(zero),
             (2, _) => self.source_hz(state, Osc::Lsi),
             // An F4 divides HSE by `CFGR.RTCPRE`, and a value below 2 means no
             // clock (RM0090 §7.3.3). An L4 divides it by a fixed 32
-            // (RM0351 §6.4.3).
+            // (RM0351 §6.4.3), and so does a U5 (RM0456 §11.8).
             (3, Variant::F4) => {
                 let pre = u64::from((state.word(self.layout.cfgr) >> 16) & 0x1f);
                 if pre < 2 {
@@ -1281,7 +1644,7 @@ impl Registers {
                         .unwrap_or(zero)
                 }
             }
-            (3, Variant::L4) => self
+            (3, Variant::L4 | Variant::U5) => self
                 .source_hz(state, Osc::Hse)
                 .checked_scale(1, 32)
                 .unwrap_or(zero),
@@ -1303,27 +1666,42 @@ impl Registers {
             (Variant::F4, 0) => self.source_hz(state, Osc::Hsi),
             (Variant::F4, 1) => self.source_hz(state, Osc::Hse),
             (Variant::F4, 2) => pll_sys,
-            // RM0351 §6.4.3: 00 MSI, 01 HSI16, 10 HSE, 11 PLL.
-            (Variant::L4, 0) => self.source_hz(state, Osc::Msi),
-            (Variant::L4, 1) => self.source_hz(state, Osc::Hsi),
-            (Variant::L4, 2) => self.source_hz(state, Osc::Hse),
-            (Variant::L4, 3) => pll_sys,
+            // RM0351 §6.4.3, and RM0456 §11.8 for a U5's `CFGR1`: 00 MSI(S),
+            // 01 HSI16, 10 HSE, 11 PLL(1).
+            (Variant::L4 | Variant::U5, 0) => self.source_hz(state, Osc::Msi),
+            (Variant::L4 | Variant::U5, 1) => self.source_hz(state, Osc::Hsi),
+            (Variant::L4 | Variant::U5, 2) => self.source_hz(state, Osc::Hse),
+            (Variant::L4 | Variant::U5, 3) => pll_sys,
             _ => zero,
         };
 
-        let (ppre1_shift, ppre2_shift) = match self.variant {
-            // RM0090 §7.3.3: PPRE1[12:10], PPRE2[15:13].
-            Variant::F4 => (10, 13),
-            // RM0351 §6.4.3: PPRE1[10:8], PPRE2[13:11].
-            Variant::L4 => (8, 11),
+        let (hpre, ppre1, ppre2, ppre3) = match self.variant {
+            // RM0090 §7.3.3: HPRE[7:4], PPRE1[12:10], PPRE2[15:13].
+            Variant::F4 => ((cfgr >> 4) & 0xf, (cfgr >> 10) & 0x7, (cfgr >> 13) & 0x7, 0),
+            // RM0351 §6.4.3: HPRE[7:4], PPRE1[10:8], PPRE2[13:11].
+            Variant::L4 => ((cfgr >> 4) & 0xf, (cfgr >> 8) & 0x7, (cfgr >> 11) & 0x7, 0),
+            // RM0456 §11.8: the prescalers left `CFGR1` for `CFGR2` —
+            // HPRE[3:0], PPRE1[6:4], PPRE2[10:8] — and `CFGR3.PPRE3[6:4]`.
+            // The encodings are the F4's.
+            Variant::U5 => {
+                let cfgr2 = state.word(U5_CFGR2);
+                (
+                    cfgr2 & 0xf,
+                    (cfgr2 >> 4) & 0x7,
+                    (cfgr2 >> 8) & 0x7,
+                    (state.word(U5_CFGR3) >> 4) & 0x7,
+                )
+            }
         };
-        let hpre = (cfgr >> 4) & 0xf;
-        let ppre1 = (cfgr >> ppre1_shift) & 0x7;
-        let ppre2 = (cfgr >> ppre2_shift) & 0x7;
 
         let hclk = sysclk.checked_scale(1, hpre_div(hpre)).unwrap_or(zero);
         let pclk1 = hclk.checked_scale(1, ppre_div(ppre1)).unwrap_or(zero);
         let pclk2 = hclk.checked_scale(1, ppre_div(ppre2)).unwrap_or(zero);
+        let pclk3 = if self.variant == Variant::U5 {
+            hclk.checked_scale(1, ppre_div(ppre3)).unwrap_or(zero)
+        } else {
+            zero
+        };
         // "If APBx prescaler is 1, the timer clock is PCLKx, else 2 × PCLKx"
         // (RM0090 §7.2, RM0351 §6.2).
         let tim1 = if ppre_div(ppre1) == 1 {
@@ -1346,6 +1724,7 @@ impl Registers {
         out[usize::from(ClockOutput::TIMCLK2.0)] = tim2;
         out[usize::from(ClockOutput::RTCCLK.0)] = self.rtc_hz(state);
         out[usize::from(ClockOutput::PLL48.0)] = pll48;
+        out[usize::from(ClockOutput::PCLK3.0)] = pclk3;
         out
     }
 
@@ -1634,10 +2013,10 @@ impl Registers {
             (Variant::F4, 0) => Osc::Hsi,
             (Variant::F4, 1) => Osc::Hse,
             (Variant::F4, 2) => Osc::Pll,
-            (Variant::L4, 0) => Osc::Msi,
-            (Variant::L4, 1) => Osc::Hsi,
-            (Variant::L4, 2) => Osc::Hse,
-            (Variant::L4, 3) => Osc::Pll,
+            (Variant::L4 | Variant::U5, 0) => Osc::Msi,
+            (Variant::L4 | Variant::U5, 1) => Osc::Hsi,
+            (Variant::L4 | Variant::U5, 2) => Osc::Hse,
+            (Variant::L4 | Variant::U5, 3) => Osc::Pll,
             // An F4's `SW = 11` is reserved.
             _ => {
                 *state.word_mut(self.layout.cfgr) = (cfgr & !0x3) | previous;
@@ -1768,8 +2147,9 @@ impl Rcc {
     /// one this class does not know was given.
     pub fn new(props: &Props) -> Result<Rcc> {
         let mut r = props.reader();
-        let variant = match r.or_enum("variant", "f4", &["f4", "l4"])? {
+        let variant = match r.or_enum("variant", "f4", &["f4", "l4", "u5"])? {
             "l4" => Variant::L4,
+            "u5" => Variant::U5,
             _ => Variant::F4,
         };
         let defaults = Frequencies::default();
@@ -2112,7 +2492,7 @@ pub static CLASS: DeviceClass = DeviceClass {
             name: "variant",
             kind: ValueKind::Str,
             required: false,
-            summary: "which register layout: \"f4\" (RM0090) or \"l4\" (RM0351)",
+            summary: "which register layout: \"f4\" (RM0090), \"l4\" (RM0351) or \"u5\" (RM0456)",
         },
         PropertySpec {
             name: "hse",
@@ -2184,6 +2564,13 @@ pub static CLASS: DeviceClass = DeviceClass {
             summary: "the object whose clock domain is what an APB2 timer counts; it must \
                       hang off `pclk2`, and is PCLK2 doubled unless PPRE2 is one",
         },
+        PropertySpec {
+            name: "pclk3",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "the object whose clock domain is PCLK3 (a U5's APB3); it must hang off \
+                      `hclk`",
+        },
     ],
     construct: |props| Ok(Box::new(Rcc::new(props)?)),
 };
@@ -2210,7 +2597,7 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
 #[must_use]
 pub fn schema() -> ClassSchema {
     let mut schema = ClassSchema::new(CLASS_NAME)
-        .prop(PropSchema::new("variant", ValueKind::Str).values(&["f4", "l4"]))
+        .prop(PropSchema::new("variant", ValueKind::Str).values(&["f4", "l4", "u5"]))
         .prop(PropSchema::new("hse", ValueKind::Uint))
         .prop(PropSchema::new("hsi", ValueKind::Uint))
         .prop(PropSchema::new("lse", ValueKind::Uint))

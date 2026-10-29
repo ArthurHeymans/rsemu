@@ -2194,7 +2194,8 @@ dev-stm32-rtc = []
 # through an `ExportId::CLOCK_TREE` handle. Every xxENR and xxRSTR bit is an
 # output pin, so a peripheral can be told it has no clock and can be reset by
 # its own xxRST bit. `BDCR` is write-protected until `PWR_CR.DBP` arrives on the
-# `dbp` input. Both the F4 (RM0090 §7) and L4 (RM0351 §6) layouts, selected by a
+# `dbp` input. The F4 (RM0090 §7), L4 (RM0351 §6) and U5 (RM0456 §11: MSIS
+# boot, PLL1 with FRACN, CFGR1-3, the LSI in BDCR, APB3) layouts, selected by a
 # construction property. `no_std + alloc`, no `unsafe`, no dependencies.
 dev-stm32-rcc = []
 
