@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/KarpelesLab/rsemu/compare/v0.0.7...v0.0.8) - 2026-10-29
+
+### Added
+
+- *(cpu-x86)* correctly rounded x87 transcendentals, FBLD/FBSTP and FISTTP
+- *(cpu-x86)* [**breaking**] make the x86 Config and Features non_exhaustive
+- *(cpu-x86)* [**breaking**] MMX, with its registers aliased onto the x87 unit
+- *(cpu-x86)* ExitingCore exits and host-armed execution breakpoints
+
+### Fixed
+
+- *(cpu-x86)* keep MASKMOVDQU's summary out of rustdoc's link syntax
+- *(cpu-x86)* restart a faulting REP string op with its completed iterations
+- *(cpu-x86)* the thirteen SSE/SSE2 encodings CPUID claimed and the decoder lacked
+
 ## [0.0.7](https://github.com/KarpelesLab/rsemu/compare/v0.0.6...v0.0.7) - 2026-10-29
 
 ### Added
