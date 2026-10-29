@@ -22,9 +22,13 @@
 //! | `0x08` | `SR` | `EWIF` at 0: the early-wakeup flag, **cleared by writing a zero** |
 //!
 //! `WDGTB` moved between families — bits `[8:7]` on an F4, `[12:11]` on an L4
-//! — so `wdgtb-shift` says where it is on this part. Everything else about the
-//! block is the same, which is why it is one class and a property rather than
-//! two classes.
+//! — so `wdgtb-shift` says where it is on this part. The STM32U5 widened it
+//! to three bits at `[13:11]` (`WWDG_CFR_WDGTB_Msk` is `0x7 << 11` in ST CMSIS
+//! `stm32u585xx.h`, Apache-2.0; RM0456's WWDG chapter has the divide-by-128
+//! that buys), so `wdgtb-width` says how wide it is: a U5 board writes
+//! `wdgtb-shift = 11` and `wdgtb-width = 3`. Everything else about the block
+//! is the same, U5 included, which is why it is one class and two properties
+//! rather than three classes.
 //!
 //! # The three ways it fires
 //!
@@ -161,6 +165,12 @@ pub const F4_WDGTB_SHIFT: u32 = 7;
 /// Where it sits on an L4: bits `[12:11]`.
 pub const L4_WDGTB_SHIFT: u32 = 11;
 
+/// How wide `WDGTB` is on an F4 or an L4: two bits.
+pub const F4_WDGTB_WIDTH: u32 = 2;
+
+/// How wide it is on a U5: three bits, dividing by up to 128.
+pub const U5_WDGTB_WIDTH: u32 = 3;
+
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
@@ -174,7 +184,7 @@ struct State {
     t: u32,
     /// `CFR.W[6:0]`.
     w: u32,
-    /// `CFR.WDGTB`, two bits wherever the part puts them.
+    /// `CFR.WDGTB`, two or three bits wherever the part puts them.
     wdgtb: u32,
     /// `CFR.EWI`. Set-only, like `WDGA` (RM0090 §20.4.2).
     ewi: bool,
@@ -296,6 +306,8 @@ struct Registers {
     state: Mutex<State>,
     /// Which bit `WDGTB` starts at on this part.
     wdgtb_shift: u32,
+    /// How many bits wide `WDGTB` is on this part.
+    wdgtb_width: u32,
     /// Whether the debug unit is holding the counter still.
     ///
     /// An atomic rather than a field of [`State`], for the two reasons
@@ -328,6 +340,7 @@ impl fmt::Debug for Registers {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut s = f.debug_struct("Registers");
         s.field("wdgtb_shift", &self.wdgtb_shift)
+            .field("wdgtb_width", &self.wdgtb_width)
             .field("frozen", &self.frozen.load(Ordering::Relaxed));
         match self.state.try_lock() {
             Some(state) => s.field("state", &*state),
@@ -449,7 +462,7 @@ impl Registers {
 
     /// `CFR`'s `WDGTB` field, as a mask.
     fn wdgtb_mask(&self) -> u32 {
-        0x3 << self.wdgtb_shift
+        ((1 << self.wdgtb_width) - 1) << self.wdgtb_shift
     }
 
     /// Read one register.
@@ -600,19 +613,38 @@ impl Wwdg {
             u64::from(F4_WDGTB_SHIFT),
             u64::from(F4_WDGTB_SHIFT)..=u64::from(L4_WDGTB_SHIFT),
         )? as u32;
+        let width = r.or_range(
+            "wdgtb-width",
+            u64::from(F4_WDGTB_WIDTH),
+            u64::from(F4_WDGTB_WIDTH)..=u64::from(U5_WDGTB_WIDTH),
+        )? as u32;
         r.touch("clock");
         r.finish()?;
-        Ok(Wwdg::with_shift(shift))
+        if width == U5_WDGTB_WIDTH && shift != L4_WDGTB_SHIFT {
+            // Three bits at 7 would run into `EWI` at 9.
+            return Err(Error::Property(format!(
+                "a three-bit WDGTB is the U5's, at bit {L4_WDGTB_SHIFT}, not at bit {shift}"
+            )));
+        }
+        Ok(Wwdg::with_field(shift, width))
     }
 
-    /// Build one directly — the route a test takes.
+    /// Build one directly — the route a test takes. Two-bit `WDGTB`.
     #[must_use]
     pub fn with_shift(wdgtb_shift: u32) -> Wwdg {
+        Wwdg::with_field(wdgtb_shift, F4_WDGTB_WIDTH)
+    }
+
+    /// Build one with `WDGTB` at `wdgtb_shift`, `wdgtb_width` bits wide.
+    #[must_use]
+    pub fn with_field(wdgtb_shift: u32, wdgtb_width: u32) -> Wwdg {
         let wdgtb_shift = wdgtb_shift.clamp(F4_WDGTB_SHIFT, L4_WDGTB_SHIFT);
+        let wdgtb_width = wdgtb_width.clamp(F4_WDGTB_WIDTH, U5_WDGTB_WIDTH);
         let regs = Arc::new(Registers {
             state: Mutex::with_rank(LockRank::DEVICE, State::default()),
             frozen: AtomicBool::new(false),
             wdgtb_shift,
+            wdgtb_width,
             reset_out: Mutex::with_rank(LockRank::WIRE, None),
             irq_out: Mutex::with_rank(LockRank::WIRE, None),
             lazy: Mutex::with_rank(LockRank::LEAF, None),
@@ -733,7 +765,7 @@ impl Device for Wwdg {
             prescale: r.read_u64()?,
             tick: r.read_u64()?,
         };
-        if state.t > T_MASK || state.w > T_MASK || state.wdgtb > 3 {
+        if state.t > T_MASK || state.w > T_MASK || state.wdgtb >> self.regs.wdgtb_width != 0 {
             return Err(Error::State(format!(
                 "snapshot has a WWDG with T={}, W={}, WDGTB={}",
                 state.t, state.w, state.wdgtb
@@ -838,12 +870,20 @@ pub static CLASS: DeviceClass = DeviceClass {
     name: CLASS_NAME,
     version: STATE_VERSION,
     summary: "STM32 window watchdog: the PCLK1 down-counter, its window and its early wakeup",
-    properties: &[PropertySpec {
-        name: "wdgtb-shift",
-        kind: ValueKind::Uint,
-        required: false,
-        summary: "which bit CFR.WDGTB starts at: 7 on an F4 (the default), 11 on an L4",
-    }],
+    properties: &[
+        PropertySpec {
+            name: "wdgtb-shift",
+            kind: ValueKind::Uint,
+            required: false,
+            summary: "which bit CFR.WDGTB starts at: 7 on an F4 (the default), 11 on an L4 or U5",
+        },
+        PropertySpec {
+            name: "wdgtb-width",
+            kind: ValueKind::Uint,
+            required: false,
+            summary: "how many bits CFR.WDGTB has: 2 (the default), 3 on a U5",
+        },
+    ],
     construct: |props| Ok(Box::new(Wwdg::new(props)?)),
 };
 
@@ -872,6 +912,10 @@ pub fn schema() -> ClassSchema {
         .prop(
             PropSchema::new("wdgtb-shift", ValueKind::Uint)
                 .range(u64::from(F4_WDGTB_SHIFT), u64::from(L4_WDGTB_SHIFT)),
+        )
+        .prop(
+            PropSchema::new("wdgtb-width", ValueKind::Uint)
+                .range(u64::from(F4_WDGTB_WIDTH), u64::from(U5_WDGTB_WIDTH)),
         )
         .region("")
         .region("regs")
@@ -1172,6 +1216,48 @@ mod tests {
             d.regs.constraints(),
             AccessConstraints::word(Width::U32, Endian::Little)
         );
+    }
+
+    #[test]
+    fn a_u5_wdgtb_is_three_bits_and_divides_by_up_to_128() {
+        let d = Wwdg::with_field(L4_WDGTB_SHIFT, U5_WDGTB_WIDTH);
+        poke(&d, 0x04, 0xffff_ffff);
+        assert_eq!(peek(&d, 0x04), 0x7f | CFR_EWI | (7 << 11));
+        // WDGTB = 7: one decrement every 4096 * 128 PCLK cycles.
+        poke(&d, 0x00, CR_WDGA | 0x7f);
+        d.advance_to(4096 * 128 - 1);
+        assert_eq!(d.counter(), 0x7f);
+        d.advance_to(4096 * 128);
+        assert_eq!(d.counter(), 0x7e);
+
+        let mut shape = MachineShape::new();
+        shape.add_device("wwdg", CLASS_NAME).unwrap();
+        let mut w = StateWriter::new(shape);
+        {
+            let mut chunk = w.chunk("wwdg", CLASS_NAME, STATE_VERSION).unwrap();
+            Device::save(&d, &mut chunk).unwrap();
+        }
+        let bytes = w.to_vec().unwrap();
+        let reader = StateReader::new(&bytes).unwrap();
+        let chunk = reader
+            .load("wwdg", CLASS_NAME, STATE_VERSION, &Migrations::new())
+            .unwrap();
+        let restored = Wwdg::with_field(L4_WDGTB_SHIFT, U5_WDGTB_WIDTH);
+        Device::load(&restored, &mut chunk.reader()).unwrap();
+        assert_eq!(peek(&restored, 0x04), peek(&d, 0x04));
+        // A two-bit part refuses the same snapshot: WDGTB = 7 does not fit.
+        let chunk = reader
+            .load("wwdg", CLASS_NAME, STATE_VERSION, &Migrations::new())
+            .unwrap();
+        let l4 = Wwdg::with_shift(L4_WDGTB_SHIFT);
+        assert!(Device::load(&l4, &mut chunk.reader()).is_err());
+
+        let props = Props::new()
+            .with("wdgtb-shift", Value::from(11u64))
+            .with("wdgtb-width", Value::from(3u64));
+        assert!(Wwdg::new(&props).is_ok());
+        let props = Props::new().with("wdgtb-width", Value::from(3u64));
+        assert!(Wwdg::new(&props).is_err(), "three bits at 7 would hit EWI");
     }
 
     #[test]
