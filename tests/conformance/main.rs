@@ -745,6 +745,11 @@ const LEDGERS: &[(&str, bool)] = &[
     // known-gaps list in the same format and under the same rule — it only ever
     // shrinks — and the parser check below is what keeps it honest.
     ("cpu-arm-v7m-fp", true),
+    // The Armv8-M Mainline (Cortex-M33) additions to the same core: no
+    // permissively licensed v8-M corpus exists either, so this is the list of
+    // what `src/cpu/arm/v7m/v8mtests.rs` and the built corpus deliberately
+    // leave out -- TrustZone first.
+    ("cpu-arm-v8m", true),
     ("riscv-arch-test", true),
     ("sst-6502", false),
     ("sst-nes6502", false),
